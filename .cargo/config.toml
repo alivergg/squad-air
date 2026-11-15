@@ -1,0 +1,7 @@
+[env]
+CMAKE_POLICY_VERSION_MINIMUM = "3.5"
+
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"
+ar = "x86_64-w64-mingw32-gcc-ar"
+rustflags = ["-C", "link-arg=-Wl,-Bstatic", "-C", "link-arg=-lssp", "-C", "link-arg=-Wl,-Bdynamic"]

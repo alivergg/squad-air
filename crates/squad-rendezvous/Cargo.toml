@@ -1,0 +1,16 @@
+[package]
+name = "squad-rendezvous"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "squad-rendezvous"
+path = "src/main.rs"
+
+[dependencies]
+squad-proto = { path = "../squad-proto" }
+tokio.workspace = true
+dashmap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true

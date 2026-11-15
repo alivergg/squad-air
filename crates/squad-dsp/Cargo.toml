@@ -1,0 +1,23 @@
+[package]
+name = "squad-dsp"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+squad-proto = { path = "../squad-proto" }
+thiserror.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+serde.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
+cpal.workspace = true
+ringbuf.workspace = true
+rubato.workspace = true
+nnnoiseless.workspace = true
+aec3.workspace = true
+tract-onnx.workspace = true
+audiopus.workspace = true
+hound.workspace = true
+dirs.workspace = true
+tokio.workspace = true

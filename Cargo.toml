@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/squad-proto",
+    "crates/squad-rendezvous",
+    "crates/squad-dsp",
+    "crates/squad-client",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Squad-Air Contributors"]
+
+[workspace.dependencies]
+tokio = { version = "1.41", features = ["full"] }
+bytes = "1.8"
+thiserror = "2.0"
+anyhow = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+rand = "0.8"
+uuid = { version = "1.11", features = ["v4", "serde"] }
+bs58 = "0.5"
+blake3 = "1.5"
+chacha20poly1305 = "0.10"
+dashmap = "6.1"
+cpal = "0.15"
+ringbuf = "0.4"
+rubato = "0.16"
+nnnoiseless = "0.5"
+aec3 = "0.1"
+tract-onnx = "0.21"
+audiopus = "0.3.0-rc.0"
+hound = "3.5"
+dirs = "5.0"
+if-addrs = "0.13"
+iced = { version = "0.13", features = ["tokio", "canvas", "advanced", "image"] }
+tray-icon = "0.19"
+arboard = "3.4"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
+rfd = "0.15"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

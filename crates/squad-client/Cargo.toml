@@ -1,0 +1,31 @@
+[package]
+name = "squad-client"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "squad-client"
+path = "src/main.rs"
+
+[dependencies]
+squad-proto = { path = "../squad-proto" }
+squad-dsp = { path = "../squad-dsp" }
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+toml.workspace = true
+rand.workspace = true
+uuid.workspace = true
+bs58.workspace = true
+dirs.workspace = true
+if-addrs.workspace = true
+iced.workspace = true
+tray-icon.workspace = true
+blake3.workspace = true
+arboard.workspace = true
+image.workspace = true
+rfd.workspace = true
