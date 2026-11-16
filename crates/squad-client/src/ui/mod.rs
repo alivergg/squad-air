@@ -20,12 +20,17 @@ use crate::ui::avatar::{
     save_cached_avatar_jpeg, AvatarCache,
 };
 use crate::ui::share_modal::ShareSourceTab;
-use crate::ui::theme::{material_dark_theme, root_container_style};
-use iced::{
-    clipboard, event, keyboard, time,
-    widget::{container, image as iced_image, stack},
-    Element, Length, Subscription, Task, Theme,
+use crate::ui::theme::{
+    material_dark_theme, pill_danger_button, pill_primary_button, pill_tonal_button,
+    root_container_style, M3_ON_SURFACE, M3_OUTLINE, M3_SURFACE_CONTAINER,
 };
+use iced::{
+    alignment::Vertical,
+    clipboard, event, keyboard, time,
+    widget::{button, column, container, horizontal_space, image as iced_image, row, stack, text},
+    Background, Border, Color, ContentFit, Element, Length, Subscription, Task, Theme,
+};
+use std::borrow::Cow;
 use image::imageops::FilterType;
 use squad_dsp::{
     list_input_devices, list_output_devices, AudioEngineConfig, AudioEngineHandle,
@@ -56,6 +61,7 @@ pub enum Screen {
 pub enum ClipboardPayload {
     InlineImage { filename: String, bytes: Vec<u8> },
     TempFile(PathBuf),
+    InviteUri(String),
 }
 
 #[derive(Debug, Clone)]
@@ -93,8 +99,17 @@ pub enum Message {
     SendChatText,
     PickFileToSend,
     FilePicked(Option<PathBuf>),
-    PasteFromClipboard,
+    PasteFromClipboard {
+        text_input_focused: bool,
+    },
     ClipboardProcessed(Option<ClipboardPayload>),
+    CopyChatText(u64, String),
+    CopyImageToClipboard([u8; 16]),
+    OpenImageLightbox([u8; 16]),
+    CloseImageLightbox,
+    SaveImageAs([u8; 16]),
+    ClipboardActionDone(Result<(), String>),
+    EscapePressed,
     DownloadBlob([u8; 16]),
     OpenDownloadsFolder(Option<PathBuf>),
     PeerVolumeChanged {
@@ -137,6 +152,9 @@ pub struct SquadApp {
     pub peers: Vec<PeerUiSnapshot>,
     pub chat_messages: Vec<ChatItemUi>,
     pub image_handles: HashMap<[u8; 16], iced_image::Handle>,
+    pub inline_image_bytes: HashMap<[u8; 16], (String, Vec<u8>)>,
+    pub copied_msg_id: Option<(u64, std::time::Instant)>,
+    pub lightbox_blob_id: Option<[u8; 16]>,
     pub chat_input: String,
     pub status_banner: Option<String>,
     pub invite_copied_flash: bool,
@@ -222,6 +240,9 @@ impl SquadApp {
             peers: Vec::new(),
             chat_messages: Vec::new(),
             image_handles: HashMap::new(),
+            inline_image_bytes: HashMap::new(),
+            copied_msg_id: None,
+            lightbox_blob_id: None,
             chat_input: String::new(),
             status_banner: None,
             invite_copied_flash: false,
@@ -263,13 +284,27 @@ impl SquadApp {
 
     pub fn subscription(&self) -> Subscription<Message> {
         let tick = time::every(Duration::from_millis(20)).map(|_| Message::Tick);
-        let keys = event::listen_with(|evt, _status, _win| match evt {
+        let keys = event::listen_with(|evt, status, _win| match evt {
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key: keyboard::Key::Character(ref ch),
+                key,
+                physical_key,
                 modifiers,
                 ..
-            }) if modifiers.command() && ch.eq_ignore_ascii_case("v") => {
-                Some(Message::PasteFromClipboard)
+            }) => {
+                let is_v = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("v"))
+                    || matches!(
+                        physical_key,
+                        keyboard::key::Physical::Code(keyboard::key::Code::KeyV)
+                    );
+                if modifiers.command() && is_v {
+                    return Some(Message::PasteFromClipboard {
+                        text_input_focused: status == iced::event::Status::Captured,
+                    });
+                }
+                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                    return Some(Message::EscapePressed);
+                }
+                None
             }
             _ => None,
         });
@@ -280,6 +315,11 @@ impl SquadApp {
         match message {
             Message::Tick => {
                 self.hotkeys.poll_events(&self.audio);
+                if let Some((_, ts)) = self.copied_msg_id {
+                    if ts.elapsed() >= Duration::from_secs(2) {
+                        self.copied_msg_id = None;
+                    }
+                }
                 if let Some(TrayAction::Quit) = self.tray.poll_action(&self.audio) {
                     let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
                     self.audio.shutdown();
@@ -309,6 +349,9 @@ impl SquadApp {
                                 self.peers.clear();
                                 self.chat_messages.clear();
                                 self.image_handles.clear();
+                                self.inline_image_bytes.clear();
+                                self.copied_msg_id = None;
+                                self.lightbox_blob_id = None;
                                 self.chat_input.clear();
                                 self.local_peer_id = 0;
                                 self.share_modal_open = false;
@@ -332,16 +375,28 @@ impl SquadApp {
                             MeshEvent::ChatItemReceived(item) => {
                                 if let ChatContentUi::InlineImage {
                                     blob_id,
+                                    ref filename,
                                     bytes: Some(ref raw),
                                     ..
                                 } = item.content
                                 {
                                     self.image_handles
                                         .insert(blob_id, iced_image::Handle::from_bytes(raw.clone()));
+                                    self.inline_image_bytes
+                                        .insert(blob_id, (filename.clone(), raw.clone()));
                                 }
-                                self.chat_messages.push(item);
-                                if self.chat_messages.len() > 100 {
-                                    self.chat_messages.remove(0);
+                                let already = self.chat_messages.iter().any(|existing| {
+                                    existing.sender_uuid == item.sender_uuid
+                                        && existing.msg_id == item.msg_id
+                                });
+                                if !already {
+                                    self.chat_messages.push(item);
+                                    self.chat_messages
+                                        .sort_by_key(|m| (m.timestamp_ms, m.msg_id));
+                                    if self.chat_messages.len() > 30 {
+                                        let drop_n = self.chat_messages.len() - 30;
+                                        self.chat_messages.drain(0..drop_n);
+                                    }
                                 }
                             }
                             MeshEvent::BlobStateChanged {
@@ -357,13 +412,16 @@ impl SquadApp {
                                     match &mut item.content {
                                         ChatContentUi::InlineImage {
                                             blob_id: bid,
+                                            filename,
                                             state: st,
                                             bytes,
                                             ..
                                         } if *bid == blob_id => {
                                             *st = state.clone();
-                                            if inline_bytes.is_some() {
-                                                *bytes = inline_bytes.clone();
+                                            if let Some(ref raw) = inline_bytes {
+                                                *bytes = Some(raw.clone());
+                                                self.inline_image_bytes
+                                                    .insert(blob_id, (filename.clone(), raw.clone()));
                                             }
                                         }
                                         ChatContentUi::File {
@@ -398,11 +456,15 @@ impl SquadApp {
                             }
                             MeshEvent::PeerAvatarLoaded {
                                 client_uuid,
+                                avatar_hash,
                                 jpeg_bytes,
-                                ..
                             } => {
-                                self.avatars
-                                    .set_from_jpeg_option(client_uuid, jpeg_bytes.as_deref());
+                                if avatar_hash == [0u8; 32] {
+                                    self.avatars.reset_to_identicon(client_uuid);
+                                } else {
+                                    self.avatars
+                                        .set_from_jpeg_option(client_uuid, jpeg_bytes.as_deref());
+                                }
                             }
                             MeshEvent::Error(err) => {
                                 self.status_banner = Some(err);
@@ -450,6 +512,9 @@ impl SquadApp {
                 self.peers.clear();
                 self.chat_messages.clear();
                 self.image_handles.clear();
+                self.inline_image_bytes.clear();
+                self.copied_msg_id = None;
+                self.lightbox_blob_id = None;
                 self.chat_input.clear();
                 self.share_modal_open = false;
                 self.is_local_sharing = false;
@@ -650,36 +715,104 @@ impl SquadApp {
                 Task::none()
             }
             Message::FilePicked(None) => Task::none(),
-            Message::PasteFromClipboard => {
-                if self.screen != Screen::Room {
+            Message::PasteFromClipboard { text_input_focused } => {
+                let screen = self.screen;
+                let invite_empty = self.invite_input.trim().is_empty();
+                if screen != Screen::Room && (screen != Screen::Lobby || text_input_focused) {
                     return Task::none();
                 }
                 Task::perform(
-                    async {
-                        tokio::task::spawn_blocking(read_and_compress_clipboard_image)
-                            .await
-                            .ok()
-                            .flatten()
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            read_clipboard_payload(screen, text_input_focused, invite_empty)
+                        })
+                        .await
+                        .ok()
+                        .flatten()
                     },
                     Message::ClipboardProcessed,
                 )
             }
             Message::ClipboardProcessed(Some(payload)) => {
-                if self.screen == Screen::Room {
-                    match payload {
-                        ClipboardPayload::InlineImage { filename, bytes } => {
+                match payload {
+                    ClipboardPayload::InlineImage { filename, bytes } => {
+                        if self.screen == Screen::Room {
                             let _ = self
                                 .mesh_tx
                                 .try_send(MeshCommand::SendInlineImage { filename, bytes });
                         }
-                        ClipboardPayload::TempFile(path) => {
+                    }
+                    ClipboardPayload::TempFile(path) => {
+                        if self.screen == Screen::Room {
                             let _ = self.mesh_tx.try_send(MeshCommand::OfferFile { path });
+                        }
+                    }
+                    ClipboardPayload::InviteUri(uri) => {
+                        if self.screen == Screen::Lobby {
+                            self.invite_input = uri;
                         }
                     }
                 }
                 Task::none()
             }
             Message::ClipboardProcessed(None) => Task::none(),
+            Message::CopyChatText(msg_id, text) => {
+                self.copied_msg_id = Some((msg_id, std::time::Instant::now()));
+                clipboard::write(text)
+            }
+            Message::CopyImageToClipboard(blob_id) => {
+                if let Some((_, raw)) = self.inline_image_bytes.get(&blob_id).cloned() {
+                    return Task::perform(
+                        async move {
+                            tokio::task::spawn_blocking(move || copy_encoded_image_to_clipboard(&raw))
+                                .await
+                                .map_err(|e| format!("Clipboard task failed: {e}"))?
+                        },
+                        Message::ClipboardActionDone,
+                    );
+                }
+                Task::none()
+            }
+            Message::OpenImageLightbox(blob_id) => {
+                if self.image_handles.contains_key(&blob_id) {
+                    self.lightbox_blob_id = Some(blob_id);
+                }
+                Task::none()
+            }
+            Message::CloseImageLightbox => {
+                self.lightbox_blob_id = None;
+                Task::none()
+            }
+            Message::SaveImageAs(blob_id) => {
+                if let Some((filename, raw)) = self.inline_image_bytes.get(&blob_id).cloned() {
+                    return Task::perform(
+                        async move {
+                            if let Some(handle) = rfd::AsyncFileDialog::new()
+                                .set_file_name(&filename)
+                                .save_file()
+                                .await
+                            {
+                                std::fs::write(handle.path(), &raw)
+                                    .map_err(|e| format!("Failed to save image: {e}"))?;
+                            }
+                            Ok(())
+                        },
+                        Message::ClipboardActionDone,
+                    );
+                }
+                Task::none()
+            }
+            Message::ClipboardActionDone(res) => {
+                if let Err(err) = res {
+                    self.status_banner = Some(err);
+                }
+                Task::none()
+            }
+            Message::EscapePressed => {
+                self.lightbox_blob_id = None;
+                self.share_modal_open = false;
+                Task::none()
+            }
             Message::DownloadBlob(blob_id) => {
                 let _ = self.mesh_tx.try_send(MeshCommand::DownloadBlob { blob_id });
                 Task::none()
@@ -844,6 +977,17 @@ impl SquadApp {
             .height(Length::Fill)
             .style(root_container_style);
 
+        if let Some(blob_id) = self.lightbox_blob_id {
+            if let Some(handle) = self.image_handles.get(&blob_id) {
+                let title = self
+                    .inline_image_bytes
+                    .get(&blob_id)
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("Image Preview");
+                return stack![base, view_image_lightbox(blob_id, title, handle.clone())].into();
+            }
+        }
+
         if self.share_modal_open {
             stack![base, share_modal::view_share_modal(self)].into()
         } else {
@@ -888,6 +1032,9 @@ impl SquadApp {
     fn join_with_invite(&mut self, invite: InviteLink) {
         self.chat_messages.clear();
         self.image_handles.clear();
+        self.inline_image_bytes.clear();
+        self.copied_msg_id = None;
+        self.lightbox_blob_id = None;
         self.chat_input.clear();
         let _ = self.mesh_tx.try_send(MeshCommand::JoinRoom {
             rendezvous_server: self.config.rendezvous_server.clone(),
@@ -900,9 +1047,96 @@ impl SquadApp {
     }
 }
 
-fn read_and_compress_clipboard_image() -> Option<ClipboardPayload> {
+fn view_image_lightbox<'a>(
+    blob_id: [u8; 16],
+    filename: &'a str,
+    handle: iced_image::Handle,
+) -> Element<'a, Message> {
+    let header = row![
+        text(filename).size(14).color(M3_ON_SURFACE),
+        horizontal_space(),
+        button(text("Copy Image").size(12))
+            .padding([8, 14])
+            .style(pill_primary_button)
+            .on_press(Message::CopyImageToClipboard(blob_id)),
+        button(text("Save As...").size(12))
+            .padding([8, 14])
+            .style(pill_tonal_button)
+            .on_press(Message::SaveImageAs(blob_id)),
+        button(text("Close (Esc)").size(12))
+            .padding([8, 14])
+            .style(pill_danger_button)
+            .on_press(Message::CloseImageLightbox),
+    ]
+    .spacing(10)
+    .align_y(Vertical::Center);
+
+    let card = container(
+        column![
+            header,
+            container(
+                iced_image(handle)
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .content_fit(ContentFit::Contain),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill),
+        ]
+        .spacing(12)
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .width(Length::Fill)
+    .height(Length::Fill)
+    .padding(20)
+    .style(|_t: &Theme| container::Style {
+        background: Some(Background::Color(M3_SURFACE_CONTAINER)),
+        border: Border {
+            color: M3_OUTLINE,
+            width: 1.0,
+            radius: 16.0.into(),
+        },
+        ..Default::default()
+    });
+
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(32)
+        .style(|_t: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.84))),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn read_clipboard_payload(
+    screen: Screen,
+    text_input_focused: bool,
+    invite_empty: bool,
+) -> Option<ClipboardPayload> {
     let mut cb = arboard::Clipboard::new().ok()?;
-    let img_data = cb.get_image().ok()?;
+
+    if screen == Screen::Lobby {
+        if !text_input_focused && invite_empty {
+            if let Ok(txt) = cb.get_text() {
+                let trimmed = txt.trim();
+                if trimmed.starts_with("squad://") {
+                    return Some(ClipboardPayload::InviteUri(trimmed.to_string()));
+                }
+            }
+        }
+        return None;
+    }
+
+    if screen != Screen::Room {
+        return None;
+    }
+
+    let Ok(img_data) = cb.get_image() else {
+        return None;
+    };
     let rgba = image::RgbaImage::from_raw(
         img_data.width as u32,
         img_data.height as u32,
@@ -910,8 +1144,8 @@ fn read_and_compress_clipboard_image() -> Option<ClipboardPayload> {
     )?;
 
     let mut dyn_img = image::DynamicImage::ImageRgba8(rgba);
-    if dyn_img.width() > 1280 || dyn_img.height() > 1280 {
-        dyn_img = dyn_img.resize(1280, 1280, FilterType::Triangle);
+    if dyn_img.width() > 1920 || dyn_img.height() > 1920 {
+        dyn_img = dyn_img.resize(1920, 1920, FilterType::Triangle);
     }
 
     let ts = SystemTime::now()
@@ -919,7 +1153,7 @@ fn read_and_compress_clipboard_image() -> Option<ClipboardPayload> {
         .unwrap_or_default()
         .as_millis();
 
-    for &(max_dim, quality) in &[(1280u32, 82u8), (1280, 68), (1024, 55), (800, 45), (640, 35)] {
+    for &(max_dim, quality) in &[(1920u32, 85u8), (1280, 75), (1024, 58), (800, 45), (640, 35)] {
         if dyn_img.width() > max_dim || dyn_img.height() > max_dim {
             dyn_img = dyn_img.resize(max_dim, max_dim, FilterType::Triangle);
         }
@@ -942,6 +1176,21 @@ fn read_and_compress_clipboard_image() -> Option<ClipboardPayload> {
         return Some(ClipboardPayload::TempFile(tmp_path));
     }
     None
+}
+
+fn copy_encoded_image_to_clipboard(encoded_bytes: &[u8]) -> Result<(), String> {
+    let img = image::load_from_memory(encoded_bytes)
+        .map_err(|e| format!("Failed to decode image for clipboard: {e}"))?;
+    let rgba = img.to_rgba8();
+    let (width, height) = (rgba.width() as usize, rgba.height() as usize);
+    let mut cb =
+        arboard::Clipboard::new().map_err(|e| format!("Clipboard unavailable: {e}"))?;
+    cb.set_image(arboard::ImageData {
+        width,
+        height,
+        bytes: Cow::Owned(rgba.into_raw()),
+    })
+    .map_err(|e| format!("Failed to write image to clipboard: {e}"))
 }
 
 fn open_in_file_manager(saved_path: Option<PathBuf>) {

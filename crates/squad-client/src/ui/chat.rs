@@ -105,16 +105,33 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
         iced::Color::WHITE
     };
 
-    let meta_row = row![
+    let mut meta_items = row![
         avatar_circle(app.avatars.handle_for(&item.sender_uuid), 24.0, false),
         text(author_label).size(12).color(author_color),
         horizontal_space(),
-        text(format_utc_hhmm(item.timestamp_ms))
-            .size(11)
-            .color(M3_ON_SURFACE_VARIANT),
     ]
     .spacing(6)
     .align_y(Vertical::Center);
+
+    if let ChatContentUi::Text(ref body_text) = item.content {
+        let is_copied = app.copied_msg_id.is_some_and(|(id, _)| id == item.msg_id);
+        let copy_label = if is_copied { "Copied ✓" } else { "Copy" };
+        let copy_btn = button(text(copy_label).size(10))
+            .padding([3, 7])
+            .style(if is_copied {
+                pill_success_button
+            } else {
+                pill_tonal_button
+            })
+            .on_press(Message::CopyChatText(item.msg_id, body_text.clone()));
+        meta_items = meta_items.push(copy_btn);
+    }
+
+    let meta_row = meta_items.push(
+        text(format_utc_hhmm(item.timestamp_ms))
+            .size(11)
+            .color(M3_ON_SURFACE_VARIANT),
+    );
 
     let body: Element<'a, Message> = match &item.content {
         ChatContentUi::Text(body_text) => text(body_text).size(13).into(),
@@ -130,15 +147,36 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
                 .color(M3_ON_SURFACE_VARIANT);
 
             if let Some(handle) = app.image_handles.get(blob_id) {
-                let img_view = container(
-                    image(handle.clone())
-                        .width(Length::Fill)
-                        .content_fit(ContentFit::Contain),
+                let bid = *blob_id;
+                let clickable_img = button(
+                    container(
+                        image(handle.clone())
+                            .width(Length::Fill)
+                            .content_fit(ContentFit::Contain),
+                    )
+                    .max_height(220.0)
+                    .width(Length::Fill),
                 )
-                .max_height(220.0)
-                .width(Length::Fill);
+                .padding(0)
+                .width(Length::Fill)
+                .style(|_t: &Theme, _status| button::Style {
+                    background: None,
+                    ..Default::default()
+                })
+                .on_press(Message::OpenImageLightbox(bid));
 
-                column![img_view, caption].spacing(6).into()
+                let footer_row = row![
+                    caption,
+                    horizontal_space(),
+                    button(text("Copy Image").size(10))
+                        .padding([4, 8])
+                        .style(pill_tonal_button)
+                        .on_press(Message::CopyImageToClipboard(bid)),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center);
+
+                column![clickable_img, footer_row].spacing(6).into()
             } else {
                 let status_line: Element<'a, Message> = match state {
                     BlobTransferState::Downloading {

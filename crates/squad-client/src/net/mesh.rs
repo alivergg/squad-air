@@ -1,6 +1,7 @@
 use crate::net::nat::discover_lan_ipv4_addrs;
 use crate::net::transfer::{
-    BlobTransferState, ChatItemUi, SwarmChatManager, TransferCtx, TransferEvent,
+    app_data_root_dir, BlobTransferState, ChatItemUi, SwarmChatManager, TransferCtx,
+    TransferEvent,
 };
 use squad_dsp::{AudioEngineHandle, OutboundAudioFrame, SoundCue};
 use squad_proto::{
@@ -155,7 +156,6 @@ struct ActiveSession {
     lan_addrs: Vec<std::net::SocketAddrV4>,
     peers: HashMap<PeerId, RemotePeerState>,
     control_seq: u64,
-    history_synced: bool,
     transfer: SwarmChatManager,
     local_encoder_backend: String,
     local_stream_config: Option<StreamConfig>,
@@ -231,6 +231,9 @@ pub fn spawn_mesh_worker(
 
                             let mut transfer = SwarmChatManager::new();
                             transfer.set_initial_local_avatar(pending_local_avatar.clone());
+                            transfer.set_room_persistence(invite.room_id, app_data_root_dir());
+                            transfer.load_room_from_disk(client_uuid, &tr_tx).await;
+                            forward_transfer_events(&mut tr_rx, &evt_tx).await;
 
                             let new_sess = ActiveSession {
                                 rendezvous_addr: rv_addr,
@@ -243,7 +246,6 @@ pub fn spawn_mesh_worker(
                                 lan_addrs,
                                 peers: HashMap::new(),
                                 control_seq: 1,
-                                history_synced: false,
                                 transfer,
                                 local_encoder_backend: local_encoder_backend.clone(),
                                 local_stream_config: None,
@@ -575,6 +577,12 @@ pub fn spawn_mesh_worker(
                         continue;
                     }
                     let peer_addrs = connected_peer_map(&sess.peers);
+                    let peer_uuids: HashMap<PeerId, ClientUuid> = sess
+                        .peers
+                        .iter()
+                        .map(|(&pid, st)| (pid, st.record.client_uuid))
+                        .collect();
+                    let expected_uuids: Vec<ClientUuid> = peer_uuids.values().copied().collect();
                     let mut ctx = TransferCtx {
                         local_peer_id: sess.local_peer_id,
                         local_uuid: sess.local_uuid,
@@ -586,7 +594,9 @@ pub fn spawn_mesh_worker(
                         seal_buf: &mut seal_buf,
                         evt_tx: &tr_tx,
                     };
-                    sess.transfer.tick_10ms(&peer_addrs, &mut ctx).await;
+                    sess.transfer
+                        .tick_10ms(&peer_addrs, &peer_uuids, &expected_uuids, &mut ctx)
+                        .await;
                     forward_transfer_events(&mut tr_rx, &evt_tx).await;
                 }
 
@@ -910,11 +920,7 @@ async fn handle_p2p_rx(
         };
         sess.transfer.announce_haves_to_peer(src_addr, &mut ctx).await;
         sess.transfer.announce_avatar_to_peer(src_addr, &mut ctx).await;
-
-        if !sess.history_synced {
-            sess.history_synced = true;
-            sess.transfer.send_history_sync_req(src_addr, &mut ctx).await;
-        }
+        sess.transfer.send_history_sync_req(src_addr, &mut ctx).await;
         if let Some(cfg) = sess.local_stream_config.clone() {
             send_stream_announce_to_addr(socket, src_addr, sess, io.seal_buf, true, Some(&cfg))
                 .await;

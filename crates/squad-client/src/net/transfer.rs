@@ -1,5 +1,5 @@
 use squad_proto::{
-    ClientUuid, P2pHeader, P2pPayload, PeerId, RoomCipher, BLOB_CHUNK_SIZE,
+    ClientUuid, P2pHeader, P2pPayload, PeerId, RoomCipher, RoomId, BLOB_CHUNK_SIZE,
     INLINE_IMAGE_MAX_BYTES,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -13,8 +13,9 @@ use tokio::sync::mpsc;
 use tracing::{debug, info};
 
 const HISTORY_LIMIT: usize = 30;
-const RETRY_INTERVAL: Duration = Duration::from_millis(200);
-const MAX_RETRIES: u8 = 10;
+const RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_RETRIES: u8 = 20;
+const DELIVERY_MAX_AGE: Duration = Duration::from_secs(5);
 const CHUNK_REQ_INTERVAL: Duration = Duration::from_millis(40);
 const WINDOW_RETRY_COOLDOWN: Duration = Duration::from_millis(160);
 const QOS_MAX_CHUNKS_PER_TICK: usize = 15;
@@ -144,6 +145,23 @@ struct PendingReliable {
     next_send_at: Instant,
 }
 
+struct PendingRoomDelivery {
+    msg_id: u64,
+    payload: P2pPayload,
+    acked_by: HashSet<ClientUuid>,
+    created_at: Instant,
+    next_send_at: Instant,
+    attempts_remaining: u8,
+}
+
+#[derive(Debug, Clone)]
+struct DownloadedBlobRecord {
+    blob_id: [u8; 16],
+    path: PathBuf,
+    total_size: u64,
+    blake3_root: [u8; 32],
+}
+
 enum LocalBlobSource {
     Memory(Vec<u8>),
     Disk { path: PathBuf, total_size: u64 },
@@ -182,6 +200,12 @@ pub struct SwarmChatManager {
     history: VecDeque<HistoryEntry>,
     seen_messages: HashSet<(ClientUuid, u64)>,
     pending_reliable: Vec<PendingReliable>,
+    pending_deliveries: Vec<PendingRoomDelivery>,
+    history_sync_attempts_left: u8,
+    history_sync_next_at: Instant,
+    room_id: Option<RoomId>,
+    data_root: Option<PathBuf>,
+    downloaded_index: HashMap<[u8; 16], DownloadedBlobRecord>,
     local_blobs: HashMap<[u8; 16], LocalBlobSource>,
     remote_blobs: HashMap<[u8; 16], TrackedBlob>,
     outbound_chunks: VecDeque<(PeerId, [u8; 16], u32)>,
@@ -198,6 +222,12 @@ impl SwarmChatManager {
             history: VecDeque::with_capacity(HISTORY_LIMIT),
             seen_messages: HashSet::new(),
             pending_reliable: Vec::new(),
+            pending_deliveries: Vec::new(),
+            history_sync_attempts_left: MAX_RETRIES,
+            history_sync_next_at: Instant::now(),
+            room_id: None,
+            data_root: None,
+            downloaded_index: HashMap::new(),
             local_blobs: HashMap::new(),
             remote_blobs: HashMap::new(),
             outbound_chunks: VecDeque::new(),
@@ -205,6 +235,146 @@ impl SwarmChatManager {
             last_swarm_tick: Instant::now(),
             local_avatar: None,
             avatar_targets: HashMap::new(),
+        }
+    }
+
+    pub fn set_room_persistence(&mut self, room_id: RoomId, data_root: PathBuf) {
+        self.room_id = Some(room_id);
+        self.data_root = Some(data_root);
+    }
+
+    pub async fn load_room_from_disk(
+        &mut self,
+        local_uuid: ClientUuid,
+        evt_tx: &mpsc::Sender<TransferEvent>,
+    ) {
+        let Some(root) = self.data_root.clone() else {
+            return;
+        };
+
+        // Load downloaded files index and re-seed files whose BLAKE3 still matches.
+        for rec in read_downloaded_blobs_index(&root) {
+            if rec.path.is_file() {
+                if let Ok(actual) = hash_file_blake3(&rec.path) {
+                    if actual == rec.blake3_root {
+                        self.local_blobs.insert(
+                            rec.blob_id,
+                            LocalBlobSource::Disk {
+                                path: rec.path.clone(),
+                                total_size: rec.total_size,
+                            },
+                        );
+                        self.downloaded_index.insert(rec.blob_id, rec);
+                    }
+                }
+            }
+        }
+
+        let Some(room_id) = self.room_id else {
+            return;
+        };
+        let mut entries = read_room_history_file(&root, &room_id);
+        entries.sort_by_key(|e| (e.timestamp_ms, e.msg_id));
+        if entries.len() > HISTORY_LIMIT {
+            let drop_n = entries.len() - HISTORY_LIMIT;
+            entries.drain(0..drop_n);
+        }
+
+        for entry in entries {
+            if !self.seen_messages.insert((entry.sender_uuid, entry.msg_id)) {
+                continue;
+            }
+            let is_self = entry.sender_uuid == local_uuid;
+            let content = match &entry.payload {
+                HistoryPayload::Text(text) => ChatContentUi::Text(text.clone()),
+                HistoryPayload::BlobOffer {
+                    blob_id,
+                    kind,
+                    filename,
+                    total_size,
+                    total_chunks,
+                    blake3_root,
+                    ..
+                } => {
+                    if *kind == BLOB_KIND_INLINE_IMAGE {
+                        let cached = load_cached_inline_image(&root, blob_id, blake3_root);
+                        if let Some(ref bytes) = cached {
+                            self.local_blobs
+                                .insert(*blob_id, LocalBlobSource::Memory(bytes.clone()));
+                            ChatContentUi::InlineImage {
+                                blob_id: *blob_id,
+                                filename: filename.clone(),
+                                total_size: *total_size,
+                                bytes: Some(bytes.clone()),
+                                state: BlobTransferState::Completed { saved_path: None },
+                            }
+                        } else {
+                            self.remote_blobs.entry(*blob_id).or_insert(TrackedBlob {
+                                meta: BlobMetadata {
+                                    blob_id: *blob_id,
+                                    kind: *kind,
+                                    filename: filename.clone(),
+                                    total_size: *total_size,
+                                    total_chunks: *total_chunks,
+                                    blake3_root: *blake3_root,
+                                },
+                                seeders: HashSet::new(),
+                                seeder_rr_cursor: 0,
+                                download: None,
+                                completed: false,
+                            });
+                            ChatContentUi::InlineImage {
+                                blob_id: *blob_id,
+                                filename: filename.clone(),
+                                total_size: *total_size,
+                                bytes: None,
+                                state: BlobTransferState::Available,
+                            }
+                        }
+                    } else if let Some(rec) = self.downloaded_index.get(blob_id) {
+                        ChatContentUi::File {
+                            blob_id: *blob_id,
+                            filename: filename.clone(),
+                            total_size: *total_size,
+                            state: BlobTransferState::Completed {
+                                saved_path: Some(rec.path.clone()),
+                            },
+                        }
+                    } else {
+                        self.remote_blobs.entry(*blob_id).or_insert(TrackedBlob {
+                            meta: BlobMetadata {
+                                blob_id: *blob_id,
+                                kind: *kind,
+                                filename: filename.clone(),
+                                total_size: *total_size,
+                                total_chunks: *total_chunks,
+                                blake3_root: *blake3_root,
+                            },
+                            seeders: HashSet::new(),
+                            seeder_rr_cursor: 0,
+                            download: None,
+                            completed: false,
+                        });
+                        ChatContentUi::File {
+                            blob_id: *blob_id,
+                            filename: filename.clone(),
+                            total_size: *total_size,
+                            state: BlobTransferState::Available,
+                        }
+                    }
+                }
+            };
+
+            let item = ChatItemUi {
+                msg_id: entry.msg_id,
+                sender_uuid: entry.sender_uuid,
+                sender_nickname: entry.sender_nickname.clone(),
+                timestamp_ms: entry.timestamp_ms,
+                is_self,
+                content,
+            };
+            self.history.push_back(entry);
+            let _ = evt_tx.send(TransferEvent::ChatItemReceived(item)).await;
         }
     }
 
@@ -263,10 +433,53 @@ impl SwarmChatManager {
     }
 
     fn push_history(&mut self, entry: HistoryEntry) {
-        if self.history.len() >= HISTORY_LIMIT {
-            self.history.pop_front();
+        if self
+            .history
+            .iter()
+            .any(|e| e.sender_uuid == entry.sender_uuid && e.msg_id == entry.msg_id)
+        {
+            return;
         }
-        self.history.push_back(entry);
+        let mut list: Vec<HistoryEntry> = self.history.drain(..).collect();
+        list.push(entry);
+        list.sort_by_key(|e| (e.timestamp_ms, e.msg_id));
+        if list.len() > HISTORY_LIMIT {
+            let drop_n = list.len() - HISTORY_LIMIT;
+            list.drain(0..drop_n);
+        }
+        self.history = VecDeque::from(list);
+        self.persist_history_to_disk();
+    }
+
+    fn persist_history_to_disk(&self) {
+        let (Some(root), Some(room_id)) = (&self.data_root, &self.room_id) else {
+            return;
+        };
+        let entries: Vec<HistoryEntry> = self.history.iter().cloned().collect();
+        let _ = write_room_history_file(root, room_id, &entries);
+    }
+
+    fn record_downloaded_blob(
+        &mut self,
+        blob_id: [u8; 16],
+        path: PathBuf,
+        total_size: u64,
+        blake3_root: [u8; 32],
+    ) {
+        self.downloaded_index.insert(
+            blob_id,
+            DownloadedBlobRecord {
+                blob_id,
+                path,
+                total_size,
+                blake3_root,
+            },
+        );
+        if let Some(root) = &self.data_root {
+            let records: Vec<DownloadedBlobRecord> =
+                self.downloaded_index.values().cloned().collect();
+            let _ = write_downloaded_blobs_index(root, &records);
+        }
     }
 
     pub async fn send_chat_text(
@@ -342,6 +555,9 @@ impl SwarmChatManager {
 
         self.local_blobs
             .insert(blob_id, LocalBlobSource::Memory(bytes.clone()));
+        if let Some(root) = &self.data_root {
+            let _ = save_cached_inline_image(root, &blob_id, &bytes);
+        }
         self.seen_messages.insert((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
             sender_uuid: ctx.local_uuid,
@@ -453,6 +669,7 @@ impl SwarmChatManager {
                 total_size,
             },
         );
+        self.record_downloaded_blob(blob_id, path.clone(), total_size, blake3_root);
         self.seen_messages.insert((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
             sender_uuid: ctx.local_uuid,
@@ -461,7 +678,7 @@ impl SwarmChatManager {
             timestamp_ms,
             payload: HistoryPayload::BlobOffer {
                 blob_id,
-                kind: 2,
+                kind: BLOB_KIND_FILE,
                 auto_download: false,
                 filename: filename.clone(),
                 total_size,
@@ -496,7 +713,7 @@ impl SwarmChatManager {
             blob_id,
             msg_id,
             timestamp_ms,
-            kind: 2,
+            kind: BLOB_KIND_FILE,
             auto_download: false,
             filename,
             total_size,
@@ -621,6 +838,11 @@ impl SwarmChatManager {
             P2pPayload::ChatAck { msg_id } => {
                 self.pending_reliable
                     .retain(|p| !(p.target_peer == sender_peer_id && p.msg_id == msg_id));
+                for delivery in &mut self.pending_deliveries {
+                    if delivery.msg_id == msg_id {
+                        delivery.acked_by.insert(sender_uuid);
+                    }
+                }
             }
             P2pPayload::HistorySyncReq => {
                 let now = Instant::now();
@@ -965,6 +1187,9 @@ impl SwarmChatManager {
                     } else {
                         self.local_blobs
                             .insert(blob_id, LocalBlobSource::Memory(mem.clone()));
+                        if let Some(root) = &self.data_root {
+                            let _ = save_cached_inline_image(root, &blob_id, &mem);
+                        }
                         info!("Swarm inline image verified: {}", meta.filename);
                         let _ = ctx
                             .evt_tx
@@ -1003,6 +1228,12 @@ impl SwarmChatManager {
                                 path: final_path.clone(),
                                 total_size: meta.total_size,
                             },
+                        );
+                        self.record_downloaded_blob(
+                            blob_id,
+                            final_path.clone(),
+                            meta.total_size,
+                            meta.blake3_root,
                         );
                         info!("Swarm file download verified: {:?}", final_path);
                         let _ = ctx
@@ -1051,6 +1282,8 @@ impl SwarmChatManager {
     pub async fn tick_10ms(
         &mut self,
         peer_addrs: &HashMap<PeerId, SocketAddr>,
+        peer_uuids: &HashMap<PeerId, ClientUuid>,
+        expected_room_uuids: &[ClientUuid],
         ctx: &mut TransferCtx<'_>,
     ) {
         if ctx.local_peer_id == 0 {
@@ -1091,6 +1324,43 @@ impl SwarmChatManager {
         }
         self.last_swarm_tick = now;
 
+        self.pending_deliveries.retain(|d| {
+            let all_acked = !expected_room_uuids.is_empty()
+                && expected_room_uuids.iter().all(|u| d.acked_by.contains(u));
+            !all_acked
+                && d.attempts_remaining > 0
+                && now.duration_since(d.created_at) < DELIVERY_MAX_AGE
+        });
+
+        for idx in 0..self.pending_deliveries.len() {
+            if now >= self.pending_deliveries[idx].next_send_at {
+                let payload = self.pending_deliveries[idx].payload.clone();
+                let acked_by = &self.pending_deliveries[idx].acked_by;
+                for (&pid, &dst) in peer_addrs {
+                    let already_acked = peer_uuids
+                        .get(&pid)
+                        .is_some_and(|u| acked_by.contains(u));
+                    if !already_acked {
+                        ctx.send_p2p(dst, &payload).await;
+                    }
+                }
+                let item = &mut self.pending_deliveries[idx];
+                item.attempts_remaining = item.attempts_remaining.saturating_sub(1);
+                item.next_send_at = now + RETRY_INTERVAL;
+            }
+        }
+
+        if self.history_sync_attempts_left > 0
+            && !peer_addrs.is_empty()
+            && now >= self.history_sync_next_at
+        {
+            for &dst in peer_addrs.values() {
+                ctx.send_p2p(dst, &P2pPayload::HistorySyncReq).await;
+            }
+            self.history_sync_attempts_left = self.history_sync_attempts_left.saturating_sub(1);
+            self.history_sync_next_at = now + RETRY_INTERVAL;
+        }
+
         let mut idx = 0;
         while idx < self.pending_reliable.len() {
             let due = now >= self.pending_reliable[idx].next_send_at;
@@ -1098,7 +1368,7 @@ impl SwarmChatManager {
                 if self.pending_reliable[idx].retries_left == 0 {
                     let dropped = self.pending_reliable.swap_remove(idx);
                     debug!(
-                        "Dropping unacked msg {} for peer {}",
+                        "Dropping unacked sync msg {} for peer {}",
                         dropped.msg_id, dropped.target_peer
                     );
                     continue;
@@ -1192,16 +1462,17 @@ impl SwarmChatManager {
         ctx: &mut TransferCtx<'_>,
     ) {
         let now = Instant::now();
-        for &(peer_id, addr) in connected_peers {
+        for &(_, addr) in connected_peers {
             ctx.send_p2p(addr, payload).await;
-            self.pending_reliable.push(PendingReliable {
-                target_peer: peer_id,
-                msg_id,
-                payload: payload.clone(),
-                retries_left: MAX_RETRIES,
-                next_send_at: now + RETRY_INTERVAL,
-            });
         }
+        self.pending_deliveries.push(PendingRoomDelivery {
+            msg_id,
+            payload: payload.clone(),
+            acked_by: HashSet::new(),
+            created_at: now,
+            next_send_at: now + RETRY_INTERVAL,
+            attempts_remaining: MAX_RETRIES,
+        });
     }
 
     async fn broadcast_have(
@@ -1313,10 +1584,464 @@ fn verify_and_finalize_file(part_path: &Path, meta: &BlobMetadata) -> Result<Pat
     Ok(final_path)
 }
 
+pub fn app_data_root_dir() -> PathBuf {
+    dirs::config_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("squad-air")
+}
+
 pub fn downloads_root_dir() -> PathBuf {
     dirs::download_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Squad-Air")
+}
+
+fn room_history_path(root: &Path, room_id: &RoomId) -> PathBuf {
+    root.join("history")
+        .join(format!("{}.json", bs58::encode(room_id).into_string()))
+}
+
+fn inline_cache_path(root: &Path, blob_id: &[u8; 16]) -> PathBuf {
+    root.join("cache")
+        .join("inline")
+        .join(format!("{}.bin", bytes_to_hex(blob_id)))
+}
+
+fn downloaded_blobs_index_path(root: &Path) -> PathBuf {
+    root.join("history").join("downloaded_blobs.json")
+}
+
+fn save_cached_inline_image(root: &Path, blob_id: &[u8; 16], bytes: &[u8]) -> Result<(), String> {
+    if bytes.is_empty() || bytes.len() >= INLINE_IMAGE_MAX_BYTES {
+        return Ok(());
+    }
+    let path = inline_cache_path(root, blob_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    fs::write(path, bytes).map_err(|e| e.to_string())
+}
+
+fn load_cached_inline_image(root: &Path, blob_id: &[u8; 16], blake3_root: &[u8; 32]) -> Option<Vec<u8>> {
+    let bytes = fs::read(inline_cache_path(root, blob_id)).ok()?;
+    if bytes.is_empty() || bytes.len() >= INLINE_IMAGE_MAX_BYTES {
+        return None;
+    }
+    if *blake3::hash(&bytes).as_bytes() == *blake3_root {
+        Some(bytes)
+    } else {
+        None
+    }
+}
+
+fn write_downloaded_blobs_index(root: &Path, records: &[DownloadedBlobRecord]) -> Result<(), String> {
+    let path = downloaded_blobs_index_path(root);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut out = String::from("[\n");
+    for (idx, rec) in records.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(",\n");
+        }
+        let path_str = rec.path.to_string_lossy();
+        out.push_str(&format!(
+            "  {{\"blob_id\":\"{}\",\"path\":\"{}\",\"total_size\":{},\"blake3_root\":\"{}\"}}",
+            bytes_to_hex(&rec.blob_id),
+            json_escape(&path_str),
+            rec.total_size,
+            bytes_to_hex(&rec.blake3_root),
+        ));
+    }
+    out.push_str("\n]\n");
+    fs::write(path, out).map_err(|e| e.to_string())
+}
+
+fn read_downloaded_blobs_index(root: &Path) -> Vec<DownloadedBlobRecord> {
+    let Ok(raw) = fs::read_to_string(downloaded_blobs_index_path(root)) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for obj in parse_json_object_array(&raw) {
+        let Some(blob_hex) = obj.get("blob_id").and_then(JsonVal::as_str) else {
+            continue;
+        };
+        let Some(path_str) = obj.get("path").and_then(JsonVal::as_str) else {
+            continue;
+        };
+        let Some(total_size) = obj.get("total_size").and_then(JsonVal::as_u64) else {
+            continue;
+        };
+        let Some(hash_hex) = obj.get("blake3_root").and_then(JsonVal::as_str) else {
+            continue;
+        };
+        if let (Some(blob_id), Some(blake3_root)) = (hex_to_16(blob_hex), hex_to_32(hash_hex)) {
+            out.push(DownloadedBlobRecord {
+                blob_id,
+                path: PathBuf::from(path_str),
+                total_size,
+                blake3_root,
+            });
+        }
+    }
+    out
+}
+
+fn write_room_history_file(
+    root: &Path,
+    room_id: &RoomId,
+    entries: &[HistoryEntry],
+) -> Result<(), String> {
+    let path = room_history_path(root, room_id);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    let mut out = String::from("[\n");
+    for (idx, e) in entries.iter().enumerate() {
+        if idx > 0 {
+            out.push_str(",\n");
+        }
+        let sender_hex = bytes_to_hex(&e.sender_uuid);
+        let nick_esc = json_escape(&e.sender_nickname);
+        match &e.payload {
+            HistoryPayload::Text(text) => {
+                out.push_str(&format!(
+                    "  {{\"msg_id\":{},\"sender_uuid\":\"{}\",\"sender_nickname\":\"{}\",\"timestamp_ms\":{},\"kind\":0,\"text\":\"{}\"}}",
+                    e.msg_id,
+                    sender_hex,
+                    nick_esc,
+                    e.timestamp_ms,
+                    json_escape(text),
+                ));
+            }
+            HistoryPayload::BlobOffer {
+                blob_id,
+                kind,
+                auto_download,
+                filename,
+                total_size,
+                chunk_size,
+                total_chunks,
+                blake3_root,
+            } => {
+                out.push_str(&format!(
+                    "  {{\"msg_id\":{},\"sender_uuid\":\"{}\",\"sender_nickname\":\"{}\",\"timestamp_ms\":{},\"kind\":{},\"blob_id\":\"{}\",\"auto_download\":{},\"filename\":\"{}\",\"total_size\":{},\"chunk_size\":{},\"total_chunks\":{},\"blake3_root\":\"{}\"}}",
+                    e.msg_id,
+                    sender_hex,
+                    nick_esc,
+                    e.timestamp_ms,
+                    kind,
+                    bytes_to_hex(blob_id),
+                    auto_download,
+                    json_escape(filename),
+                    total_size,
+                    chunk_size,
+                    total_chunks,
+                    bytes_to_hex(blake3_root),
+                ));
+            }
+        }
+    }
+    out.push_str("\n]\n");
+    fs::write(path, out).map_err(|e| e.to_string())
+}
+
+fn read_room_history_file(root: &Path, room_id: &RoomId) -> Vec<HistoryEntry> {
+    let Ok(raw) = fs::read_to_string(room_history_path(root, room_id)) else {
+        return Vec::new();
+    };
+    let mut entries = Vec::new();
+    for obj in parse_json_object_array(&raw) {
+        let Some(msg_id) = obj.get("msg_id").and_then(JsonVal::as_u64) else {
+            continue;
+        };
+        let Some(sender_uuid) = obj
+            .get("sender_uuid")
+            .and_then(JsonVal::as_str)
+            .and_then(hex_to_16)
+        else {
+            continue;
+        };
+        let sender_nickname = obj
+            .get("sender_nickname")
+            .and_then(JsonVal::as_str)
+            .unwrap_or("Peer")
+            .to_string();
+        let Some(timestamp_ms) = obj.get("timestamp_ms").and_then(JsonVal::as_u64) else {
+            continue;
+        };
+        let Some(kind) = obj.get("kind").and_then(JsonVal::as_u64) else {
+            continue;
+        };
+
+        let payload = if kind == 0 {
+            let text = obj
+                .get("text")
+                .and_then(JsonVal::as_str)
+                .unwrap_or("")
+                .to_string();
+            HistoryPayload::Text(text)
+        } else {
+            let Some(blob_id) = obj
+                .get("blob_id")
+                .and_then(JsonVal::as_str)
+                .and_then(hex_to_16)
+            else {
+                continue;
+            };
+            let auto_download = obj
+                .get("auto_download")
+                .and_then(JsonVal::as_bool)
+                .unwrap_or(kind == 1);
+            let filename = obj
+                .get("filename")
+                .and_then(JsonVal::as_str)
+                .unwrap_or("attachment")
+                .to_string();
+            let Some(total_size) = obj.get("total_size").and_then(JsonVal::as_u64) else {
+                continue;
+            };
+            let chunk_size = obj
+                .get("chunk_size")
+                .and_then(JsonVal::as_u64)
+                .unwrap_or(BLOB_CHUNK_SIZE as u64) as u16;
+            let total_chunks = obj
+                .get("total_chunks")
+                .and_then(JsonVal::as_u64)
+                .unwrap_or(1) as u32;
+            let Some(blake3_root) = obj
+                .get("blake3_root")
+                .and_then(JsonVal::as_str)
+                .and_then(hex_to_32)
+            else {
+                continue;
+            };
+            HistoryPayload::BlobOffer {
+                blob_id,
+                kind: kind as u8,
+                auto_download,
+                filename,
+                total_size,
+                chunk_size,
+                total_chunks,
+                blake3_root,
+            }
+        };
+
+        entries.push(HistoryEntry {
+            sender_uuid,
+            sender_nickname,
+            msg_id,
+            timestamp_ms,
+            payload,
+        });
+    }
+    entries
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        use std::fmt::Write;
+        let _ = write!(&mut s, "{b:02x}");
+    }
+    s
+}
+
+fn hex_to_16(hex: &str) -> Option<[u8; 16]> {
+    let t = hex.trim();
+    if t.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(t.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn hex_to_32(hex: &str) -> Option<[u8; 32]> {
+    let t = hex.trim();
+    if t.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (i, slot) in out.iter_mut().enumerate() {
+        *slot = u8::from_str_radix(t.get(i * 2..i * 2 + 2)?, 16).ok()?;
+    }
+    Some(out)
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(&mut out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out
+}
+
+enum JsonVal {
+    Str(String),
+    Num(u64),
+    Bool(bool),
+}
+
+impl JsonVal {
+    fn as_str(&self) -> Option<&str> {
+        match self {
+            JsonVal::Str(s) => Some(s.as_str()),
+            _ => None,
+        }
+    }
+    fn as_u64(&self) -> Option<u64> {
+        match self {
+            JsonVal::Num(n) => Some(*n),
+            _ => None,
+        }
+    }
+    fn as_bool(&self) -> Option<bool> {
+        match self {
+            JsonVal::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+}
+
+fn parse_json_object_array(input: &str) -> Vec<HashMap<String, JsonVal>> {
+    let bytes = input.as_bytes();
+    let mut i = 0usize;
+    let skip_ws = |idx: &mut usize| {
+        while *idx < bytes.len() && bytes[*idx].is_ascii_whitespace() {
+            *idx += 1;
+        }
+    };
+
+    skip_ws(&mut i);
+    if i >= bytes.len() || bytes[i] != b'[' {
+        return Vec::new();
+    }
+    i += 1;
+
+    let mut objs = Vec::new();
+    loop {
+        skip_ws(&mut i);
+        if i >= bytes.len() || bytes[i] == b']' {
+            break;
+        }
+        if bytes[i] == b',' {
+            i += 1;
+            continue;
+        }
+        if bytes[i] != b'{' {
+            break;
+        }
+        i += 1;
+        let mut map = HashMap::new();
+        loop {
+            skip_ws(&mut i);
+            if i >= bytes.len() || bytes[i] == b'}' {
+                i += 1;
+                break;
+            }
+            if bytes[i] == b',' {
+                i += 1;
+                continue;
+            }
+            let Some(key) = parse_json_string(input, &mut i) else {
+                return objs;
+            };
+            skip_ws(&mut i);
+            if i >= bytes.len() || bytes[i] != b':' {
+                return objs;
+            }
+            i += 1;
+            skip_ws(&mut i);
+            if i >= bytes.len() {
+                return objs;
+            }
+            let val = if bytes[i] == b'"' {
+                let Some(s) = parse_json_string(input, &mut i) else {
+                    return objs;
+                };
+                JsonVal::Str(s)
+            } else if input[i..].starts_with("true") {
+                i += 4;
+                JsonVal::Bool(true)
+            } else if input[i..].starts_with("false") {
+                i += 5;
+                JsonVal::Bool(false)
+            } else {
+                let start = i;
+                while i < bytes.len() && bytes[i].is_ascii_digit() {
+                    i += 1;
+                }
+                if i == start {
+                    return objs;
+                }
+                let n = input[start..i].parse::<u64>().unwrap_or(0);
+                JsonVal::Num(n)
+            };
+            map.insert(key, val);
+        }
+        objs.push(map);
+    }
+    objs
+}
+
+fn parse_json_string(input: &str, idx: &mut usize) -> Option<String> {
+    let bytes = input.as_bytes();
+    if *idx >= bytes.len() || bytes[*idx] != b'"' {
+        return None;
+    }
+    *idx += 1;
+    let mut out = String::new();
+    while *idx < bytes.len() {
+        let b = bytes[*idx];
+        if b == b'"' {
+            *idx += 1;
+            return Some(out);
+        }
+        if b == b'\\' {
+            *idx += 1;
+            if *idx >= bytes.len() {
+                return None;
+            }
+            match bytes[*idx] {
+                b'"' => out.push('"'),
+                b'\\' => out.push('\\'),
+                b'/' => out.push('/'),
+                b'n' => out.push('\n'),
+                b'r' => out.push('\r'),
+                b't' => out.push('\t'),
+                b'u' => {
+                    let hex = input.get(*idx + 1..*idx + 5)?;
+                    let code = u32::from_str_radix(hex, 16).ok()?;
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    }
+                    *idx += 4;
+                }
+                other => out.push(other as char),
+            }
+            *idx += 1;
+        } else {
+            let ch = input[*idx..].chars().next()?;
+            out.push(ch);
+            *idx += ch.len_utf8();
+        }
+    }
+    None
 }
 
 fn sanitize_filename(raw: &str) -> String {
@@ -1480,6 +2205,10 @@ mod tests {
         ab_map.insert(2, addr_b);
         let mut ba_map = HashMap::new();
         ba_map.insert(1, addr_a);
+        let mut uuids = HashMap::new();
+        uuids.insert(1u16, [0x11; 16]);
+        uuids.insert(2u16, [0x22; 16]);
+        uuids.insert(3u16, [0x33; 16]);
 
         let mut b_got_text = false;
         let mut b_got_img = false;
@@ -1498,7 +2227,7 @@ mod tests {
                     evt_tx: &tx_b,
                 };
                 pump_socket(&mut mgr_b, &nicks, &ba_list, &mut ctx_b).await;
-                mgr_b.tick_10ms(&ba_map, &mut ctx_b).await;
+                mgr_b.tick_10ms(&ba_map, &uuids, &[[0x11; 16]], &mut ctx_b).await;
             }
             {
                 let mut ctx_a = TransferCtx {
@@ -1513,7 +2242,7 @@ mod tests {
                     evt_tx: &tx_a,
                 };
                 pump_socket(&mut mgr_a, &nicks, &ab_list, &mut ctx_a).await;
-                mgr_a.tick_10ms(&ab_map, &mut ctx_a).await;
+                mgr_a.tick_10ms(&ab_map, &uuids, &[[0x22; 16]], &mut ctx_a).await;
             }
 
             while let Ok(ev) = rx_b.try_recv() {
@@ -1540,7 +2269,7 @@ mod tests {
             }
         }
         assert!(b_got_text && b_got_img);
-        assert!(mgr_a.pending_reliable.is_empty());
+        assert!(mgr_a.pending_deliveries.is_empty());
 
         {
             let mut ctx_c = TransferCtx {
@@ -1583,7 +2312,9 @@ mod tests {
                     evt_tx: &tx_b,
                 };
                 pump_socket(&mut mgr_b, &nicks, &bc_list, &mut ctx_b).await;
-                mgr_b.tick_10ms(&bc_map, &mut ctx_b).await;
+                mgr_b
+                    .tick_10ms(&bc_map, &uuids, &[[0x11; 16], [0x33; 16]], &mut ctx_b)
+                    .await;
             }
             {
                 let mut ctx_c = TransferCtx {
@@ -1598,7 +2329,9 @@ mod tests {
                     evt_tx: &tx_c,
                 };
                 pump_socket(&mut mgr_c, &nicks, &cb_list, &mut ctx_c).await;
-                mgr_c.tick_10ms(&cb_map, &mut ctx_c).await;
+                mgr_c
+                    .tick_10ms(&cb_map, &uuids, &[[0x11; 16], [0x22; 16]], &mut ctx_c)
+                    .await;
             }
 
             while let Ok(ev) = rx_c.try_recv() {
@@ -1694,7 +2427,9 @@ mod tests {
                     evt_tx: &tx_b,
                 };
                 pump_socket(&mut mgr_b, &nicks, &ba_list, &mut ctx_b).await;
-                mgr_b.tick_10ms(&ba_map, &mut ctx_b).await;
+                mgr_b
+                    .tick_10ms(&ba_map, &uuids, &[[0x11; 16]], &mut ctx_b)
+                    .await;
             }
             {
                 let mut ctx_a = TransferCtx {
@@ -1709,7 +2444,9 @@ mod tests {
                     evt_tx: &tx_a,
                 };
                 pump_socket(&mut mgr_a, &nicks, &ab_list, &mut ctx_a).await;
-                mgr_a.tick_10ms(&ab_map, &mut ctx_a).await;
+                mgr_a
+                    .tick_10ms(&ab_map, &uuids, &[[0x22; 16]], &mut ctx_a)
+                    .await;
             }
 
             while let Ok(ev) = rx_b.try_recv() {
