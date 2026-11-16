@@ -338,6 +338,39 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
         .padding(20)
         .style(surface_card_style);
 
+    let min_to_tray = app.config.minimize_to_tray;
+    let behavior_section = container(
+        column![
+            text("Behavior & System Tray").size(16).color(M3_PRIMARY),
+            row![
+                column![
+                    text("Minimize to System Tray on Close").size(13),
+                    text("Keep P2P voice mesh and tray icon active when closing the window")
+                        .size(11)
+                        .color(M3_ON_SURFACE_VARIANT),
+                ]
+                .spacing(2),
+                horizontal_space(),
+                row![
+                    button(text("Off").size(12))
+                        .padding([6, 12])
+                        .style(pill_chip_button(!min_to_tray))
+                        .on_press(Message::SetMinimizeToTray(false)),
+                    button(text("On").size(12))
+                        .padding([6, 12])
+                        .style(pill_chip_button(min_to_tray))
+                        .on_press(Message::SetMinimizeToTray(true)),
+                ]
+                .spacing(6),
+            ]
+            .align_y(Vertical::Center),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fill)
+    .padding(20)
+    .style(surface_card_style);
+
     column![
         top_bar,
         scrollable(
@@ -346,6 +379,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                 devices_section,
                 dsp_section,
                 hotkeys_section,
+                behavior_section,
             ]
             .spacing(16)
         )

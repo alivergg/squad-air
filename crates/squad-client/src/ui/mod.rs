@@ -135,6 +135,8 @@ pub enum Message {
     PickAvatarImage,
     AvatarImagePicked(Option<PathBuf>),
     ResetAvatarIdenticon,
+    SetMinimizeToTray(bool),
+    WindowCloseRequested(iced::window::Id),
 }
 
 pub struct SquadApp {
@@ -325,7 +327,8 @@ impl SquadApp {
             }
             _ => None,
         });
-        Subscription::batch([tick, keys])
+        let close_reqs = iced::window::close_requests().map(Message::WindowCloseRequested);
+        Subscription::batch([tick, keys, close_reqs])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -337,10 +340,21 @@ impl SquadApp {
                         self.copied_msg_id = None;
                     }
                 }
-                if let Some(TrayAction::Quit) = self.tray.poll_action(&self.audio) {
-                    let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
-                    self.audio.shutdown();
-                    std::process::exit(0);
+                match self.tray.poll_action(&self.audio) {
+                    Some(TrayAction::ShowWindow) => {
+                        return iced::window::get_latest().and_then(|id| {
+                            Task::batch([
+                                iced::window::change_mode(id, iced::window::Mode::Windowed),
+                                iced::window::gain_focus(id),
+                            ])
+                        });
+                    }
+                    Some(TrayAction::Quit) => {
+                        let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
+                        self.audio.shutdown();
+                        return iced::exit();
+                    }
+                    Some(TrayAction::ToggleMute) | None => {}
                 }
 
                 if let Ok(mut rx) = self.mesh_rx.try_lock() {
@@ -971,6 +985,20 @@ impl SquadApp {
                     self.stream_fullscreen = false;
                     return set_window_fullscreen_task(false);
                 }
+                Task::none()
+            }
+            Message::WindowCloseRequested(window_id) => {
+                if self.config.minimize_to_tray {
+                    iced::window::change_mode(window_id, iced::window::Mode::Hidden)
+                } else {
+                    let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
+                    self.audio.shutdown();
+                    iced::exit()
+                }
+            }
+            Message::SetMinimizeToTray(enabled) => {
+                self.config.minimize_to_tray = enabled;
+                let _ = self.config.save();
                 Task::none()
             }
             Message::PickAvatarImage => Task::perform(

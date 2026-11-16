@@ -5,12 +5,14 @@ use tray_icon::{
 };
 
 pub enum TrayAction {
+    ShowWindow,
     ToggleMute,
     Quit,
 }
 
 pub struct SystemTray {
     _tray: Option<TrayIcon>,
+    show_item_id: Option<tray_icon::menu::MenuId>,
     mute_item_id: Option<tray_icon::menu::MenuId>,
     quit_item_id: Option<tray_icon::menu::MenuId>,
 }
@@ -18,16 +20,19 @@ pub struct SystemTray {
 impl SystemTray {
     pub fn new() -> Self {
         let menu = Menu::new();
+        let show_item = MenuItem::new("Show Squad-Air", true, None);
         let mute_item = MenuItem::new("Squad-Air: Toggle Mic Mute", true, None);
         let quit_item = MenuItem::new("Quit Squad-Air", true, None);
 
+        let show_id = show_item.id().clone();
         let mute_id = mute_item.id().clone();
         let quit_id = quit_item.id().clone();
 
+        let _ = menu.append(&show_item);
         let _ = menu.append(&mute_item);
         let _ = menu.append(&quit_item);
 
-        let icon = build_procedural_icon();
+        let icon = load_custom_tray_icon().or_else(build_procedural_icon);
         let tray = icon.and_then(|ic| {
             TrayIconBuilder::new()
                 .with_tooltip("Squad-Air P2P Voice")
@@ -39,6 +44,7 @@ impl SystemTray {
 
         Self {
             _tray: tray,
+            show_item_id: Some(show_id),
             mute_item_id: Some(mute_id),
             quit_item_id: Some(quit_id),
         }
@@ -46,6 +52,9 @@ impl SystemTray {
 
     pub fn poll_action(&self, audio: &AudioEngineHandle) -> Option<TrayAction> {
         while let Ok(event) = MenuEvent::receiver().try_recv() {
+            if Some(&event.id) == self.show_item_id.as_ref() {
+                return Some(TrayAction::ShowWindow);
+            }
             if Some(&event.id) == self.mute_item_id.as_ref() {
                 let next_mute = !audio.is_mic_muted();
                 audio.set_mic_muted(next_mute);
@@ -62,6 +71,15 @@ impl SystemTray {
         }
         None
     }
+}
+
+fn load_custom_tray_icon() -> Option<Icon> {
+    let bytes = include_bytes!("../../../assets/icons/icon.png");
+    let img = image::load_from_memory(bytes).ok()?;
+    let resized = img
+        .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    Icon::from_rgba(resized.into_raw(), 64, 64).ok()
 }
 
 fn build_procedural_icon() -> Option<Icon> {

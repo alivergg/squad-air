@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 mod config;
 mod hotkeys;
 mod net;
@@ -16,6 +18,8 @@ const INFO_PLIST_STR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <string>com.squadair.client</string>
     <key>CFBundleName</key>
     <string>Squad-Air</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>Squad-Air uses your microphone for end-to-end encrypted P2P voice chat.</string>
 </dict>
@@ -39,6 +43,15 @@ const fn build_info_plist() -> [u8; INFO_PLIST_STR.len()] {
 #[used]
 static INFO_PLIST: [u8; INFO_PLIST_STR.len()] = build_info_plist();
 
+fn load_window_icon() -> Option<iced::window::Icon> {
+    let bytes = include_bytes!("../../../assets/icons/icon.png");
+    let img = image::load_from_memory(bytes).ok()?;
+    let resized = img
+        .resize_exact(64, 64, image::imageops::FilterType::Lanczos3)
+        .to_rgba8();
+    iced::window::icon::from_rgba(resized.into_raw(), 64, 64).ok()
+}
+
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -59,6 +72,11 @@ fn main() -> iced::Result {
     iced::application(SquadApp::title, SquadApp::update, SquadApp::view)
         .subscription(SquadApp::subscription)
         .theme(SquadApp::theme)
-        .window_size(Size::new(1180.0, 740.0))
+        .window(iced::window::Settings {
+            size: Size::new(1180.0, 740.0),
+            icon: load_window_icon(),
+            ..Default::default()
+        })
+        .exit_on_close_request(false)
         .run_with(SquadApp::new)
 }
