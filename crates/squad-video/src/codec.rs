@@ -1,18 +1,58 @@
-use crate::capture::RawRgbaFrame;
+use crate::capture::{RawRgbaFrame, VideoCodec};
+use flate2::{
+    read::DeflateDecoder,
+    write::DeflateEncoder,
+    Compression,
+};
+use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageFormat};
+use std::fmt;
+use std::io::{Cursor, Read, Write};
 
 const ANNEX_B_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
+
 const NAL_SPS: u8 = 0x67;
 const NAL_PPS: u8 = 0x68;
 const NAL_IDR: u8 = 0x65;
 const NAL_SLICE: u8 = 0x41;
 
-const P_TILE_SIZE: usize = 8;
+const NAL_HEVC_VPS: u8 = 0x40;
+const NAL_HEVC_SPS: u8 = 0x42;
+const NAL_HEVC_PPS: u8 = 0x44;
+const NAL_HEVC_IDR: u8 = 0x26;
+const NAL_HEVC_SLICE: u8 = 0x02;
+
+const IDR_MODE_DEFLATE_RGB: u8 = 0x01;
+const IDR_MODE_JPEG_FULL: u8 = 0x02;
+
+const P_MODE_DEFLATE_TILES: u8 = 0x01;
+const P_MODE_JPEG_TILES: u8 = 0x02;
+
+const P_TILE_SIZE: usize = 64;
+const MAX_IDR_PAYLOAD_BYTES: usize = 160 * 1024;
+const FLAT_IDR_DEFLATE_LIMIT: usize = 48 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct EncodedVideoFrame {
     pub is_keyframe: bool,
     pub annex_b: Vec<u8>,
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DecoderError {
+    UnsupportedCodec(String),
+    CorruptBitstream,
+}
+
+impl fmt::Display for DecoderError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DecoderError::UnsupportedCodec(msg) => write!(f, "Unsupported video codec: {msg}"),
+            DecoderError::CorruptBitstream => write!(f, "Corrupt video bitstream"),
+        }
+    }
+}
+
+impl std::error::Error for DecoderError {}
 
 pub fn detect_hardware_encoder_backend() -> String {
     #[cfg(target_os = "macos")]
@@ -54,52 +94,88 @@ pub fn detect_hardware_encoder_backend() -> String {
     }
 }
 
+pub fn is_hevc_hardware_supported() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        #[link(name = "VideoToolbox", kind = "framework")]
+        extern "C" {
+            fn VTIsHardwareDecodeSupported(codec_type: u32) -> u8;
+        }
+        const K_CM_VIDEO_CODEC_TYPE_HEVC: u32 = 0x6876_6331; // 'hvc1'
+        unsafe { VTIsHardwareDecodeSupported(K_CM_VIDEO_CODEC_TYPE_HEVC) != 0 }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        use windows::Win32::Graphics::Dxgi::{
+            CreateDXGIFactory1, IDXGIFactory1, DXGI_ADAPTER_DESC1, DXGI_ADAPTER_FLAG_SOFTWARE,
+        };
+        unsafe {
+            if let Ok(factory) = CreateDXGIFactory1::<IDXGIFactory1>() {
+                if let Ok(adapter) = factory.EnumAdapters1(0) {
+                    let mut desc = DXGI_ADAPTER_DESC1::default();
+                    if adapter.GetDesc1(&mut desc).is_ok() {
+                        return (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) == 0;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        true
+    }
+}
+
 pub struct H264Encoder {
     fps: u8,
     bitrate_bps: u32,
+    codec: VideoCodec,
     gop_len: u64,
     frame_index: u64,
     force_idr: bool,
     width: u32,
     height: u32,
-    sub: usize,
-    q_shift: u8,
-    plane_w: usize,
-    plane_h: usize,
-    c_w: usize,
-    c_h: usize,
-    ref_y: Vec<u8>,
-    ref_cb: Vec<u8>,
-    ref_cr: Vec<u8>,
-    cur_y: Vec<u8>,
-    cur_cb: Vec<u8>,
-    cur_cr: Vec<u8>,
+    ref_rgba: Vec<u8>,
+    scratch_rgb: Vec<u8>,
+    scratch_dpcm: Vec<u8>,
+    scratch_strip: Vec<u8>,
 }
 
 impl H264Encoder {
     pub fn new(fps: u8, bitrate_bps: u32) -> Self {
+        Self::new_with_codec(fps, bitrate_bps, VideoCodec::H264)
+    }
+
+    pub fn new_with_codec(fps: u8, bitrate_bps: u32, codec: VideoCodec) -> Self {
         let clamped_fps = fps.max(1);
         Self {
             fps: clamped_fps,
             bitrate_bps: bitrate_bps.max(500_000),
+            codec,
             gop_len: u64::from(clamped_fps) * 2,
             frame_index: 0,
             force_idr: true,
             width: 0,
             height: 0,
-            sub: 4,
-            q_shift: 2,
-            plane_w: 0,
-            plane_h: 0,
-            c_w: 0,
-            c_h: 0,
-            ref_y: Vec::new(),
-            ref_cb: Vec::new(),
-            ref_cr: Vec::new(),
-            cur_y: Vec::new(),
-            cur_cb: Vec::new(),
-            cur_cr: Vec::new(),
+            ref_rgba: Vec::new(),
+            scratch_rgb: Vec::new(),
+            scratch_dpcm: Vec::new(),
+            scratch_strip: Vec::new(),
         }
+    }
+
+    pub fn set_codec(&mut self, codec: VideoCodec) {
+        if self.codec != codec {
+            self.codec = codec;
+            self.force_idr = true;
+        }
+    }
+
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
     }
 
     pub fn force_keyframe(&mut self) {
@@ -109,25 +185,38 @@ impl H264Encoder {
     pub fn encode(&mut self, frame: &RawRgbaFrame) -> EncodedVideoFrame {
         let width = frame.width.max(2);
         let height = frame.height.max(2);
-        let dims_changed = width != self.width || height != self.height;
-        let is_keyframe =
+        let expected_rgba_len = (width as usize) * (height as usize) * 4;
+        let dims_changed =
+            width != self.width || height != self.height || self.ref_rgba.len() != expected_rgba_len;
+
+        let mut is_keyframe =
             self.force_idr || dims_changed || self.frame_index.is_multiple_of(self.gop_len);
 
         self.width = width;
         self.height = height;
         self.frame_index = self.frame_index.wrapping_add(1);
 
-        let mut annex_b = Vec::with_capacity(4096);
+        let p_payload = if is_keyframe {
+            None
+        } else {
+            self.try_encode_p_payload(frame)
+        };
 
+        if p_payload.is_none() {
+            is_keyframe = true;
+        }
+
+        let mut annex_b = Vec::with_capacity(8192);
         if is_keyframe {
             self.force_idr = false;
-            write_nal(&mut annex_b, NAL_SPS, &encode_sps(width, height, self.fps));
-            write_nal(&mut annex_b, NAL_PPS, &[self.q_shift, (self.bitrate_bps / 1_000_000) as u8]);
             let idr_payload = self.encode_idr_payload(frame);
-            write_nal(&mut annex_b, NAL_IDR, &idr_payload);
-        } else {
-            let p_payload = self.encode_p_payload(frame);
-            write_nal(&mut annex_b, NAL_SLICE, &p_payload);
+            self.emit_keyframe_nals(&mut annex_b, width, height, &idr_payload);
+        } else if let Some(p_bytes) = p_payload {
+            let nal_type = match self.codec {
+                VideoCodec::H264 => NAL_SLICE,
+                VideoCodec::H265 => NAL_HEVC_SLICE,
+            };
+            write_nal(&mut annex_b, nal_type, &p_bytes);
         }
 
         EncodedVideoFrame {
@@ -136,229 +225,222 @@ impl H264Encoder {
         }
     }
 
-    fn idr_budget_bytes(&self) -> usize {
-        if self.bitrate_bps >= 12_000_000 {
-            72_000
-        } else if self.bitrate_bps >= 8_000_000 {
-            52_000
-        } else {
-            34_000
+    fn emit_keyframe_nals(&self, out: &mut Vec<u8>, width: u32, height: u32, idr_payload: &[u8]) {
+        let sps = encode_sps(width, height, self.fps);
+        let pps = [self.codec.as_u8(), (self.bitrate_bps / 1_000_000) as u8];
+        match self.codec {
+            VideoCodec::H264 => {
+                write_nal(out, NAL_SPS, &sps);
+                write_nal(out, NAL_PPS, &pps);
+                write_nal(out, NAL_IDR, idr_payload);
+            }
+            VideoCodec::H265 => {
+                write_nal(out, NAL_HEVC_VPS, &[0x01, self.fps]);
+                write_nal(out, NAL_HEVC_SPS, &sps);
+                write_nal(out, NAL_HEVC_PPS, &pps);
+                write_nal(out, NAL_HEVC_IDR, idr_payload);
+            }
         }
     }
 
     fn p_budget_bytes(&self) -> usize {
-        if self.bitrate_bps >= 12_000_000 {
-            24_000
+        let base = if self.bitrate_bps >= 12_000_000 {
+            48_000
         } else if self.bitrate_bps >= 8_000_000 {
-            16_000
+            34_000
         } else {
-            10_000
+            24_000
+        };
+        if self.codec == VideoCodec::H265 {
+            (base * 115) / 100
+        } else {
+            base
         }
     }
 
-    fn encode_idr_payload(&mut self, frame: &RawRgbaFrame) -> Vec<u8> {
-        let pixel_count = (self.width as usize) * (self.height as usize);
-        let idr_budget = self.idr_budget_bytes();
-        let candidates: &[(usize, u8)] = if pixel_count <= 1280 * 720 {
-            &[(1, 2), (2, 2), (2, 3), (4, 2), (4, 3), (8, 3), (8, 4)]
-        } else {
-            &[(2, 2), (2, 3), (4, 2), (4, 3), (8, 3), (8, 4), (16, 4)]
-        };
+    fn idr_qualities(&self) -> &'static [u8] {
+        match (self.codec, self.bitrate_bps) {
+            (VideoCodec::H265, b) if b >= 12_000_000 => &[86, 76, 66, 54, 42, 30],
+            (VideoCodec::H265, b) if b >= 8_000_000 => &[80, 70, 58, 46, 36, 26],
+            (VideoCodec::H265, _) => &[74, 62, 50, 40, 30, 22],
+            (VideoCodec::H264, b) if b >= 12_000_000 => &[82, 72, 62, 50, 38, 28],
+            (VideoCodec::H264, b) if b >= 8_000_000 => &[76, 66, 54, 44, 34, 24],
+            (VideoCodec::H264, _) => &[70, 58, 48, 38, 28, 20],
+        }
+    }
 
-        let mut best_payload = Vec::new();
-        for &(sub, q_shift) in candidates {
-            self.sample_rgba_planes(frame, sub, q_shift);
-            let encoded = self.serialize_idr_planes(sub, q_shift);
-            best_payload = encoded;
-            if best_payload.len() <= idr_budget {
+    fn p_tile_quality(&self) -> u8 {
+        match (self.codec, self.bitrate_bps) {
+            (VideoCodec::H265, b) if b >= 12_000_000 => 84,
+            (VideoCodec::H265, b) if b >= 8_000_000 => 78,
+            (VideoCodec::H265, _) => 72,
+            (VideoCodec::H264, b) if b >= 12_000_000 => 80,
+            (VideoCodec::H264, b) if b >= 8_000_000 => 74,
+            (VideoCodec::H264, _) => 68,
+        }
+    }
+
+    fn copy_rgba_to_ref_and_rgb(&mut self, frame: &RawRgbaFrame) -> (bool, bool) {
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let pixel_count = w * h;
+        let rgba_len = pixel_count * 4;
+
+        self.ref_rgba.resize(rgba_len, 255);
+        let copy_len = frame.rgba.len().min(rgba_len);
+        self.ref_rgba[..copy_len].copy_from_slice(&frame.rgba[..copy_len]);
+        if copy_len < rgba_len {
+            self.ref_rgba[copy_len..].fill(255);
+        }
+
+        self.scratch_rgb.resize(pixel_count * 3, 0);
+        let mut all_achromatic = true;
+        let mut transitions = 0usize;
+        let mut prev_pixel = [0u8; 3];
+
+        for (i, (src, dst)) in self
+            .ref_rgba
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(self.scratch_rgb.as_chunks_mut::<3>().0.iter_mut())
+            .enumerate()
+        {
+            dst[0] = src[0];
+            dst[1] = src[1];
+            dst[2] = src[2];
+            if src[0] != src[1] || src[1] != src[2] {
+                all_achromatic = false;
+            }
+            if i % w != 0 && *dst != prev_pixel {
+                transitions += 1;
+            }
+            prev_pixel = *dst;
+        }
+
+        let is_flat = transitions * 10 <= pixel_count;
+        (all_achromatic, is_flat)
+    }
+
+    fn encode_idr_payload(&mut self, frame: &RawRgbaFrame) -> Vec<u8> {
+        let w = self.width;
+        let h = self.height;
+        let (all_achromatic, is_flat) = self.copy_rgba_to_ref_and_rgb(frame);
+
+        if is_flat || all_achromatic {
+            dpcm_row_sub_rgb(&self.scratch_rgb, w as usize, &mut self.scratch_dpcm);
+            if let Some(compressed) = deflate_fast(&self.scratch_dpcm) {
+                let limit = if all_achromatic {
+                    MAX_IDR_PAYLOAD_BYTES
+                } else {
+                    FLAT_IDR_DEFLATE_LIMIT
+                };
+                if 1 + compressed.len() <= limit {
+                    let mut out = Vec::with_capacity(1 + compressed.len());
+                    out.push(IDR_MODE_DEFLATE_RGB);
+                    out.extend_from_slice(&compressed);
+                    return out;
+                }
+            }
+        }
+
+        if self.codec == VideoCodec::H265 {
+            soften_chroma_spikes(&mut self.scratch_rgb, w as usize, h as usize);
+        }
+
+        let mut best_jpeg = Vec::new();
+        for &q in self.idr_qualities() {
+            best_jpeg.clear();
+            let mut enc = JpegEncoder::new_with_quality(&mut best_jpeg, q);
+            if enc
+                .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
+                .is_ok()
+                && 1 + best_jpeg.len() <= MAX_IDR_PAYLOAD_BYTES
+            {
                 break;
             }
         }
 
-        self.ref_y.clear();
-        self.ref_y.extend_from_slice(&self.cur_y);
-        self.ref_cb.clear();
-        self.ref_cb.extend_from_slice(&self.cur_cb);
-        self.ref_cr.clear();
-        self.ref_cr.extend_from_slice(&self.cur_cr);
+        if 1 + best_jpeg.len() > MAX_IDR_PAYLOAD_BYTES {
+            let mut fallback = Vec::new();
+            let mut enc = JpegEncoder::new_with_quality(&mut fallback, 15);
+            if enc
+                .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
+                .is_ok()
+                && !fallback.is_empty()
+            {
+                best_jpeg = fallback;
+            }
+        }
 
-        best_payload
+        let mut out = Vec::with_capacity(1 + best_jpeg.len());
+        out.push(IDR_MODE_JPEG_FULL);
+        out.extend_from_slice(&best_jpeg);
+        out
     }
 
-    fn sample_rgba_planes(&mut self, frame: &RawRgbaFrame, sub: usize, q_shift: u8) {
+    fn try_encode_p_payload(&mut self, frame: &RawRgbaFrame) -> Option<Vec<u8>> {
         let w = self.width as usize;
         let h = self.height as usize;
-        let plane_w = w.div_ceil(sub).max(2);
-        let plane_h = h.div_ceil(sub).max(2);
-        let c_w = plane_w.div_ceil(2);
-        let c_h = plane_h.div_ceil(2);
-
-        self.sub = sub;
-        self.q_shift = q_shift;
-        self.plane_w = plane_w;
-        self.plane_h = plane_h;
-        self.c_w = c_w;
-        self.c_h = c_h;
-
-        self.cur_y.resize(plane_w * plane_h, 0);
-        self.cur_cb.resize(c_w * c_h, 128 >> q_shift);
-        self.cur_cr.resize(c_w * c_h, 128 >> q_shift);
-
-        let rgba = &frame.rgba;
-
-        for py in 0..plane_h {
-            let sy_start = (py * sub).min(h - 1);
-            let sy_end = ((py + 1) * sub).min(h);
-            for px in 0..plane_w {
-                let sx_start = (px * sub).min(w - 1);
-                let sx_end = ((px + 1) * sub).min(w);
-
-                let mut sum_y: i32 = 0;
-                let mut count: i32 = 0;
-                for sy in sy_start..sy_end {
-                    let row_base = sy * w * 4;
-                    for sx in sx_start..sx_end {
-                        let idx = row_base + sx * 4;
-                        if idx + 2 < rgba.len() {
-                            let r = i32::from(rgba[idx]);
-                            let g = i32::from(rgba[idx + 1]);
-                            let b = i32::from(rgba[idx + 2]);
-                            let y = ((77 * r + 150 * g + 29 * b) >> 8).clamp(0, 255);
-                            sum_y += y;
-                            count += 1;
-                        }
-                    }
-                }
-                let avg_y = sum_y.checked_div(count).unwrap_or(0);
-                self.cur_y[py * plane_w + px] = quantize_luma(avg_y, q_shift);
-            }
+        let expected = w * h * 4;
+        if frame.rgba.len() < expected || self.ref_rgba.len() < expected {
+            return None;
         }
 
-        let chroma_span = sub * 2;
-        for cy in 0..c_h {
-            let sy_start = (cy * chroma_span).min(h - 1);
-            let sy_end = ((cy + 1) * chroma_span).min(h);
-            for cx in 0..c_w {
-                let sx_start = (cx * chroma_span).min(w - 1);
-                let sx_end = ((cx + 1) * chroma_span).min(w);
-
-                let mut sum_cb: i32 = 0;
-                let mut sum_cr: i32 = 0;
-                let mut count: i32 = 0;
-                for sy in sy_start..sy_end {
-                    let row_base = sy * w * 4;
-                    for sx in sx_start..sx_end {
-                        let idx = row_base + sx * 4;
-                        if idx + 2 < rgba.len() {
-                            let r = i32::from(rgba[idx]);
-                            let g = i32::from(rgba[idx + 1]);
-                            let b = i32::from(rgba[idx + 2]);
-                            let cb = (((-43 * r - 85 * g + 128 * b) >> 8) + 128).clamp(0, 255);
-                            let cr = (((128 * r - 107 * g - 21 * b) >> 8) + 128).clamp(0, 255);
-                            sum_cb += cb;
-                            sum_cr += cr;
-                            count += 1;
-                        }
-                    }
-                }
-                let avg_cb = sum_cb.checked_div(count).unwrap_or(128);
-                let avg_cr = sum_cr.checked_div(count).unwrap_or(128);
-                self.cur_cb[cy * c_w + cx] = quantize_chroma(avg_cb, q_shift);
-                self.cur_cr[cy * c_w + cx] = quantize_chroma(avg_cr, q_shift);
-            }
-        }
-    }
-
-    fn serialize_idr_planes(&self, sub: usize, q_shift: u8) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(self.cur_y.len() + self.cur_cb.len() + self.cur_cr.len());
-        dpcm_encode(&self.cur_y, self.plane_w, &mut raw);
-        dpcm_encode(&self.cur_cb, self.c_w, &mut raw);
-        dpcm_encode(&self.cur_cr, self.c_w, &mut raw);
-
-        if q_shift >= 4 {
-            let packed = pack_nibbles(&raw);
-            let rle = packbits_encode(&packed);
-            let mut out = Vec::with_capacity(4 + rle.len());
-            out.push(sub as u8);
-            out.push(q_shift | 0x80);
-            out.extend_from_slice(&(self.plane_w as u16).to_be_bytes());
-            out.extend_from_slice(&(self.plane_h as u16).to_be_bytes());
-            out.extend_from_slice(&rle);
-            out
-        } else {
-            let rle = packbits_encode(&raw);
-            let mut out = Vec::with_capacity(4 + rle.len());
-            out.push(sub as u8);
-            out.push(q_shift);
-            out.extend_from_slice(&(self.plane_w as u16).to_be_bytes());
-            out.extend_from_slice(&(self.plane_h as u16).to_be_bytes());
-            out.extend_from_slice(&rle);
-            out
-        }
-    }
-
-    fn encode_p_payload(&mut self, frame: &RawRgbaFrame) -> Vec<u8> {
-        self.sample_rgba_planes(frame, self.sub, self.q_shift);
-
-        let tiles_x = self.plane_w.div_ceil(P_TILE_SIZE);
-        let tiles_y = self.plane_h.div_ceil(P_TILE_SIZE);
+        let tiles_x = w.div_ceil(P_TILE_SIZE);
+        let tiles_y = h.div_ceil(P_TILE_SIZE);
         let total_tiles = tiles_x * tiles_y;
-        let threshold = 1u32;
+        let mut changed: Vec<(u64, u16)> = Vec::new();
 
-        let mut changed: Vec<(u32, u16)> = Vec::new();
         for ty in 0..tiles_y {
+            let y0 = ty * P_TILE_SIZE;
+            let y1 = (y0 + P_TILE_SIZE).min(h);
             for tx in 0..tiles_x {
-                let mut sad = 0u32;
-                let y0 = ty * P_TILE_SIZE;
-                let y1 = (y0 + P_TILE_SIZE).min(self.plane_h);
                 let x0 = tx * P_TILE_SIZE;
-                let x1 = (x0 + P_TILE_SIZE).min(self.plane_w);
-                for py in y0..y1 {
-                    let row = py * self.plane_w;
-                    for px in x0..x1 {
-                        let i = row + px;
-                        sad += u32::from(self.cur_y[i].abs_diff(self.ref_y[i]));
+                let x1 = (x0 + P_TILE_SIZE).min(w);
+                let mut sad = 0u64;
+
+                for y in y0..y1 {
+                    let row_start = (y * w + x0) * 4;
+                    let row_end = (y * w + x1) * 4;
+                    let cur = &frame.rgba[row_start..row_end];
+                    let prev = &self.ref_rgba[row_start..row_end];
+                    for (c, p) in cur.as_chunks::<4>().0.iter().zip(prev.as_chunks::<4>().0.iter()) {
+                        sad += u64::from(c[0].abs_diff(p[0]))
+                            + u64::from(c[1].abs_diff(p[1]))
+                            + u64::from(c[2].abs_diff(p[2]));
                     }
                 }
-                let cy0 = y0 / 2;
-                let cy1 = y1.div_ceil(2).min(self.c_h);
-                let cx0 = x0 / 2;
-                let cx1 = x1.div_ceil(2).min(self.c_w);
-                for cy in cy0..cy1 {
-                    let row = cy * self.c_w;
-                    for cx in cx0..cx1 {
-                        let i = row + cx;
-                        sad += u32::from(self.cur_cb[i].abs_diff(self.ref_cb[i]));
-                        sad += u32::from(self.cur_cr[i].abs_diff(self.ref_cr[i]));
-                    }
-                }
-                if sad >= threshold {
-                    let tid = (ty * tiles_x + tx) as u16;
-                    changed.push((sad, tid));
+
+                if sad > 0 {
+                    changed.push((sad, (ty * tiles_x + tx) as u16));
                 }
             }
         }
 
         if changed.is_empty() {
-            return vec![0x00, 0x00];
+            return Some(vec![0x00, 0x00, P_MODE_JPEG_TILES]);
+        }
+
+        if changed.len() * 100 > total_tiles * 65 {
+            return None;
         }
 
         changed.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
 
-        let p_budget = self.p_budget_bytes();
-        let mut low = 0usize;
-        let mut high = changed.len().min(total_tiles);
-        let mut best_encoded = vec![0x00, 0x00];
+        let budget = self.p_budget_bytes();
+        let quality = self.p_tile_quality();
+        let mut best_encoded = vec![0x00, 0x00, P_MODE_JPEG_TILES];
         let mut best_count = 0usize;
+
+        let max_k = changed.len().min(96);
+        let mut low = 1usize;
+        let mut high = max_k;
 
         while low <= high {
             let mid = (low + high) / 2;
-            if mid == 0 {
-                low = 1;
-                continue;
-            }
-            let candidate = self.serialize_p_tiles(&changed[..mid], tiles_x);
-            if candidate.len() <= p_budget {
+            let candidate = self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..mid], quality);
+            if candidate.len() <= budget {
                 best_encoded = candidate;
                 best_count = mid;
                 low = mid + 1;
@@ -370,65 +452,107 @@ impl H264Encoder {
             }
         }
 
+        if best_count == 0 && !changed.is_empty() {
+            let single = self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..1], 55);
+            if !single.is_empty() {
+                best_encoded = single;
+                best_count = 1;
+            }
+        }
+
         for &(_, tid) in &changed[..best_count] {
             let tx = usize::from(tid) % tiles_x;
             let ty = usize::from(tid) / tiles_x;
             let y0 = ty * P_TILE_SIZE;
-            let y1 = (y0 + P_TILE_SIZE).min(self.plane_h);
+            let y1 = (y0 + P_TILE_SIZE).min(h);
             let x0 = tx * P_TILE_SIZE;
-            let x1 = (x0 + P_TILE_SIZE).min(self.plane_w);
-            for py in y0..y1 {
-                let row = py * self.plane_w;
-                self.ref_y[row + x0..row + x1].copy_from_slice(&self.cur_y[row + x0..row + x1]);
-            }
-            let cy0 = y0 / 2;
-            let cy1 = y1.div_ceil(2).min(self.c_h);
-            let cx0 = x0 / 2;
-            let cx1 = x1.div_ceil(2).min(self.c_w);
-            for cy in cy0..cy1 {
-                let row = cy * self.c_w;
-                self.ref_cb[row + cx0..row + cx1].copy_from_slice(&self.cur_cb[row + cx0..row + cx1]);
-                self.ref_cr[row + cx0..row + cx1].copy_from_slice(&self.cur_cr[row + cx0..row + cx1]);
+            let x1 = (x0 + P_TILE_SIZE).min(w);
+            for y in y0..y1 {
+                let row_start = (y * w + x0) * 4;
+                let row_end = (y * w + x1) * 4;
+                self.ref_rgba[row_start..row_end].copy_from_slice(&frame.rgba[row_start..row_end]);
             }
         }
 
-        best_encoded
+        Some(best_encoded)
     }
 
-    fn serialize_p_tiles(&self, tiles: &[(u32, u16)], tiles_x: usize) -> Vec<u8> {
-        let mut raw = Vec::with_capacity(tiles.len() * 100);
-        for &(_, tid) in tiles {
+    fn serialize_p_tiles(
+        &mut self,
+        rgba: &[u8],
+        w: usize,
+        h: usize,
+        tiles_x: usize,
+        tiles: &[(u64, u16)],
+        jpeg_quality: u8,
+    ) -> Vec<u8> {
+        let count = tiles.len();
+        let strip_h = count * P_TILE_SIZE;
+        self.scratch_strip.resize(P_TILE_SIZE * strip_h * 3, 0);
+
+        for (slot, &(_, tid)) in tiles.iter().enumerate() {
             let tx = usize::from(tid) % tiles_x;
             let ty = usize::from(tid) / tiles_x;
-            let y0 = ty * P_TILE_SIZE;
-            let y1 = (y0 + P_TILE_SIZE).min(self.plane_h);
             let x0 = tx * P_TILE_SIZE;
-            let x1 = (x0 + P_TILE_SIZE).min(self.plane_w);
-            for py in y0..y1 {
-                let row = py * self.plane_w;
-                raw.extend_from_slice(&self.cur_y[row + x0..row + x1]);
-            }
-            let cy0 = y0 / 2;
-            let cy1 = y1.div_ceil(2).min(self.c_h);
-            let cx0 = x0 / 2;
-            let cx1 = x1.div_ceil(2).min(self.c_w);
-            for cy in cy0..cy1 {
-                let row = cy * self.c_w;
-                raw.extend_from_slice(&self.cur_cb[row + cx0..row + cx1]);
-            }
-            for cy in cy0..cy1 {
-                let row = cy * self.c_w;
-                raw.extend_from_slice(&self.cur_cr[row + cx0..row + cx1]);
+            let x1 = (x0 + P_TILE_SIZE).min(w);
+            let y0 = ty * P_TILE_SIZE;
+            let y1 = (y0 + P_TILE_SIZE).min(h);
+            let slot_base_row = slot * P_TILE_SIZE;
+
+            for dy in 0..P_TILE_SIZE {
+                let sy = (y0 + dy).min(y1.saturating_sub(1));
+                let dst_row = (slot_base_row + dy) * P_TILE_SIZE * 3;
+                for dx in 0..P_TILE_SIZE {
+                    let sx = (x0 + dx).min(x1.saturating_sub(1));
+                    let sidx = (sy * w + sx) * 4;
+                    let didx = dst_row + dx * 3;
+                    self.scratch_strip[didx] = rgba[sidx];
+                    self.scratch_strip[didx + 1] = rgba[sidx + 1];
+                    self.scratch_strip[didx + 2] = rgba[sidx + 2];
+                }
             }
         }
 
-        let compressed = packbits_encode(&raw);
-        let mut out = Vec::with_capacity(2 + tiles.len() * 2 + compressed.len());
-        out.extend_from_slice(&(tiles.len() as u16).to_be_bytes());
+        let mut jpeg_buf = Vec::with_capacity(count * 512);
+        let mut jpeg_ok = false;
+        {
+            let mut enc = JpegEncoder::new_with_quality(&mut jpeg_buf, jpeg_quality);
+            if enc
+                .encode(
+                    &self.scratch_strip,
+                    P_TILE_SIZE as u32,
+                    strip_h as u32,
+                    ExtendedColorType::Rgb8,
+                )
+                .is_ok()
+            {
+                jpeg_ok = true;
+            }
+        }
+
+        let mut use_deflate = false;
+        let mut chosen = jpeg_buf;
+        if self.codec == VideoCodec::H265 || !jpeg_ok {
+            dpcm_row_sub_rgb(&self.scratch_strip, P_TILE_SIZE, &mut self.scratch_dpcm);
+            if let Some(def_buf) = deflate_fast(&self.scratch_dpcm) {
+                if !jpeg_ok || def_buf.len() < chosen.len() {
+                    chosen = def_buf;
+                    use_deflate = true;
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(3 + count * 2 + chosen.len());
+        out.extend_from_slice(&(count as u16).to_be_bytes());
+        out.push(if use_deflate {
+            P_MODE_DEFLATE_TILES
+        } else {
+            P_MODE_JPEG_TILES
+        });
         for &(_, tid) in tiles {
             out.extend_from_slice(&tid.to_be_bytes());
         }
-        out.extend_from_slice(&compressed);
+        out.extend_from_slice(&chosen);
         out
     }
 }
@@ -438,15 +562,8 @@ pub struct H264Decoder {
     height: u32,
     fps: u8,
     has_idr: bool,
-    sub: usize,
-    q_shift: u8,
-    plane_w: usize,
-    plane_h: usize,
-    c_w: usize,
-    c_h: usize,
-    y_plane: Vec<u8>,
-    cb_plane: Vec<u8>,
-    cr_plane: Vec<u8>,
+    hevc_decode_supported: bool,
+    frame_rgba: Vec<u8>,
 }
 
 impl Default for H264Decoder {
@@ -462,37 +579,61 @@ impl H264Decoder {
             height: 0,
             fps: 30,
             has_idr: false,
-            sub: 4,
-            q_shift: 2,
-            plane_w: 0,
-            plane_h: 0,
-            c_w: 0,
-            c_h: 0,
-            y_plane: Vec::new(),
-            cb_plane: Vec::new(),
-            cr_plane: Vec::new(),
+            hevc_decode_supported: is_hevc_hardware_supported(),
+            frame_rgba: Vec::new(),
         }
+    }
+
+    pub fn set_hevc_decode_supported(&mut self, supported: bool) {
+        self.hevc_decode_supported = supported;
+    }
+
+    pub fn is_hevc_decode_supported(&self) -> bool {
+        self.hevc_decode_supported
     }
 
     pub fn reset(&mut self) {
         self.has_idr = false;
-        self.y_plane.clear();
-        self.cb_plane.clear();
-        self.cr_plane.clear();
+        self.frame_rgba.clear();
+    }
+
+    pub fn reset_and_shrink(&mut self) {
+        self.has_idr = false;
+        self.width = 0;
+        self.height = 0;
+        self.frame_rgba = Vec::new();
     }
 
     pub fn decode(&mut self, annex_b: &[u8]) -> Option<RawRgbaFrame> {
-        let nals = split_annex_b_nals(annex_b);
-        let mut produced = false;
+        self.decode_checked(annex_b).ok().flatten()
+    }
 
+    pub fn decode_checked(&mut self, annex_b: &[u8]) -> Result<Option<RawRgbaFrame>, DecoderError> {
+        let nals = split_annex_b_nals(annex_b);
+        if nals.is_empty() {
+            return Err(DecoderError::CorruptBitstream);
+        }
+
+        let mut produced = false;
         for nal in nals {
             if nal.is_empty() {
                 continue;
             }
             let nal_type = nal[0];
+            let is_hevc_nal = matches!(
+                nal_type,
+                NAL_HEVC_VPS | NAL_HEVC_SPS | NAL_HEVC_PPS | NAL_HEVC_IDR | NAL_HEVC_SLICE
+            );
+            if is_hevc_nal && !self.hevc_decode_supported {
+                return Err(DecoderError::UnsupportedCodec(
+                    "HEVC decoder initialization failed on viewer".to_string(),
+                ));
+            }
+
             let rbsp = unescape_rbsp(&nal[1..]);
             match nal_type {
-                NAL_SPS => {
+                NAL_HEVC_VPS => {}
+                NAL_SPS | NAL_HEVC_SPS => {
                     if let Some((w, h, fps)) = decode_sps(&rbsp) {
                         if w != self.width || h != self.height {
                             self.has_idr = false;
@@ -502,322 +643,288 @@ impl H264Decoder {
                         self.fps = fps;
                     }
                 }
-                NAL_PPS => {}
-                NAL_IDR => {
-                    if self.width > 0 && self.height > 0 && self.decode_idr(&rbsp) {
-                        self.has_idr = true;
-                        produced = true;
+                NAL_PPS | NAL_HEVC_PPS => {}
+                NAL_IDR | NAL_HEVC_IDR => {
+                    if self.width > 0 && self.height > 0 {
+                        if self.decode_idr(&rbsp) {
+                            self.has_idr = true;
+                            produced = true;
+                        } else {
+                            return Err(DecoderError::CorruptBitstream);
+                        }
                     }
                 }
-                NAL_SLICE if self.has_idr && self.decode_p(&rbsp) => {
-                    produced = true;
+                NAL_SLICE | NAL_HEVC_SLICE if self.has_idr => {
+                    if self.decode_p(&rbsp) {
+                        produced = true;
+                    } else {
+                        return Err(DecoderError::CorruptBitstream);
+                    }
                 }
                 _ => {}
             }
         }
 
         if produced {
-            Some(self.render_rgba())
+            Ok(Some(RawRgbaFrame {
+                width: self.width,
+                height: self.height,
+                rgba: self.frame_rgba.clone(),
+            }))
         } else {
-            None
+            Ok(None)
         }
     }
 
     fn decode_idr(&mut self, payload: &[u8]) -> bool {
-        if payload.len() < 6 {
+        if payload.len() < 2 {
             return false;
         }
-        let sub = usize::from(payload[0]).max(1);
-        let nibble_packed = (payload[1] & 0x80) != 0;
-        let q_shift = payload[1] & 0x7F;
-        let plane_w = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
-        let plane_h = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-        if plane_w == 0 || plane_h == 0 {
-            return false;
+        let mode = payload[0];
+        let body = &payload[1..];
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let expected_rgb = w * h * 3;
+        let expected_rgba = w * h * 4;
+
+        match mode {
+            IDR_MODE_DEFLATE_RGB => {
+                let Ok(dpcm) = inflate_bounded(body, expected_rgb) else {
+                    return false;
+                };
+                if dpcm.len() < expected_rgb {
+                    return false;
+                }
+                self.frame_rgba.resize(expected_rgba, 255);
+                dpcm_row_unsub_rgb_to_rgba(&dpcm[..expected_rgb], w, &mut self.frame_rgba);
+                true
+            }
+            IDR_MODE_JPEG_FULL => {
+                let Ok(img) = image::load_from_memory_with_format(body, ImageFormat::Jpeg) else {
+                    return false;
+                };
+                if img.width() != self.width || img.height() != self.height {
+                    let resized =
+                        img.resize_exact(self.width, self.height, image::imageops::FilterType::Triangle);
+                    self.frame_rgba = resized.to_rgba8().into_raw();
+                } else {
+                    self.frame_rgba = img.to_rgba8().into_raw();
+                }
+                self.frame_rgba.len() == expected_rgba
+            }
+            _ => false,
         }
-        let c_w = plane_w.div_ceil(2);
-        let c_h = plane_h.div_ceil(2);
-        let y_len = plane_w * plane_h;
-        let c_len = c_w * c_h;
-        let expected_len = y_len + c_len * 2;
-
-        let rle_decoded = packbits_decode(&payload[6..], if nibble_packed { expected_len.div_ceil(2) } else { expected_len });
-        let raw = if nibble_packed {
-            unpack_nibbles(&rle_decoded, expected_len)
-        } else {
-            rle_decoded
-        };
-        if raw.len() < expected_len {
-            return false;
-        }
-
-        self.sub = sub;
-        self.q_shift = q_shift;
-        self.plane_w = plane_w;
-        self.plane_h = plane_h;
-        self.c_w = c_w;
-        self.c_h = c_h;
-
-        self.y_plane = dpcm_decode(&raw[..y_len], plane_w);
-        self.cb_plane = dpcm_decode(&raw[y_len..y_len + c_len], c_w);
-        self.cr_plane = dpcm_decode(&raw[y_len + c_len..expected_len], c_w);
-        true
     }
 
     fn decode_p(&mut self, payload: &[u8]) -> bool {
-        if payload.len() < 2 {
+        if payload.len() < 3 {
             return false;
         }
         let count = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
         if count == 0 {
             return true;
         }
-        let header_bytes = 2 + count * 2;
+        let mode = payload[2];
+        let header_bytes = 3 + count * 2;
         if payload.len() < header_bytes {
             return false;
         }
 
-        let tiles_x = self.plane_w.div_ceil(P_TILE_SIZE);
-        let tiles_y = self.plane_h.div_ceil(P_TILE_SIZE);
-        let mut raw_needed = 0usize;
+        let w = self.width as usize;
+        let h = self.height as usize;
+        let tiles_x = w.div_ceil(P_TILE_SIZE);
+        let tiles_y = h.div_ceil(P_TILE_SIZE);
+        if self.frame_rgba.len() < w * h * 4 {
+            return false;
+        }
+
         let mut tile_ids = Vec::with_capacity(count);
         for i in 0..count {
-            let tid = u16::from_be_bytes([payload[2 + i * 2], payload[2 + i * 2 + 1]]);
-            let tx = usize::from(tid) % tiles_x;
+            let tid = u16::from_be_bytes([payload[3 + i * 2], payload[3 + i * 2 + 1]]);
             let ty = usize::from(tid) / tiles_x;
             if ty >= tiles_y {
                 return false;
             }
-            let y0 = ty * P_TILE_SIZE;
-            let y1 = (y0 + P_TILE_SIZE).min(self.plane_h);
-            let x0 = tx * P_TILE_SIZE;
-            let x1 = (x0 + P_TILE_SIZE).min(self.plane_w);
-            let cy0 = y0 / 2;
-            let cy1 = y1.div_ceil(2).min(self.c_h);
-            let cx0 = x0 / 2;
-            let cx1 = x1.div_ceil(2).min(self.c_w);
-            raw_needed += (y1 - y0) * (x1 - x0) + 2 * (cy1 - cy0) * (cx1 - cx0);
             tile_ids.push(tid);
         }
 
-        let raw = packbits_decode(&payload[header_bytes..], raw_needed);
-        if raw.len() < raw_needed {
-            return false;
-        }
+        let strip_w = P_TILE_SIZE;
+        let strip_h = count * P_TILE_SIZE;
+        let compressed = &payload[header_bytes..];
 
-        let mut off = 0usize;
-        for tid in tile_ids {
+        let strip_rgb: Vec<u8> = match mode {
+            P_MODE_DEFLATE_TILES => {
+                let expected = strip_w * strip_h * 3;
+                let Ok(dpcm) = inflate_bounded(compressed, expected) else {
+                    return false;
+                };
+                if dpcm.len() < expected {
+                    return false;
+                }
+                dpcm_row_unsub_rgb(&dpcm[..expected], strip_w)
+            }
+            P_MODE_JPEG_TILES => {
+                let Ok(img) = image::load_from_memory_with_format(compressed, ImageFormat::Jpeg) else {
+                    return false;
+                };
+                let rgb = img.to_rgb8();
+                if rgb.width() as usize != strip_w || rgb.height() as usize != strip_h {
+                    return false;
+                }
+                rgb.into_raw()
+            }
+            _ => return false,
+        };
+
+        for (slot, tid) in tile_ids.into_iter().enumerate() {
             let tx = usize::from(tid) % tiles_x;
             let ty = usize::from(tid) / tiles_x;
-            let y0 = ty * P_TILE_SIZE;
-            let y1 = (y0 + P_TILE_SIZE).min(self.plane_h);
             let x0 = tx * P_TILE_SIZE;
-            let x1 = (x0 + P_TILE_SIZE).min(self.plane_w);
-            let tw = x1 - x0;
-            for py in y0..y1 {
-                let row = py * self.plane_w;
-                self.y_plane[row + x0..row + x1].copy_from_slice(&raw[off..off + tw]);
-                off += tw;
-            }
-            let cy0 = y0 / 2;
-            let cy1 = y1.div_ceil(2).min(self.c_h);
-            let cx0 = x0 / 2;
-            let cx1 = x1.div_ceil(2).min(self.c_w);
-            let cw = cx1 - cx0;
-            for cy in cy0..cy1 {
-                let row = cy * self.c_w;
-                self.cb_plane[row + cx0..row + cx1].copy_from_slice(&raw[off..off + cw]);
-                off += cw;
-            }
-            for cy in cy0..cy1 {
-                let row = cy * self.c_w;
-                self.cr_plane[row + cx0..row + cx1].copy_from_slice(&raw[off..off + cw]);
-                off += cw;
+            let x1 = (x0 + P_TILE_SIZE).min(w);
+            let y0 = ty * P_TILE_SIZE;
+            let y1 = (y0 + P_TILE_SIZE).min(h);
+            let slot_base_row = slot * P_TILE_SIZE;
+
+            for dy in 0..(y1 - y0) {
+                let src_row = (slot_base_row + dy) * P_TILE_SIZE * 3;
+                let dst_row = ((y0 + dy) * w + x0) * 4;
+                for dx in 0..(x1 - x0) {
+                    let sidx = src_row + dx * 3;
+                    let didx = dst_row + dx * 4;
+                    self.frame_rgba[didx] = strip_rgb[sidx];
+                    self.frame_rgba[didx + 1] = strip_rgb[sidx + 1];
+                    self.frame_rgba[didx + 2] = strip_rgb[sidx + 2];
+                    self.frame_rgba[didx + 3] = 255;
+                }
             }
         }
+
         true
     }
+}
 
-    fn render_rgba(&self) -> RawRgbaFrame {
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let mut rgba = vec![255u8; w * h * 4];
-        let shift = self.q_shift;
-        let sub = self.sub.max(1);
-        let chroma_span = sub * 2;
-
-        for y in 0..h {
-            let y_fp = (y << 8) / sub;
-            let py0 = (y_fp >> 8).min(self.plane_h - 1);
-            let py1 = (py0 + 1).min(self.plane_h - 1);
-            let wy = (y_fp & 0xFF) as i32;
-
-            let c_fp = (y << 8) / chroma_span;
-            let cy0 = (c_fp >> 8).min(self.c_h - 1);
-            let cy1 = (cy0 + 1).min(self.c_h - 1);
-            let wcy = (c_fp & 0xFF) as i32;
-
-            let dst_row = y * w * 4;
-
-            for x in 0..w {
-                let x_fp = (x << 8) / sub;
-                let px0 = (x_fp >> 8).min(self.plane_w - 1);
-                let px1 = (px0 + 1).min(self.plane_w - 1);
-                let wx = (x_fp & 0xFF) as i32;
-
-                let cx_fp = (x << 8) / chroma_span;
-                let cx0 = (cx_fp >> 8).min(self.c_w - 1);
-                let cx1 = (cx0 + 1).min(self.c_w - 1);
-                let wcx = (cx_fp & 0xFF) as i32;
-
-                let yv = sample_bilinear_y(
-                    &self.y_plane,
-                    self.plane_w,
-                    px0,
-                    px1,
-                    py0,
-                    py1,
-                    wx,
-                    wy,
-                    shift,
-                );
-                let cb = sample_bilinear_chroma(
-                    &self.cb_plane,
-                    self.c_w,
-                    cx0,
-                    cx1,
-                    cy0,
-                    cy1,
-                    wcx,
-                    wcy,
-                    shift,
-                );
-                let cr = sample_bilinear_chroma(
-                    &self.cr_plane,
-                    self.c_w,
-                    cx0,
-                    cx1,
-                    cy0,
-                    cy1,
-                    wcx,
-                    wcy,
-                    shift,
-                );
-
-                let d = cb - 128;
-                let e = cr - 128;
-
-                let r = (yv + ((359 * e) >> 8)).clamp(0, 255) as u8;
-                let g = (yv - ((88 * d + 183 * e) >> 8)).clamp(0, 255) as u8;
-                let b = (yv + ((454 * d) >> 8)).clamp(0, 255) as u8;
-
-                let out_idx = dst_row + x * 4;
-                rgba[out_idx] = r;
-                rgba[out_idx + 1] = g;
-                rgba[out_idx + 2] = b;
-                rgba[out_idx + 3] = 255;
+fn soften_chroma_spikes(rgb: &mut [u8], w: usize, h: usize) {
+    if w < 4 || h < 4 {
+        return;
+    }
+    for y in (0..h - 1).step_by(2) {
+        let row0 = y * w * 3;
+        let row1 = (y + 1) * w * 3;
+        for x in (0..w - 1).step_by(2) {
+            let p00 = row0 + x * 3;
+            let p10 = p00 + 3;
+            let p01 = row1 + x * 3;
+            let p11 = p01 + 3;
+            let max_spread = [
+                rgb[p00].abs_diff(rgb[p00 + 1]),
+                rgb[p00 + 1].abs_diff(rgb[p00 + 2]),
+                rgb[p11].abs_diff(rgb[p11 + 1]),
+            ]
+            .into_iter()
+            .max()
+            .unwrap_or(0);
+            if max_spread > 12 {
+                let avg_rg_diff = (i32::from(rgb[p00]) - i32::from(rgb[p00 + 1])
+                    + i32::from(rgb[p10]) - i32::from(rgb[p10 + 1])
+                    + i32::from(rgb[p01]) - i32::from(rgb[p01 + 1])
+                    + i32::from(rgb[p11]) - i32::from(rgb[p11 + 1]))
+                    >> 2;
+                let avg_bg_diff = (i32::from(rgb[p00 + 2]) - i32::from(rgb[p00 + 1])
+                    + i32::from(rgb[p10 + 2]) - i32::from(rgb[p10 + 1])
+                    + i32::from(rgb[p01 + 2]) - i32::from(rgb[p01 + 1])
+                    + i32::from(rgb[p11 + 2]) - i32::from(rgb[p11 + 1]))
+                    >> 2;
+                for idx in [p00, p10, p01, p11] {
+                    let g = i32::from(rgb[idx + 1]);
+                    let r_blend = (i32::from(rgb[idx]) * 3 + (g + avg_rg_diff)) >> 2;
+                    let b_blend = (i32::from(rgb[idx + 2]) * 3 + (g + avg_bg_diff)) >> 2;
+                    rgb[idx] = r_blend.clamp(0, 255) as u8;
+                    rgb[idx + 2] = b_blend.clamp(0, 255) as u8;
+                }
             }
         }
+    }
+}
 
-        RawRgbaFrame {
-            width: self.width,
-            height: self.height,
-            rgba,
+fn deflate_fast(input: &[u8]) -> Option<Vec<u8>> {
+    let mut enc = DeflateEncoder::new(Vec::new(), Compression::fast());
+    enc.write_all(input).ok()?;
+    enc.finish().ok()
+}
+
+fn inflate_bounded(input: &[u8], expected_len: usize) -> Result<Vec<u8>, ()> {
+    let mut dec = DeflateDecoder::new(Cursor::new(input));
+    let mut out = vec![0u8; expected_len];
+    dec.read_exact(&mut out).map_err(|_| ())?;
+    Ok(out)
+}
+
+fn dpcm_row_sub_rgb(rgb: &[u8], width: usize, out: &mut Vec<u8>) {
+    out.resize(rgb.len(), 0);
+    let row_bytes = width * 3;
+    for (src_row, dst_row) in rgb.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes)) {
+        let mut prev = [0u8; 3];
+        for (s, d) in src_row
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(dst_row.as_chunks_mut::<3>().0.iter_mut())
+        {
+            d[0] = s[0].wrapping_sub(prev[0]);
+            d[1] = s[1].wrapping_sub(prev[1]);
+            d[2] = s[2].wrapping_sub(prev[2]);
+            prev = *s;
         }
     }
 }
 
-#[inline]
-fn quantize_luma(val: i32, q_shift: u8) -> u8 {
-    let v = val.clamp(0, 255);
-    if q_shift == 0 {
-        return v as u8;
+fn dpcm_row_unsub_rgb(dpcm: &[u8], width: usize) -> Vec<u8> {
+    let mut out = vec![0u8; dpcm.len()];
+    let row_bytes = width * 3;
+    for (src_row, dst_row) in dpcm.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes)) {
+        let mut prev = [0u8; 3];
+        for (s, d) in src_row
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(dst_row.as_chunks_mut::<3>().0.iter_mut())
+        {
+            let r = prev[0].wrapping_add(s[0]);
+            let g = prev[1].wrapping_add(s[1]);
+            let b = prev[2].wrapping_add(s[2]);
+            d[0] = r;
+            d[1] = g;
+            d[2] = b;
+            prev = [r, g, b];
+        }
     }
-    let step = 1i32 << q_shift;
-    let rounded = (v + (step >> 1) - 1).min(255);
-    (rounded >> q_shift) as u8
+    out
 }
 
-#[inline]
-fn dequant_luma(q: u8, q_shift: u8) -> i32 {
-    if q_shift == 0 {
-        return i32::from(q);
+fn dpcm_row_unsub_rgb_to_rgba(dpcm: &[u8], width: usize, out_rgba: &mut [u8]) {
+    let src_row_bytes = width * 3;
+    let dst_row_bytes = width * 4;
+    for (src_row, dst_row) in dpcm
+        .chunks_exact(src_row_bytes)
+        .zip(out_rgba.chunks_exact_mut(dst_row_bytes))
+    {
+        let mut prev = [0u8; 3];
+        for (s, d) in src_row
+            .as_chunks::<3>()
+            .0
+            .iter()
+            .zip(dst_row.as_chunks_mut::<4>().0.iter_mut())
+        {
+            let r = prev[0].wrapping_add(s[0]);
+            let g = prev[1].wrapping_add(s[1]);
+            let b = prev[2].wrapping_add(s[2]);
+            d[0] = r;
+            d[1] = g;
+            d[2] = b;
+            d[3] = 255;
+            prev = [r, g, b];
+        }
     }
-    if q == 0 {
-        return 0;
-    }
-    let max_q = (255 >> q_shift) as u8;
-    if q >= max_q {
-        return 255;
-    }
-    (i32::from(q) << q_shift).min(255)
-}
-
-#[inline]
-fn quantize_chroma(val: i32, q_shift: u8) -> u8 {
-    let v = val.clamp(0, 255);
-    if q_shift == 0 {
-        return v as u8;
-    }
-    let mid = 128i32 >> q_shift;
-    let step = 1i32 << q_shift;
-    let q = mid + ((v - 128) / step);
-    let max_q = if q_shift >= 4 { 15 } else { 255 >> q_shift };
-    q.clamp(0, max_q) as u8
-}
-
-#[inline]
-fn dequant_chroma(q: u8, q_shift: u8) -> i32 {
-    if q_shift == 0 {
-        return i32::from(q);
-    }
-    let mid = 128i32 >> q_shift;
-    let offset = (i32::from(q) - mid) << q_shift;
-    (128 + offset).clamp(0, 255)
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn sample_bilinear_y(
-    plane: &[u8],
-    pw: usize,
-    x0: usize,
-    x1: usize,
-    y0: usize,
-    y1: usize,
-    wx: i32,
-    wy: i32,
-    shift: u8,
-) -> i32 {
-    let v00 = dequant_luma(plane[y0 * pw + x0], shift);
-    let v10 = dequant_luma(plane[y0 * pw + x1], shift);
-    let v01 = dequant_luma(plane[y1 * pw + x0], shift);
-    let v11 = dequant_luma(plane[y1 * pw + x1], shift);
-    let top = v00 * (256 - wx) + v10 * wx;
-    let bot = v01 * (256 - wx) + v11 * wx;
-    (top * (256 - wy) + bot * wy + 32_768) >> 16
-}
-
-#[allow(clippy::too_many_arguments)]
-#[inline]
-fn sample_bilinear_chroma(
-    plane: &[u8],
-    cw: usize,
-    x0: usize,
-    x1: usize,
-    y0: usize,
-    y1: usize,
-    wx: i32,
-    wy: i32,
-    shift: u8,
-) -> i32 {
-    let v00 = dequant_chroma(plane[y0 * cw + x0], shift);
-    let v10 = dequant_chroma(plane[y0 * cw + x1], shift);
-    let v01 = dequant_chroma(plane[y1 * cw + x0], shift);
-    let v11 = dequant_chroma(plane[y1 * cw + x1], shift);
-    let top = v00 * (256 - wx) + v10 * wx;
-    let bot = v01 * (256 - wx) + v11 * wx;
-    (top * (256 - wy) + bot * wy + 32_768) >> 16
 }
 
 fn write_nal(out: &mut Vec<u8>, nal_type: u8, rbsp: &[u8]) {
@@ -882,7 +989,7 @@ fn unescape_rbsp(data: &[u8]) -> Vec<u8> {
 }
 
 fn encode_sps(width: u32, height: u32, fps: u8) -> Vec<u8> {
-    let mut out = Vec::with_capacity(9);
+    let mut out = Vec::with_capacity(8);
     out.push(0x42);
     out.push(0x00);
     out.push(0x2A);
@@ -902,108 +1009,6 @@ fn decode_sps(rbsp: &[u8]) -> Option<(u32, u32, u8)> {
     Some((width, height, fps))
 }
 
-fn dpcm_encode(plane: &[u8], width: usize, out: &mut Vec<u8>) {
-    for row in plane.chunks(width) {
-        let mut prev = 0u8;
-        for &val in row {
-            out.push(val.wrapping_sub(prev));
-            prev = val;
-        }
-    }
-}
-
-fn dpcm_decode(encoded: &[u8], width: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(encoded.len());
-    for row in encoded.chunks(width) {
-        let mut prev = 0u8;
-        for &delta in row {
-            let val = prev.wrapping_add(delta);
-            out.push(val);
-            prev = val;
-        }
-    }
-    out
-}
-
-fn pack_nibbles(data: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(data.len().div_ceil(2));
-    for chunk in data.chunks(2) {
-        let hi = chunk[0] & 0x0F;
-        let lo = if chunk.len() > 1 { chunk[1] & 0x0F } else { 0 };
-        out.push((hi << 4) | lo);
-    }
-    out
-}
-
-fn unpack_nibbles(packed: &[u8], expected_len: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(expected_len);
-    for &byte in packed {
-        if out.len() < expected_len {
-            out.push(byte >> 4);
-        }
-        if out.len() < expected_len {
-            out.push(byte & 0x0F);
-        }
-    }
-    out
-}
-
-fn packbits_encode(input: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(input.len() / 2 + 16);
-    let mut i = 0usize;
-    while i < input.len() {
-        let mut run = 1usize;
-        while i + run < input.len() && run < 128 && input[i + run] == input[i] {
-            run += 1;
-        }
-        if run >= 3 {
-            out.push(0x80 | ((run - 1) as u8));
-            out.push(input[i]);
-            i += run;
-        } else {
-            let lit_start = i;
-            let mut lit_len = 0usize;
-            while i < input.len() && lit_len < 128 {
-                if i + 2 < input.len() && input[i] == input[i + 1] && input[i] == input[i + 2] {
-                    break;
-                }
-                i += 1;
-                lit_len += 1;
-            }
-            if lit_len > 0 {
-                out.push((lit_len - 1) as u8);
-                out.extend_from_slice(&input[lit_start..lit_start + lit_len]);
-            }
-        }
-    }
-    out
-}
-
-fn packbits_decode(input: &[u8], max_out: usize) -> Vec<u8> {
-    let mut out = Vec::with_capacity(max_out);
-    let mut i = 0usize;
-    while i < input.len() && out.len() < max_out {
-        let hdr = input[i];
-        i += 1;
-        if (hdr & 0x80) != 0 {
-            let run = usize::from(hdr & 0x7F) + 1;
-            if i >= input.len() {
-                break;
-            }
-            let val = input[i];
-            i += 1;
-            let take = run.min(max_out - out.len());
-            out.resize(out.len() + take, val);
-        } else {
-            let lit = usize::from(hdr) + 1;
-            let avail = lit.min(input.len().saturating_sub(i)).min(max_out - out.len());
-            out.extend_from_slice(&input[i..i + avail]);
-            i += avail;
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,7 +1025,7 @@ mod tests {
     #[test]
     fn test_h264_annex_b_encode_decode_1080p_and_force_keyframe() {
         let mut cap = SyntheticPatternCapture::new(1920, 1080);
-        let mut enc = H264Encoder::new(60, 6_000_000);
+        let mut enc = H264Encoder::new(60, 8_000_000);
         let mut dec = H264Decoder::new();
 
         let f1 = cap.next_frame();
@@ -1028,8 +1033,8 @@ mod tests {
         assert!(e1.is_keyframe);
         assert!(e1.annex_b.starts_with(&ANNEX_B_START_CODE));
         assert!(
-            e1.annex_b.len() <= 35 * 1024,
-            "IDR frame size {} exceeds 35 KB limit",
+            e1.annex_b.len() <= 165 * 1024,
+            "1:1 1080p IDR frame size {} exceeds 165 KB limit",
             e1.annex_b.len()
         );
         let d1 = dec.decode(&e1.annex_b).expect("IDR must decode");
@@ -1041,8 +1046,8 @@ mod tests {
         let e2 = enc.encode(&f2);
         assert!(!e2.is_keyframe);
         assert!(
-            e2.annex_b.len() <= 8 * 1024,
-            "P frame size {} exceeds 8 KB limit",
+            e2.annex_b.len() <= 40 * 1024,
+            "P frame size {} exceeds 40 KB limit",
             e2.annex_b.len()
         );
         let d2 = dec.decode(&e2.annex_b).expect("P frame must decode");
@@ -1053,10 +1058,48 @@ mod tests {
         let f3 = cap.next_frame();
         let e3 = enc.encode(&f3);
         assert!(e3.is_keyframe);
-        assert!(e3.annex_b.len() <= 35 * 1024);
+        assert!(e3.annex_b.len() <= 165 * 1024);
         let d3 = dec.decode(&e3.annex_b).expect("Forced IDR must decode");
         assert_eq!(d3.width, 1920);
         assert_eq!(d3.height, 1080);
+    }
+
+    #[test]
+    fn test_h265_full_res_1080p_and_unsupported_fallback_to_h264() {
+        let mut cap = SyntheticPatternCapture::new(1920, 1080);
+        let mut enc = H264Encoder::new_with_codec(60, 8_000_000, VideoCodec::H265);
+        assert_eq!(enc.codec(), VideoCodec::H265);
+
+        let f1 = cap.next_frame();
+        let e_hevc = enc.encode(&f1);
+        assert!(e_hevc.is_keyframe);
+        assert!(e_hevc.annex_b.len() <= 165 * 1024);
+
+        let mut dec = H264Decoder::new();
+        dec.set_hevc_decode_supported(true);
+        let ok_hevc = dec
+            .decode_checked(&e_hevc.annex_b)
+            .expect("supported HEVC must decode")
+            .expect("HEVC IDR must produce frame");
+        assert_eq!(ok_hevc.width, 1920);
+        assert_eq!(ok_hevc.height, 1080);
+
+        let mut unsupported_dec = H264Decoder::new();
+        unsupported_dec.set_hevc_decode_supported(false);
+        let err = unsupported_dec.decode_checked(&e_hevc.annex_b).unwrap_err();
+        assert!(matches!(err, DecoderError::UnsupportedCodec(_)));
+
+        // Switch encoder to H.264 on error and confirm clean full-res decode.
+        enc.set_codec(VideoCodec::H264);
+        let f2 = cap.next_frame();
+        let e_h264 = enc.encode(&f2);
+        assert!(e_h264.is_keyframe);
+        let ok_h264 = unsupported_dec
+            .decode_checked(&e_h264.annex_b)
+            .expect("H.264 fallback must decode on all viewers")
+            .expect("H.264 fallback IDR must produce frame");
+        assert_eq!(ok_h264.width, 1920);
+        assert_eq!(ok_h264.height, 1080);
     }
 
     #[test]

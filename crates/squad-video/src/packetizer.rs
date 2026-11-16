@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 
 pub const VIDEO_FEC_GROUP_SIZE: usize = 5;
 pub const VIDEO_DATA_SHARD_SIZE: usize = MAX_VIDEO_FRAG_BYTES - 2; // 1098B leaves 2B length metadata in parity
-const FRAME_TIMEOUT: Duration = Duration::from_millis(180);
+const FRAME_TIMEOUT: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoPacketOut {
@@ -198,6 +198,12 @@ impl FrameReassembler {
         self.awaiting_idr = true;
     }
 
+    pub fn reset_and_shrink(&mut self) {
+        self.pending = BTreeMap::new();
+        self.last_completed_frame_id = None;
+        self.awaiting_idr = true;
+    }
+
     /// Feeds one `VideoFrameFrag` packet and returns `(Some(frame), need_pli)`.
     pub fn push_fragment(
         &mut self,
@@ -291,7 +297,7 @@ impl FrameReassembler {
             need_pli = true;
         }
 
-        while self.pending.len() > 4 {
+        while self.pending.len() > 8 {
             if let Some((&oldest, _)) = self.pending.iter().next() {
                 if oldest == frame_id {
                     break;

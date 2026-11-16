@@ -14,6 +14,7 @@ pub const BLOB_CHUNK_SIZE: usize = 1024;
 pub const INLINE_IMAGE_MAX_BYTES: usize = 200 * 1024;
 pub const MAX_STREAM_TITLE_BYTES: usize = 64;
 pub const MAX_ENCODER_BACKEND_BYTES: usize = 48;
+pub const MAX_STREAM_ERROR_BYTES: usize = 64;
 pub const MAX_VIDEO_FRAG_BYTES: usize = 1100;
 pub const VIDEO_FLAG_KEYFRAME: u8 = 0x01;
 pub const VIDEO_FLAG_XOR_FEC: u8 = 0x02;
@@ -372,6 +373,8 @@ pub enum P2pMsgType {
     StreamSubscribe = 0x51,
     StreamPli = 0x52,
     VideoFrameFrag = 0x53,
+    StreamDecoderError = 0x54,
+    StreamAudioOpus = 0x55,
 }
 
 impl P2pMsgType {
@@ -395,6 +398,8 @@ impl P2pMsgType {
             0x51 => Ok(Self::StreamSubscribe),
             0x52 => Ok(Self::StreamPli),
             0x53 => Ok(Self::VideoFrameFrag),
+            0x54 => Ok(Self::StreamDecoderError),
+            0x55 => Ok(Self::StreamAudioOpus),
             other => Err(ProtoError::UnknownOpcode(other)),
         }
     }
@@ -514,6 +519,8 @@ pub enum P2pPayload {
     },
     StreamAnnounce {
         is_streaming: bool,
+        codec: u8,
+        has_audio: bool,
         width: u16,
         height: u16,
         fps: u8,
@@ -530,6 +537,13 @@ pub enum P2pPayload {
         frag_count: u16,
         flags: u8,
         data: Vec<u8>,
+    },
+    StreamDecoderError {
+        failed_codec: u8,
+        reason: String,
+    },
+    StreamAudioOpus {
+        opus_data: Vec<u8>,
     },
 }
 
@@ -554,6 +568,8 @@ impl P2pPayload {
             P2pPayload::StreamSubscribe { .. } => P2pMsgType::StreamSubscribe,
             P2pPayload::StreamPli => P2pMsgType::StreamPli,
             P2pPayload::VideoFrameFrag { .. } => P2pMsgType::VideoFrameFrag,
+            P2pPayload::StreamDecoderError { .. } => P2pMsgType::StreamDecoderError,
+            P2pPayload::StreamAudioOpus { .. } => P2pMsgType::StreamAudioOpus,
         }
     }
 
@@ -675,6 +691,8 @@ impl P2pPayload {
             }
             P2pPayload::StreamAnnounce {
                 is_streaming,
+                codec,
+                has_audio,
                 width,
                 height,
                 fps,
@@ -684,6 +702,8 @@ impl P2pPayload {
                 let title_bytes = truncate_utf8(source_title, MAX_STREAM_TITLE_BYTES);
                 let backend_bytes = truncate_utf8(encoder_backend, MAX_ENCODER_BACKEND_BYTES);
                 out.push(u8::from(*is_streaming));
+                out.push(*codec);
+                out.push(u8::from(*has_audio));
                 out.extend_from_slice(&width.to_be_bytes());
                 out.extend_from_slice(&height.to_be_bytes());
                 out.push(*fps);
@@ -712,6 +732,22 @@ impl P2pPayload {
                 out.push(*flags);
                 out.extend_from_slice(&(data.len() as u16).to_be_bytes());
                 out.extend_from_slice(data);
+            }
+            P2pPayload::StreamDecoderError {
+                failed_codec,
+                reason,
+            } => {
+                let reason_bytes = truncate_utf8(reason, MAX_STREAM_ERROR_BYTES);
+                out.push(*failed_codec);
+                out.push(reason_bytes.len() as u8);
+                out.extend_from_slice(reason_bytes);
+            }
+            P2pPayload::StreamAudioOpus { opus_data } => {
+                if opus_data.len() > 1024 {
+                    return Err(ProtoError::PacketTooLarge(opus_data.len()));
+                }
+                out.extend_from_slice(&(opus_data.len() as u16).to_be_bytes());
+                out.extend_from_slice(opus_data);
             }
         }
         Ok(())
@@ -872,18 +908,20 @@ impl P2pPayload {
                 })
             }
             P2pMsgType::StreamAnnounce => {
-                need_bytes(body, 0, 7)?;
+                need_bytes(body, 0, 9)?;
                 let is_streaming = body[0] != 0;
-                let width = u16::from_be_bytes([body[1], body[2]]);
-                let height = u16::from_be_bytes([body[3], body[4]]);
-                let fps = body[5];
-                let title_len = body[6] as usize;
+                let codec = body[1];
+                let has_audio = body[2] != 0;
+                let width = u16::from_be_bytes([body[3], body[4]]);
+                let height = u16::from_be_bytes([body[5], body[6]]);
+                let fps = body[7];
+                let title_len = body[8] as usize;
                 if title_len > MAX_STREAM_TITLE_BYTES {
                     return Err(ProtoError::PacketTooLarge(title_len));
                 }
-                need_bytes(body, 7, title_len + 1)?;
-                let title_end = 7 + title_len;
-                let source_title = std::str::from_utf8(&body[7..title_end])
+                need_bytes(body, 9, title_len + 1)?;
+                let title_end = 9 + title_len;
+                let source_title = std::str::from_utf8(&body[9..title_end])
                     .map_err(|_| ProtoError::InvalidUtf8)?
                     .to_string();
                 let backend_len = body[title_end] as usize;
@@ -898,6 +936,8 @@ impl P2pPayload {
                         .to_string();
                 Ok(P2pPayload::StreamAnnounce {
                     is_streaming,
+                    codec,
+                    has_audio,
                     width,
                     height,
                     fps,
@@ -929,6 +969,33 @@ impl P2pPayload {
                     frag_count,
                     flags,
                     data: body[11..11 + data_len].to_vec(),
+                })
+            }
+            P2pMsgType::StreamDecoderError => {
+                need_bytes(body, 0, 2)?;
+                let failed_codec = body[0];
+                let reason_len = body[1] as usize;
+                if reason_len > MAX_STREAM_ERROR_BYTES {
+                    return Err(ProtoError::PacketTooLarge(reason_len));
+                }
+                need_bytes(body, 2, reason_len)?;
+                let reason = std::str::from_utf8(&body[2..2 + reason_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?
+                    .to_string();
+                Ok(P2pPayload::StreamDecoderError {
+                    failed_codec,
+                    reason,
+                })
+            }
+            P2pMsgType::StreamAudioOpus => {
+                need_bytes(body, 0, 2)?;
+                let len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                if len > 1024 {
+                    return Err(ProtoError::PacketTooLarge(len));
+                }
+                need_bytes(body, 2, len)?;
+                Ok(P2pPayload::StreamAudioOpus {
+                    opus_data: body[2..2 + len].to_vec(),
                 })
             }
         }
@@ -1160,6 +1227,8 @@ mod tests {
                 10u64,
                 P2pPayload::StreamAnnounce {
                     is_streaming: true,
+                    codec: 1,
+                    has_audio: true,
                     width: 1920,
                     height: 1080,
                     fps: 60,
@@ -1179,6 +1248,19 @@ mod tests {
                     data: vec![0xAB; MAX_VIDEO_FRAG_BYTES],
                 },
             ),
+            (
+                14,
+                P2pPayload::StreamDecoderError {
+                    failed_codec: 1,
+                    reason: "HEVC hardware decoder unavailable on viewer ".repeat(3),
+                },
+            ),
+            (
+                15,
+                P2pPayload::StreamAudioOpus {
+                    opus_data: vec![0x55; 96],
+                },
+            ),
         ];
 
         for (seq, payload) in packets {
@@ -1188,17 +1270,41 @@ mod tests {
 
             match (&payload, &decoded_body) {
                 (
-                    P2pPayload::StreamAnnounce { source_title, encoder_backend, .. },
                     P2pPayload::StreamAnnounce {
+                        codec,
+                        has_audio,
+                        source_title,
+                        encoder_backend,
+                        ..
+                    },
+                    P2pPayload::StreamAnnounce {
+                        codec: d_codec,
+                        has_audio: d_audio,
                         source_title: d_title,
                         encoder_backend: d_backend,
                         ..
                     },
                 ) => {
+                    assert_eq!(codec, d_codec);
+                    assert_eq!(has_audio, d_audio);
                     assert!(d_title.len() <= MAX_STREAM_TITLE_BYTES);
                     assert!(source_title.starts_with(d_title));
                     assert!(d_backend.len() <= MAX_ENCODER_BACKEND_BYTES);
                     assert!(encoder_backend.starts_with(d_backend));
+                }
+                (
+                    P2pPayload::StreamDecoderError {
+                        failed_codec,
+                        reason,
+                    },
+                    P2pPayload::StreamDecoderError {
+                        failed_codec: d_codec,
+                        reason: d_reason,
+                    },
+                ) => {
+                    assert_eq!(failed_codec, d_codec);
+                    assert!(d_reason.len() <= MAX_STREAM_ERROR_BYTES);
+                    assert!(reason.starts_with(d_reason));
                 }
                 _ => assert_eq!(payload, decoded_body),
             }

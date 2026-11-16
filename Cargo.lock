@@ -5268,6 +5268,8 @@ dependencies = [
 name = "squad-video"
 version = "0.1.0"
 dependencies = [
+ "flate2",
+ "image 0.25.10",
  "serde",
  "squad-proto",
  "tracing",

@@ -926,6 +926,8 @@ impl SquadApp {
                         resolution: self.share_resolution,
                         fps: self.share_fps,
                         bitrate_bps: self.share_bitrate_bps,
+                        codec: squad_video::VideoCodec::H264,
+                        share_audio: false,
                     };
                     let _ = self.mesh_tx.try_send(MeshCommand::StartScreenShare { config });
                     self.is_local_sharing = true;

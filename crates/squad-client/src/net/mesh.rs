@@ -995,6 +995,7 @@ async fn handle_p2p_rx(
             fps,
             source_title,
             encoder_backend,
+            ..
         } => {
             let stream_opt = if is_streaming {
                 Some(RemoteStreamInfo {
@@ -1288,10 +1289,12 @@ async fn send_stream_announce_to_addr(
     is_streaming: bool,
     config: Option<&StreamConfig>,
 ) {
-    let (width, height, fps, source_title, encoder_backend) = if is_streaming {
+    let (codec, has_audio, width, height, fps, source_title, encoder_backend) = if is_streaming {
         if let Some(cfg) = config {
             let (w, h) = cfg.output_dimensions();
             (
+                cfg.codec.as_u8(),
+                cfg.share_audio,
                 w as u16,
                 h as u16,
                 cfg.fps.as_u8(),
@@ -1299,10 +1302,10 @@ async fn send_stream_announce_to_addr(
                 sess.local_encoder_backend.clone(),
             )
         } else {
-            (0, 0, 0, String::new(), String::new())
+            (0, false, 0, 0, 0, String::new(), String::new())
         }
     } else {
-        (0, 0, 0, String::new(), String::new())
+        (0, false, 0, 0, 0, String::new(), String::new())
     };
 
     sess.control_seq = sess.control_seq.wrapping_add(1);
@@ -1314,6 +1317,8 @@ async fn send_stream_announce_to_addr(
     };
     let payload = P2pPayload::StreamAnnounce {
         is_streaming,
+        codec,
+        has_audio,
         width,
         height,
         fps,

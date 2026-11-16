@@ -96,12 +96,42 @@ impl StreamFps {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum VideoCodec {
+    #[default]
+    H264 = 0,
+    H265 = 1,
+}
+
+impl VideoCodec {
+    pub fn from_u8(val: u8) -> Self {
+        match val {
+            1 => Self::H265,
+            _ => Self::H264,
+        }
+    }
+
+    pub fn as_u8(self) -> u8 {
+        self as u8
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H.264 (Compatible)",
+            VideoCodec::H265 => "H.265 (High Efficiency)",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StreamConfig {
     pub target: CaptureTarget,
     pub resolution: StreamResolution,
     pub fps: StreamFps,
     pub bitrate_bps: u32,
+    pub codec: VideoCodec,
+    pub share_audio: bool,
 }
 
 impl StreamConfig {
