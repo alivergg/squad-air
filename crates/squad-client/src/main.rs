@@ -6,7 +6,6 @@ mod net;
 mod tray;
 mod ui;
 
-use iced::Size;
 use ui::SquadApp;
 
 #[cfg(target_os = "macos")]
@@ -43,7 +42,7 @@ const fn build_info_plist() -> [u8; INFO_PLIST_STR.len()] {
 #[used]
 static INFO_PLIST: [u8; INFO_PLIST_STR.len()] = build_info_plist();
 
-fn load_window_icon() -> Option<iced::window::Icon> {
+pub fn load_window_icon() -> Option<iced::window::Icon> {
     let bytes = include_bytes!("../../../assets/icons/icon.png");
     let img = image::load_from_memory(bytes).ok()?;
     let resized = img
@@ -69,14 +68,10 @@ fn main() -> iced::Result {
         }
     }
 
-    iced::application(SquadApp::title, SquadApp::update, SquadApp::view)
+    iced::daemon(SquadApp::title, SquadApp::update, SquadApp::view)
         .subscription(SquadApp::subscription)
         .theme(SquadApp::theme)
-        .window(iced::window::Settings {
-            size: Size::new(1180.0, 740.0),
-            icon: load_window_icon(),
-            ..Default::default()
-        })
-        .exit_on_close_request(false)
+        .style(SquadApp::style)
+        .antialiasing(true)
         .run_with(SquadApp::new)
 }

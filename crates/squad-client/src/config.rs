@@ -48,6 +48,12 @@ pub struct AppConfig {
     pub minimize_to_tray: bool,
     #[serde(default = "default_stream_volume")]
     pub stream_volume: f32,
+    #[serde(default = "default_overlay_enabled")]
+    pub overlay_enabled: bool,
+    #[serde(default)]
+    pub overlay_speaking_only: bool,
+    #[serde(default = "default_overlay_opacity")]
+    pub overlay_opacity: f32,
 }
 
 impl Default for AppConfig {
@@ -71,6 +77,9 @@ impl Default for AppConfig {
             custom_avatar_hash: None,
             minimize_to_tray: default_minimize_to_tray(),
             stream_volume: default_stream_volume(),
+            overlay_enabled: default_overlay_enabled(),
+            overlay_speaking_only: false,
+            overlay_opacity: default_overlay_opacity(),
         }
     }
 }
@@ -174,6 +183,37 @@ fn default_minimize_to_tray() -> bool {
 
 fn default_stream_volume() -> f32 {
     1.0
+}
+
+fn default_overlay_enabled() -> bool {
+    true
+}
+
+fn default_overlay_opacity() -> f32 {
+    0.82
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn app_config_overlay_defaults_and_serde_roundtrip() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.overlay_enabled);
+        assert!(!cfg.overlay_speaking_only);
+        assert!((cfg.overlay_opacity - 0.82).abs() < 1e-4);
+
+        cfg.overlay_enabled = false;
+        cfg.overlay_speaking_only = true;
+        cfg.overlay_opacity = 0.65;
+
+        let encoded = toml::to_string_pretty(&cfg).unwrap();
+        let decoded: AppConfig = toml::from_str(&encoded).unwrap();
+        assert!(!decoded.overlay_enabled);
+        assert!(decoded.overlay_speaking_only);
+        assert!((decoded.overlay_opacity - 0.65).abs() < 1e-4);
+    }
 }
 
 fn uuid_key(client_uuid: &ClientUuid) -> String {

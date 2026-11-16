@@ -371,6 +371,76 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     .padding(20)
     .style(surface_card_style);
 
+    let ov_enabled = app.config.overlay_enabled;
+    let ov_speaking_only = app.config.overlay_speaking_only;
+    let ov_opacity = app.config.overlay_opacity.clamp(0.30, 1.0);
+    let ov_pct = (ov_opacity * 100.0).round() as u32;
+    let overlay_section = container(
+        column![
+            text("In-Game Overlay").size(16).color(M3_PRIMARY),
+            row![
+                column![
+                    text("Click-Through HUD Overlay").size(13),
+                    text("Show squad members on the left edge over your games")
+                        .size(11)
+                        .color(M3_ON_SURFACE_VARIANT),
+                ]
+                .spacing(2),
+                horizontal_space(),
+                row![
+                    button(text("Disabled").size(12))
+                        .padding([6, 12])
+                        .style(pill_chip_button(!ov_enabled))
+                        .on_press(Message::SetOverlayEnabled(false)),
+                    button(text("Enabled").size(12))
+                        .padding([6, 12])
+                        .style(pill_chip_button(ov_enabled))
+                        .on_press(Message::SetOverlayEnabled(true)),
+                ]
+                .spacing(6),
+            ]
+            .align_y(Vertical::Center),
+            row![
+                column![
+                    text("Display Mode").size(13),
+                    text("Show everyone in the squad or only active speakers")
+                        .size(11)
+                        .color(M3_ON_SURFACE_VARIANT),
+                ]
+                .spacing(2),
+                horizontal_space(),
+                row![
+                    button(text("All Squad Members").size(12))
+                        .padding([6, 12])
+                        .style(pill_chip_button(!ov_speaking_only))
+                        .on_press(Message::SetOverlaySpeakingOnly(false)),
+                    button(text("Speaking Only").size(12))
+                        .padding([6, 12])
+                        .style(pill_chip_button(ov_speaking_only))
+                        .on_press(Message::SetOverlaySpeakingOnly(true)),
+                ]
+                .spacing(6),
+            ]
+            .align_y(Vertical::Center),
+            row![
+                text(format!("Opacity: {ov_pct}%"))
+                    .size(12)
+                    .color(M3_ON_SURFACE_VARIANT)
+                    .width(Length::Fixed(110.0)),
+                slider(0.30..=1.00, ov_opacity, Message::OverlayOpacityChanged)
+                    .step(0.02_f32)
+                    .width(Length::Fill)
+                    .style(m3_slider_style),
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+        ]
+        .spacing(12),
+    )
+    .width(Length::Fill)
+    .padding(20)
+    .style(surface_card_style);
+
     column![
         top_bar,
         scrollable(
@@ -379,6 +449,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                 devices_section,
                 dsp_section,
                 hotkeys_section,
+                overlay_section,
                 behavior_section,
             ]
             .spacing(16)

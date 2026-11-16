@@ -2,6 +2,8 @@ pub mod avatar;
 pub mod chat;
 pub mod components;
 pub mod lobby;
+pub mod overlay;
+pub mod overlay_platform;
 pub mod room;
 pub mod settings;
 pub mod share_modal;
@@ -31,7 +33,8 @@ use iced::{
         button, column, container, horizontal_space, image as iced_image, row, stack, text,
         text_editor,
     },
-    Background, Border, Color, ContentFit, Element, Length, Size, Subscription, Task, Theme,
+    Background, Border, Color, ContentFit, Element, Length, Point, Size, Subscription, Task,
+    Theme,
 };
 use std::borrow::Cow;
 use image::imageops::FilterType;
@@ -146,6 +149,12 @@ pub enum Message {
     AvatarImagePicked(Option<PathBuf>),
     ResetAvatarIdenticon,
     SetMinimizeToTray(bool),
+    SetOverlayEnabled(bool),
+    SetOverlaySpeakingOnly(bool),
+    OverlayOpacityChanged(f32),
+    WindowOpened,
+    OverlayWindowOpened(iced::window::Id),
+    OverlayConfigured,
     WindowCloseRequested(iced::window::Id),
 }
 
@@ -194,6 +203,8 @@ pub struct SquadApp {
     pub stream_expanded: bool,
     pub stream_fullscreen: bool,
     pub is_in_tray: bool,
+    pub main_window_id: iced::window::Id,
+    pub overlay_window_id: Option<iced::window::Id>,
 }
 
 impl SquadApp {
@@ -244,6 +255,13 @@ impl SquadApp {
             }
         }
 
+        let (main_window_id, open_main_task) = iced::window::open(iced::window::Settings {
+            size: Size::new(1180.0, 740.0),
+            icon: crate::load_window_icon(),
+            exit_on_close_request: false,
+            ..Default::default()
+        });
+
         let app = Self {
             config: config_mut,
             screen: Screen::Lobby,
@@ -289,12 +307,17 @@ impl SquadApp {
             stream_expanded: false,
             stream_fullscreen: false,
             is_in_tray: false,
+            main_window_id,
+            overlay_window_id: None,
         };
 
-        (app, Task::none())
+        (app, open_main_task.map(|_| Message::WindowOpened))
     }
 
-    pub fn title(&self) -> String {
+    pub fn title(&self, window_id: iced::window::Id) -> String {
+        if Some(window_id) == self.overlay_window_id {
+            return "Squad-Air Overlay".to_string();
+        }
         match self.screen {
             Screen::Lobby => "Squad-Air".to_string(),
             Screen::Room => "Squad-Air — Voice Room".to_string(),
@@ -302,12 +325,23 @@ impl SquadApp {
         }
     }
 
-    pub fn theme(&self) -> Theme {
+    pub fn theme(&self, _window_id: iced::window::Id) -> Theme {
         material_dark_theme()
     }
 
+    pub fn style(&self, _theme: &Theme) -> iced::daemon::Appearance {
+        iced::daemon::Appearance {
+            background_color: Color::TRANSPARENT,
+            text_color: M3_ON_SURFACE,
+        }
+    }
+
     pub fn subscription(&self) -> Subscription<Message> {
-        let tick_ms = if self.is_in_tray { 200 } else { 20 };
+        let tick_ms = if self.is_in_tray && self.overlay_window_id.is_none() {
+            200
+        } else {
+            20
+        };
         let tick = time::every(Duration::from_millis(tick_ms)).map(|_| Message::Tick);
         let close_reqs = iced::window::close_requests().map(Message::WindowCloseRequested);
         if self.is_in_tray {
@@ -377,13 +411,12 @@ impl SquadApp {
                         let _ = self
                             .mesh_tx
                             .try_send(MeshCommand::SetTrayMode { in_tray: false });
-                        return iced::window::get_latest().and_then(|id| {
-                            Task::batch([
-                                iced::window::change_mode(id, iced::window::Mode::Windowed),
-                                iced::window::resize(id, Size::new(1180.0, 740.0)),
-                                iced::window::gain_focus(id),
-                            ])
-                        });
+                        let id = self.main_window_id;
+                        return Task::batch([
+                            iced::window::change_mode(id, iced::window::Mode::Windowed),
+                            iced::window::resize(id, Size::new(1180.0, 740.0)),
+                            iced::window::gain_focus(id),
+                        ]);
                     }
                     Some(TrayAction::Quit) => {
                         let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
@@ -393,6 +426,8 @@ impl SquadApp {
                     Some(TrayAction::ToggleMute) | None => {}
                 }
 
+                let mut pending_tasks = Vec::new();
+                let mut overlay_sync_needed = false;
                 if let Ok(mut rx) = self.mesh_rx.try_lock() {
                     while let Ok(evt) = rx.try_recv() {
                         match evt {
@@ -411,6 +446,7 @@ impl SquadApp {
                                     .unwrap_or_default();
                                 self.screen = Screen::Room;
                                 self.status_banner = None;
+                                overlay_sync_needed = true;
                             }
                             MeshEvent::LeftRoom => {
                                 self.peers.clear();
@@ -430,11 +466,19 @@ impl SquadApp {
                                 self.watched_peer_id = None;
                                 self.active_stream_frame = None;
                                 self.stream_expanded = false;
+                                let was_fs = self.stream_fullscreen;
                                 self.stream_fullscreen = false;
                                 if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                                     *slot = None;
                                 }
                                 self.screen = Screen::Lobby;
+                                overlay_sync_needed = true;
+                                if was_fs {
+                                    pending_tasks.push(set_window_fullscreen_task(
+                                        self.main_window_id,
+                                        false,
+                                    ));
+                                }
                             }
                             MeshEvent::PeersUpdated(snapshots) => {
                                 for snap in &snapshots {
@@ -527,7 +571,10 @@ impl SquadApp {
                                     self.stream_expanded = false;
                                     if self.stream_fullscreen {
                                         self.stream_fullscreen = false;
-                                        return set_window_fullscreen_task(false);
+                                        pending_tasks.push(set_window_fullscreen_task(
+                                            self.main_window_id,
+                                            false,
+                                        ));
                                     }
                                 }
                             }
@@ -563,6 +610,9 @@ impl SquadApp {
                         }
                     }
                 }
+                if overlay_sync_needed {
+                    pending_tasks.push(self.sync_overlay_window());
+                }
                 if self.watched_peer_id.is_some() || self.local_stream_preview {
                     if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                         if let Some(frame) = slot.take() {
@@ -579,28 +629,29 @@ impl SquadApp {
                         }
                     }
                 }
-                Task::none()
+                if pending_tasks.is_empty() {
+                    Task::none()
+                } else {
+                    Task::batch(pending_tasks)
+                }
             }
             Message::CreateRoom => {
                 let invite = InviteLink::generate();
                 let uri = invite.to_uri();
                 self.active_invite_uri = uri.clone();
                 self.invite_copied_flash = true;
-                self.join_with_invite(invite);
-                clipboard::write(uri)
+                let join_task = self.join_with_invite(invite);
+                Task::batch([join_task, clipboard::write(uri)])
             }
             Message::InviteInputChanged(val) => {
                 self.invite_input = val;
                 Task::none()
             }
             Message::JoinRoomWithInput => {
-                self.try_join_uri(&self.invite_input.clone());
-                Task::none()
+                let uri = self.invite_input.clone();
+                self.try_join_uri(&uri)
             }
-            Message::JoinSavedChannel(uri) => {
-                self.try_join_uri(&uri);
-                Task::none()
-            }
+            Message::JoinSavedChannel(uri) => self.try_join_uri(&uri),
             Message::LeaveRoom => {
                 let _ = self.mesh_tx.try_send(MeshCommand::LeaveRoom);
                 self.peers.clear();
@@ -625,10 +676,14 @@ impl SquadApp {
                     *slot = None;
                 }
                 self.screen = Screen::Lobby;
+                let overlay_task = self.sync_overlay_window();
                 if was_fs {
-                    set_window_fullscreen_task(false)
+                    Task::batch([
+                        overlay_task,
+                        set_window_fullscreen_task(self.main_window_id, false),
+                    ])
                 } else {
-                    Task::none()
+                    overlay_task
                 }
             }
             Message::CopyInviteUri => {
@@ -943,7 +998,7 @@ impl SquadApp {
                 self.share_modal_open = false;
                 if self.stream_fullscreen {
                     self.stream_fullscreen = false;
-                    return set_window_fullscreen_task(false);
+                    return set_window_fullscreen_task(self.main_window_id, false);
                 }
                 Task::none()
             }
@@ -1044,7 +1099,7 @@ impl SquadApp {
                     }
                     if self.stream_fullscreen {
                         self.stream_fullscreen = false;
-                        return set_window_fullscreen_task(false);
+                        return set_window_fullscreen_task(self.main_window_id, false);
                     }
                 }
                 Task::none()
@@ -1070,7 +1125,7 @@ impl SquadApp {
                         && self.watched_peer_id.is_none()
                     {
                         self.stream_fullscreen = false;
-                        return set_window_fullscreen_task(false);
+                        return set_window_fullscreen_task(self.main_window_id, false);
                     }
                 }
                 Task::none()
@@ -1101,7 +1156,7 @@ impl SquadApp {
                     .mesh_tx
                     .try_send(MeshCommand::WatchPeerStream { peer_id: None });
                 if was_fs {
-                    set_window_fullscreen_task(false)
+                    set_window_fullscreen_task(self.main_window_id, false)
                 } else {
                     Task::none()
                 }
@@ -1122,18 +1177,21 @@ impl SquadApp {
                     && (self.watched_peer_id.is_some() || self.local_stream_preview)
                 {
                     self.stream_fullscreen = !self.stream_fullscreen;
-                    return set_window_fullscreen_task(self.stream_fullscreen);
+                    return set_window_fullscreen_task(self.main_window_id, self.stream_fullscreen);
                 }
                 Task::none()
             }
             Message::ExitStreamFullscreen => {
                 if self.stream_fullscreen {
                     self.stream_fullscreen = false;
-                    return set_window_fullscreen_task(false);
+                    return set_window_fullscreen_task(self.main_window_id, false);
                 }
                 Task::none()
             }
             Message::WindowCloseRequested(window_id) => {
+                if window_id != self.main_window_id {
+                    return Task::none();
+                }
                 if self.config.minimize_to_tray {
                     self.is_in_tray = true;
                     self.share_modal_open = false;
@@ -1149,7 +1207,9 @@ impl SquadApp {
                     self.inline_image_bytes.shrink_to_fit();
                     self.capture_targets.clear();
                     self.capture_targets.shrink_to_fit();
-                    self.avatars.clear_memory_cache();
+                    if self.overlay_window_id.is_none() {
+                        self.avatars.clear_memory_cache();
+                    }
                     if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                         *slot = None;
                     }
@@ -1171,6 +1231,29 @@ impl SquadApp {
                 self.config.minimize_to_tray = enabled;
                 let _ = self.config.save();
                 Task::none()
+            }
+            Message::SetOverlayEnabled(enabled) => {
+                self.config.overlay_enabled = enabled;
+                let _ = self.config.save();
+                self.sync_overlay_window()
+            }
+            Message::SetOverlaySpeakingOnly(speaking_only) => {
+                self.config.overlay_speaking_only = speaking_only;
+                let _ = self.config.save();
+                Task::none()
+            }
+            Message::OverlayOpacityChanged(opacity) => {
+                self.config.overlay_opacity = opacity.clamp(0.30, 1.0);
+                let _ = self.config.save();
+                Task::none()
+            }
+            Message::WindowOpened | Message::OverlayConfigured => Task::none(),
+            Message::OverlayWindowOpened(id) => {
+                if self.overlay_window_id == Some(id) {
+                    overlay_platform::configure_overlay_window(id)
+                } else {
+                    Task::none()
+                }
             }
             Message::PickAvatarImage => Task::perform(
                 async {
@@ -1216,7 +1299,11 @@ impl SquadApp {
         }
     }
 
-    pub fn view(&self) -> Element<'_, Message> {
+    pub fn view(&self, window_id: iced::window::Id) -> Element<'_, Message> {
+        if Some(window_id) == self.overlay_window_id {
+            return overlay::view_overlay(self);
+        }
+
         let content = match self.screen {
             Screen::Lobby => lobby::view_lobby(self),
             Screen::Room => room::view_room(self),
@@ -1267,20 +1354,21 @@ impl SquadApp {
         }
     }
 
-    fn try_join_uri(&mut self, uri: &str) {
+    fn try_join_uri(&mut self, uri: &str) -> Task<Message> {
         match InviteLink::parse(uri) {
             Ok(invite) => {
                 self.active_invite_uri = invite.to_uri();
                 self.invite_copied_flash = false;
-                self.join_with_invite(invite);
+                self.join_with_invite(invite)
             }
             Err(e) => {
                 self.status_banner = Some(format!("Invalid invite link: {e}"));
+                Task::none()
             }
         }
     }
 
-    fn join_with_invite(&mut self, invite: InviteLink) {
+    fn join_with_invite(&mut self, invite: InviteLink) -> Task<Message> {
         self.chat_messages.clear();
         self.chat_text_editors.clear();
         self.active_chat_selection = None;
@@ -1297,7 +1385,49 @@ impl SquadApp {
             initial_volumes: HashMap::new(),
         });
         self.screen = Screen::Room;
+        self.sync_overlay_window()
     }
+
+    fn sync_overlay_window(&mut self) -> Task<Message> {
+        let in_room = self.screen == Screen::Room
+            || (self.screen == Screen::Settings && self.previous_screen == Screen::Room);
+        let should_open = self.config.overlay_enabled && in_room;
+
+        if should_open {
+            if self.overlay_window_id.is_some() {
+                return Task::none();
+            }
+            #[allow(unused_mut)]
+            let mut settings = iced::window::Settings {
+                size: Size::new(240.0, 420.0),
+                position: iced::window::Position::SpecificWith(overlay_left_center_position),
+                visible: true,
+                resizable: false,
+                decorations: false,
+                transparent: true,
+                level: iced::window::Level::AlwaysOnTop,
+                exit_on_close_request: false,
+                ..Default::default()
+            };
+            #[cfg(target_os = "windows")]
+            {
+                settings.platform_specific.skip_taskbar = true;
+                settings.platform_specific.undecorated_shadow = false;
+                settings.platform_specific.drag_and_drop = false;
+            }
+            let (ov_id, open_task) = iced::window::open(settings);
+            self.overlay_window_id = Some(ov_id);
+            open_task.map(Message::OverlayWindowOpened)
+        } else if let Some(ov_id) = self.overlay_window_id.take() {
+            iced::window::close(ov_id)
+        } else {
+            Task::none()
+        }
+    }
+}
+
+fn overlay_left_center_position(win: Size, screen: Size) -> Point {
+    Point::new(18.0, ((screen.height - win.height) * 0.5).max(32.0))
 }
 
 fn view_image_lightbox<'a>(
@@ -1494,13 +1624,13 @@ fn open_in_file_manager(saved_path: Option<PathBuf>) {
     }
 }
 
-fn set_window_fullscreen_task(fullscreen: bool) -> Task<Message> {
+fn set_window_fullscreen_task(window_id: iced::window::Id, fullscreen: bool) -> Task<Message> {
     let mode = if fullscreen {
         iced::window::Mode::Fullscreen
     } else {
         iced::window::Mode::Windowed
     };
-    iced::window::get_latest().and_then(move |id| iced::window::change_mode(id, mode))
+    iced::window::change_mode(window_id, mode)
 }
 
 fn hex_prefix(bytes: &[u8; 4]) -> String {
