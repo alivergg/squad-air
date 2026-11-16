@@ -784,6 +784,7 @@ impl SwarmChatManager {
         ctx.send_p2p(peer_addr, &P2pPayload::HistorySyncReq).await;
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn handle_payload(
         &mut self,
         sender_peer_id: PeerId,
@@ -2471,5 +2472,548 @@ mod tests {
 
         let _ = fs::remove_file(&tmp_src);
         let _ = fs::remove_file(&final_path);
+    }
+
+    async fn pump_socket_with_uuids(
+        mgr: &mut SwarmChatManager,
+        peer_nicknames: &HashMap<PeerId, String>,
+        peer_uuids: &HashMap<PeerId, ClientUuid>,
+        connected_list: &[(PeerId, SocketAddr)],
+        ctx: &mut TransferCtx<'_>,
+    ) {
+        let mut rx_buf = [0u8; MAX_UDP_PAYLOAD + 64];
+        while let Ok(Ok((len, src))) =
+            tokio::time::timeout(Duration::from_millis(5), ctx.socket.recv_from(&mut rx_buf))
+                .await
+        {
+            if let Ok((hdr, payload)) = ctx.cipher.open_packet(&mut rx_buf[..len]) {
+                let nick = peer_nicknames
+                    .get(&hdr.sender_peer_id)
+                    .map(String::as_str)
+                    .unwrap_or("Peer");
+                let sender_uuid = peer_uuids
+                    .get(&hdr.sender_peer_id)
+                    .copied()
+                    .unwrap_or([0x99; 16]);
+                mgr.handle_payload(
+                    hdr.sender_peer_id,
+                    sender_uuid,
+                    nick,
+                    src,
+                    payload,
+                    connected_list,
+                    ctx,
+                )
+                .await;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_avatar_p2p_sync_and_blake3_cache() {
+        let img = image::RgbaImage::from_fn(160, 160, |x, y| {
+            image::Rgba([(x % 255) as u8, (y % 255) as u8, 180, 255])
+        });
+        let mut raw_png = Vec::new();
+        image::DynamicImage::ImageRgba8(img)
+            .write_to(
+                &mut std::io::Cursor::new(&mut raw_png),
+                image::ImageFormat::Png,
+            )
+            .unwrap();
+        let (jpeg_bytes, avatar_hash, _rgba128) =
+            crate::ui::avatar::process_custom_avatar_image(&raw_png).unwrap();
+        let _ = fs::remove_file(crate::ui::avatar::avatar_disk_path(&avatar_hash));
+
+        let invite = InviteLink::generate();
+        let prefix = invite.room_prefix();
+        let cipher = RoomCipher::from_secret(&invite.secret);
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let uuid_a = [0xA1; 16];
+        let uuid_b = [0xB2; 16];
+
+        let mut mgr_a = SwarmChatManager::new();
+        let mut mgr_b = SwarmChatManager::new();
+
+        let (tx_a, mut _rx_a) = mpsc::channel(64);
+        let (tx_b, mut rx_b) = mpsc::channel(64);
+        let mut seq_a = 1u64;
+        let mut seq_b = 1u64;
+        let mut seal_a = Vec::with_capacity(MAX_UDP_PAYLOAD);
+        let mut seal_b = Vec::with_capacity(MAX_UDP_PAYLOAD);
+
+        let ab_list = vec![(2, addr_b)];
+        let ba_list = vec![(1, addr_a)];
+        let mut ab_map = HashMap::new();
+        ab_map.insert(2, addr_b);
+        let mut ba_map = HashMap::new();
+        ba_map.insert(1, addr_a);
+
+        let mut nicks = HashMap::new();
+        nicks.insert(1, "Alpha".to_string());
+        nicks.insert(2, "Bravo".to_string());
+
+        let mut peer_uuids = HashMap::new();
+        peer_uuids.insert(1, uuid_a);
+        peer_uuids.insert(2, uuid_b);
+
+        {
+            let mut ctx_a = TransferCtx {
+                local_peer_id: 1,
+                local_uuid: uuid_a,
+                local_nickname: "Alpha",
+                socket: &sock_a,
+                cipher: &cipher,
+                room_prefix: prefix,
+                control_seq: &mut seq_a,
+                seal_buf: &mut seal_a,
+                evt_tx: &tx_a,
+            };
+            mgr_a
+                .set_local_avatar(Some((avatar_hash, jpeg_bytes.clone())), &ab_list, &mut ctx_a)
+                .await;
+        }
+
+        let mut loaded_custom = None;
+        for _ in 0..40 {
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            {
+                let mut ctx_b = TransferCtx {
+                    local_peer_id: 2,
+                    local_uuid: uuid_b,
+                    local_nickname: "Bravo",
+                    socket: &sock_b,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_b,
+                    seal_buf: &mut seal_b,
+                    evt_tx: &tx_b,
+                };
+                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b)
+                    .await;
+                mgr_b
+                    .tick_10ms(&ba_map, &peer_uuids, &[uuid_a], &mut ctx_b)
+                    .await;
+            }
+            {
+                let mut ctx_a = TransferCtx {
+                    local_peer_id: 1,
+                    local_uuid: uuid_a,
+                    local_nickname: "Alpha",
+                    socket: &sock_a,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_a,
+                    seal_buf: &mut seal_a,
+                    evt_tx: &tx_a,
+                };
+                pump_socket_with_uuids(&mut mgr_a, &nicks, &peer_uuids, &ab_list, &mut ctx_a)
+                    .await;
+                mgr_a
+                    .tick_10ms(&ab_map, &peer_uuids, &[uuid_b], &mut ctx_a)
+                    .await;
+            }
+
+            while let Ok(ev) = rx_b.try_recv() {
+                if let TransferEvent::PeerAvatarLoaded {
+                    client_uuid,
+                    avatar_hash: h,
+                    jpeg_bytes: Some(bytes),
+                } = ev
+                {
+                    loaded_custom = Some((client_uuid, h, bytes));
+                }
+            }
+            if loaded_custom.is_some() {
+                break;
+            }
+        }
+
+        let (got_uuid, got_hash, got_jpeg) =
+            loaded_custom.expect("Peer B must download custom avatar over P2P");
+        assert_eq!(got_uuid, uuid_a);
+        assert_eq!(got_hash, avatar_hash);
+        assert_eq!(got_jpeg, jpeg_bytes);
+        assert_eq!(
+            crate::ui::avatar::load_cached_avatar_jpeg(&avatar_hash).as_deref(),
+            Some(jpeg_bytes.as_slice())
+        );
+
+        // Reset to Identicon and verify [0u8; 32] broadcast
+        {
+            let mut ctx_a = TransferCtx {
+                local_peer_id: 1,
+                local_uuid: uuid_a,
+                local_nickname: "Alpha",
+                socket: &sock_a,
+                cipher: &cipher,
+                room_prefix: prefix,
+                control_seq: &mut seq_a,
+                seal_buf: &mut seal_a,
+                evt_tx: &tx_a,
+            };
+            mgr_a.set_local_avatar(None, &ab_list, &mut ctx_a).await;
+        }
+        {
+            let mut ctx_b = TransferCtx {
+                local_peer_id: 2,
+                local_uuid: uuid_b,
+                local_nickname: "Bravo",
+                socket: &sock_b,
+                cipher: &cipher,
+                room_prefix: prefix,
+                control_seq: &mut seq_b,
+                seal_buf: &mut seal_b,
+                evt_tx: &tx_b,
+            };
+            pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b).await;
+        }
+
+        let mut reset_ok = false;
+        while let Ok(ev) = rx_b.try_recv() {
+            if let TransferEvent::PeerAvatarLoaded {
+                client_uuid,
+                avatar_hash: h,
+                jpeg_bytes: None,
+            } = ev
+            {
+                if client_uuid == uuid_a && h == [0u8; 32] {
+                    reset_ok = true;
+                }
+            }
+        }
+        assert!(reset_ok, "Peer B must receive Identicon reset notification");
+
+        let _ = fs::remove_file(crate::ui::avatar::avatar_disk_path(&avatar_hash));
+    }
+
+    #[tokio::test]
+    async fn test_persistent_room_history_rejoin_author_preservation_and_seeding() {
+        let invite = InviteLink::generate();
+        let prefix = invite.room_prefix();
+        let cipher = RoomCipher::from_secret(&invite.secret);
+
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let tmp_root = std::env::temp_dir().join(format!("squad_hist_test_{nonce}"));
+        fs::create_dir_all(&tmp_root).unwrap();
+
+        let src_file = tmp_root.join("reseed_payload.bin");
+        let file_bytes = vec![0x5Au8; 4096];
+        fs::write(&src_file, &file_bytes).unwrap();
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+
+        let uuid_a = [0xA1; 16];
+        let uuid_b = [0xB2; 16];
+
+        let mut mgr_a = SwarmChatManager::new();
+        let mut mgr_b = SwarmChatManager::new();
+        mgr_b.set_room_persistence(invite.room_id, tmp_root.clone());
+
+        let (tx_a, mut _rx_a) = mpsc::channel(128);
+        let (tx_b, mut rx_b) = mpsc::channel(128);
+        let mut seq_a = 1u64;
+        let mut seq_b = 1u64;
+        let mut seal_a = Vec::with_capacity(MAX_UDP_PAYLOAD);
+        let mut seal_b = Vec::with_capacity(MAX_UDP_PAYLOAD);
+
+        let ab_list = vec![(2, addr_b)];
+        let ba_list = vec![(1, addr_a)];
+        let mut ab_map = HashMap::new();
+        ab_map.insert(2, addr_b);
+        let mut ba_map = HashMap::new();
+        ba_map.insert(1, addr_a);
+
+        let mut nicks = HashMap::new();
+        nicks.insert(1, "Alpha".to_string());
+        nicks.insert(2, "Bravo".to_string());
+        nicks.insert(9, "Alpha".to_string());
+
+        let mut peer_uuids = HashMap::new();
+        peer_uuids.insert(1, uuid_a);
+        peer_uuids.insert(2, uuid_b);
+        peer_uuids.insert(9, uuid_a);
+
+        {
+            let mut ctx_a = TransferCtx {
+                local_peer_id: 1,
+                local_uuid: uuid_a,
+                local_nickname: "Alpha",
+                socket: &sock_a,
+                cipher: &cipher,
+                room_prefix: prefix,
+                control_seq: &mut seq_a,
+                seal_buf: &mut seal_a,
+                evt_tx: &tx_a,
+            };
+            for i in 0..34u32 {
+                mgr_a
+                    .send_chat_text(format!("Alpha msg #{i}"), &ab_list, &mut ctx_a)
+                    .await;
+            }
+            mgr_a
+                .offer_file(src_file.clone(), &ab_list, &mut ctx_a)
+                .await;
+        }
+
+        let mut offered_blob_id = None;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            {
+                let mut ctx_b = TransferCtx {
+                    local_peer_id: 2,
+                    local_uuid: uuid_b,
+                    local_nickname: "Bravo",
+                    socket: &sock_b,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_b,
+                    seal_buf: &mut seal_b,
+                    evt_tx: &tx_b,
+                };
+                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b)
+                    .await;
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                if let TransferEvent::ChatItemReceived(item) = ev {
+                    if let ChatContentUi::File { blob_id, .. } = item.content {
+                        offered_blob_id = Some(blob_id);
+                    }
+                }
+            }
+            if offered_blob_id.is_some() {
+                break;
+            }
+        }
+        let bid = offered_blob_id.expect("Peer B must receive file offer");
+        {
+            let mut ctx_b = TransferCtx {
+                local_peer_id: 2,
+                local_uuid: uuid_b,
+                local_nickname: "Bravo",
+                socket: &sock_b,
+                cipher: &cipher,
+                room_prefix: prefix,
+                control_seq: &mut seq_b,
+                seal_buf: &mut seal_b,
+                evt_tx: &tx_b,
+            };
+            mgr_b
+                .send_chat_text("Reply from Bravo".to_string(), &ba_list, &mut ctx_b)
+                .await;
+        }
+        mgr_b.start_download(bid, &tx_b).await;
+
+        let mut saved_download: Option<PathBuf> = None;
+        for _ in 0..45 {
+            tokio::time::sleep(Duration::from_millis(12)).await;
+            {
+                let mut ctx_b = TransferCtx {
+                    local_peer_id: 2,
+                    local_uuid: uuid_b,
+                    local_nickname: "Bravo",
+                    socket: &sock_b,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_b,
+                    seal_buf: &mut seal_b,
+                    evt_tx: &tx_b,
+                };
+                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b)
+                    .await;
+                mgr_b
+                    .tick_10ms(&ba_map, &peer_uuids, &[uuid_a], &mut ctx_b)
+                    .await;
+            }
+            {
+                let mut ctx_a = TransferCtx {
+                    local_peer_id: 1,
+                    local_uuid: uuid_a,
+                    local_nickname: "Alpha",
+                    socket: &sock_a,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_a,
+                    seal_buf: &mut seal_a,
+                    evt_tx: &tx_a,
+                };
+                pump_socket_with_uuids(&mut mgr_a, &nicks, &peer_uuids, &ab_list, &mut ctx_a)
+                    .await;
+                mgr_a
+                    .tick_10ms(&ab_map, &peer_uuids, &[uuid_b], &mut ctx_a)
+                    .await;
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                if let TransferEvent::BlobStateChanged {
+                    blob_id,
+                    state: BlobTransferState::Completed { saved_path },
+                    ..
+                } = ev
+                {
+                    if blob_id == bid {
+                        saved_download = saved_path;
+                    }
+                }
+            }
+            if saved_download.is_some() {
+                break;
+            }
+        }
+        let dl_path = saved_download.expect("File download should complete");
+
+        // Restart Bravo's SwarmChatManager from disk and verify 30-message cap, UUID identity, and auto-seeding
+        drop(mgr_b);
+        let mut mgr_b_reloaded = SwarmChatManager::new();
+        mgr_b_reloaded.set_room_persistence(invite.room_id, tmp_root.clone());
+        let (tx_b2, mut rx_b2) = mpsc::channel(64);
+        mgr_b_reloaded.load_room_from_disk(uuid_b, &tx_b2).await;
+
+        let mut restored_items = Vec::new();
+        while let Ok(ev) = rx_b2.try_recv() {
+            if let TransferEvent::ChatItemReceived(item) = ev {
+                restored_items.push(item);
+            }
+        }
+        assert_eq!(restored_items.len(), 30, "History must cap cleanly at 30 messages");
+        assert!(
+            mgr_b_reloaded.local_blobs.contains_key(&bid),
+            "Reloaded manager must auto-seed previously downloaded blobs"
+        );
+        for item in &restored_items {
+            if item.is_self {
+                assert_eq!(item.sender_uuid, uuid_b);
+                assert_eq!(item.sender_nickname, "Bravo");
+            } else {
+                assert_eq!(item.sender_uuid, uuid_a);
+                assert_eq!(item.sender_nickname, "Alpha");
+            }
+        }
+        assert!(
+            restored_items
+                .iter()
+                .any(|i| i.is_self && i.sender_nickname == "Bravo"),
+            "Bravo reply must persist inside latest 30 history items"
+        );
+
+        // Alpha rejoins under a brand-new temporary PeerId = 9 and syncs room history
+        let sock_a2 = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a2 = sock_a2.local_addr().unwrap();
+        let mut mgr_a2 = SwarmChatManager::new();
+        let (tx_a2, mut rx_a2) = mpsc::channel(64);
+        let a2_b_list = vec![(2, addr_b)];
+        let b_a2_list = vec![(9, addr_a2)];
+        let mut a2_b_map = HashMap::new();
+        a2_b_map.insert(2, addr_b);
+        let mut b_a2_map = HashMap::new();
+        b_a2_map.insert(9, addr_a2);
+
+        {
+            let mut ctx_a2 = TransferCtx {
+                local_peer_id: 9,
+                local_uuid: uuid_a,
+                local_nickname: "Alpha",
+                socket: &sock_a2,
+                cipher: &cipher,
+                room_prefix: prefix,
+                control_seq: &mut seq_a,
+                seal_buf: &mut seal_a,
+                evt_tx: &tx_a2,
+            };
+            mgr_a2.send_history_sync_req(addr_b, &mut ctx_a2).await;
+            mgr_a2
+                .send_chat_text("Rejoined under slot 9".to_string(), &a2_b_list, &mut ctx_a2)
+                .await;
+        }
+        let mut new_msg_from_slot9 = None;
+        let mut synced_for_alpha = Vec::new();
+        for _ in 0..45 {
+            tokio::time::sleep(Duration::from_millis(14)).await;
+            {
+                let mut ctx_b2 = TransferCtx {
+                    local_peer_id: 2,
+                    local_uuid: uuid_b,
+                    local_nickname: "Bravo",
+                    socket: &sock_b,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_b,
+                    seal_buf: &mut seal_b,
+                    evt_tx: &tx_b2,
+                };
+                pump_socket_with_uuids(
+                    &mut mgr_b_reloaded,
+                    &nicks,
+                    &peer_uuids,
+                    &b_a2_list,
+                    &mut ctx_b2,
+                )
+                .await;
+                mgr_b_reloaded
+                    .tick_10ms(&b_a2_map, &peer_uuids, &[uuid_a], &mut ctx_b2)
+                    .await;
+            }
+            {
+                let mut ctx_a2 = TransferCtx {
+                    local_peer_id: 9,
+                    local_uuid: uuid_a,
+                    local_nickname: "Alpha",
+                    socket: &sock_a2,
+                    cipher: &cipher,
+                    room_prefix: prefix,
+                    control_seq: &mut seq_a,
+                    seal_buf: &mut seal_a,
+                    evt_tx: &tx_a2,
+                };
+                pump_socket_with_uuids(&mut mgr_a2, &nicks, &peer_uuids, &a2_b_list, &mut ctx_a2)
+                    .await;
+                mgr_a2
+                    .tick_10ms(&a2_b_map, &peer_uuids, &[uuid_b], &mut ctx_a2)
+                    .await;
+            }
+            while let Ok(ev) = rx_b2.try_recv() {
+                if let TransferEvent::ChatItemReceived(item) = ev {
+                    new_msg_from_slot9 = Some(item);
+                }
+            }
+            while let Ok(ev) = rx_a2.try_recv() {
+                if let TransferEvent::ChatItemReceived(item) = ev {
+                    synced_for_alpha.push(item);
+                }
+            }
+            if new_msg_from_slot9.is_some()
+                && synced_for_alpha.iter().any(|i| !i.is_self && i.sender_uuid == uuid_b)
+                && synced_for_alpha.iter().any(|i| i.is_self && i.sender_uuid == uuid_a)
+            {
+                break;
+            }
+        }
+
+        let slot9_item = new_msg_from_slot9.expect("Bravo must receive Alpha msg under PeerId 9");
+        assert_eq!(slot9_item.sender_uuid, uuid_a);
+        assert_eq!(slot9_item.sender_nickname, "Alpha");
+        assert!(!slot9_item.is_self);
+
+        assert!(
+            synced_for_alpha.iter().any(|i| !i.is_self && i.sender_uuid == uuid_b && i.sender_nickname == "Bravo"),
+            "Synced history on rejoin must identify Bravo accurately"
+        );
+        assert!(
+            synced_for_alpha.iter().any(|i| i.is_self && i.sender_uuid == uuid_a && i.sender_nickname == "Alpha"),
+            "Synced history on rejoin must restore Alpha's own historical authorship"
+        );
+
+        let _ = fs::remove_file(&dl_path);
+        let _ = fs::remove_dir_all(&tmp_root);
     }
 }

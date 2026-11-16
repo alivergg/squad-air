@@ -96,7 +96,9 @@ pub fn generate_identicon_rgba(client_uuid: &ClientUuid) -> Vec<u8> {
     rgba
 }
 
-pub fn process_custom_avatar_image(raw_bytes: &[u8]) -> Result<(Vec<u8>, [u8; 32], Vec<u8>), String> {
+pub type ProcessedAvatar = (Vec<u8>, [u8; 32], Vec<u8>);
+
+pub fn process_custom_avatar_image(raw_bytes: &[u8]) -> Result<ProcessedAvatar, String> {
     let img = image::load_from_memory(raw_bytes)
         .map_err(|e| format!("Failed to decode avatar image: {e}"))?;
     let w = img.width();

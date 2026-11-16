@@ -7,8 +7,14 @@ squad-air/
 ├── Cargo.toml                              # Workspace members & pinned dependency versions
 ├── SPECIFICATION.md                        # Full functional & protocol requirements
 ├── PROJECT_MAP.md                          # This structural map & cross-crate API contracts
+├── BUILD_AND_INSTALLERS.md                 # macOS .pkg & Windows .exe installer build guide
 ├── .agent/skills/squad-rust-guardrails/
 │   └── SKILL.md                            # Crate-specific API guardrails (iced 0.13, ringbuf 0.4)
+├── scripts/
+│   ├── package_installers.sh               # Simultaneous macOS (.pkg) & Windows (.exe) packager
+│   ├── windows_installer.c                 # Pure Win32 GUI setup with in-place upgrade & shortcut prompt
+│   └── windows_installer.rc                # Resource script embedding release squad-client.exe
+├── dist/                                   # Packaged macOS & Windows installer deliverables
 ├── assets/
 │   ├── models/README.md                    # Optional deepfilternet3.onnx placement guide
 │   └── sounds/README.md                    # Optional WAV cues manifest (join, leave, peer_join, peer_leave, mute, unmute)
