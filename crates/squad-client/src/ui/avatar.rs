@@ -1,6 +1,6 @@
 use iced::widget::image as iced_image;
 use image::imageops::FilterType;
-use squad_proto::ClientUuid;
+use squad_proto::{ClientUuid, RoomId};
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
@@ -36,8 +36,7 @@ pub fn apply_circular_alpha_mask(rgba: &mut [u8], size: u32) {
     }
 }
 
-pub fn generate_identicon_rgba(client_uuid: &ClientUuid) -> Vec<u8> {
-    let b = *blake3::hash(client_uuid).as_bytes();
+fn render_5x5_avatar_from_hash(b: &[u8; 32]) -> Vec<u8> {
     let hue = (u16::from_be_bytes([b[0], b[1]]) % 360) as f32;
     let saturation = 0.62 + (b[2] as f32 / 255.0) * 0.18;
     let lightness = 0.68 + (b[3] as f32 / 255.0) * 0.10;
@@ -94,6 +93,16 @@ pub fn generate_identicon_rgba(client_uuid: &ClientUuid) -> Vec<u8> {
 
     apply_circular_alpha_mask(&mut rgba, AVATAR_SIZE);
     rgba
+}
+
+pub fn generate_identicon_rgba(client_uuid: &ClientUuid) -> Vec<u8> {
+    let b = *blake3::hash(client_uuid).as_bytes();
+    render_5x5_avatar_from_hash(&b)
+}
+
+pub fn generate_room_avatar_rgba(room_id: &RoomId) -> Vec<u8> {
+    let b = *blake3::hash(room_id).as_bytes();
+    render_5x5_avatar_from_hash(&b)
 }
 
 pub type ProcessedAvatar = (Vec<u8>, [u8; 32], Vec<u8>);
@@ -237,6 +246,7 @@ pub fn prune_expired_avatars() {
 
 pub struct AvatarCache {
     handles: Mutex<HashMap<ClientUuid, iced_image::Handle>>,
+    room_handles: Mutex<HashMap<RoomId, iced_image::Handle>>,
 }
 
 impl AvatarCache {
@@ -244,6 +254,7 @@ impl AvatarCache {
         prune_expired_avatars();
         Self {
             handles: Mutex::new(HashMap::new()),
+            room_handles: Mutex::new(HashMap::new()),
         }
     }
 
@@ -257,6 +268,20 @@ impl AvatarCache {
         let handle = iced_image::Handle::from_rgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
         if let Ok(mut map) = self.handles.lock() {
             map.insert(*client_uuid, handle.clone());
+        }
+        handle
+    }
+
+    pub fn room_handle_for(&self, room_id: &RoomId) -> iced_image::Handle {
+        if let Ok(map) = self.room_handles.lock() {
+            if let Some(existing) = map.get(room_id) {
+                return existing.clone();
+            }
+        }
+        let rgba = generate_room_avatar_rgba(room_id);
+        let handle = iced_image::Handle::from_rgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
+        if let Ok(mut map) = self.room_handles.lock() {
+            map.insert(*room_id, handle.clone());
         }
         handle
     }
@@ -288,6 +313,10 @@ impl AvatarCache {
 
     pub fn clear_memory_cache(&self) {
         if let Ok(mut map) = self.handles.lock() {
+            map.clear();
+            map.shrink_to_fit();
+        }
+        if let Ok(mut map) = self.room_handles.lock() {
             map.clear();
             map.shrink_to_fit();
         }
@@ -388,5 +417,22 @@ mod tests {
         let decoded_rgba = decode_avatar_jpeg_to_circular_rgba(&jpeg).unwrap();
         assert_eq!(decoded_rgba.len(), (AVATAR_SIZE * AVATAR_SIZE * 4) as usize);
         assert_eq!(decoded_rgba[3], 0);
+    }
+
+    #[test]
+    fn test_generate_room_avatar_rgba_deterministic_and_circular_mask() {
+        let room_a: RoomId = [0x42; 16];
+        let room_b: RoomId = [0x99; 16];
+
+        let rgba_a1 = generate_room_avatar_rgba(&room_a);
+        let rgba_a2 = generate_room_avatar_rgba(&room_a);
+        let rgba_b = generate_room_avatar_rgba(&room_b);
+
+        assert_eq!(rgba_a1.len(), (AVATAR_SIZE * AVATAR_SIZE * 4) as usize);
+        assert_eq!(rgba_a1, rgba_a2);
+        assert_ne!(rgba_a1, rgba_b);
+        assert_eq!(rgba_a1[3], 0);
+        let center_idx = (64 * AVATAR_SIZE as usize + 64) * 4;
+        assert_eq!(rgba_a1[center_idx + 3], 255);
     }
 }

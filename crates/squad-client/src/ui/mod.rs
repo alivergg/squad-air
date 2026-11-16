@@ -27,7 +27,10 @@ use crate::ui::theme::{
 use iced::{
     alignment::Vertical,
     clipboard, event, keyboard, time,
-    widget::{button, column, container, horizontal_space, image as iced_image, row, stack, text},
+    widget::{
+        button, column, container, horizontal_space, image as iced_image, row, stack, text,
+        text_editor,
+    },
     Background, Border, Color, ContentFit, Element, Length, Size, Subscription, Task, Theme,
 };
 use std::borrow::Cow;
@@ -62,6 +65,7 @@ pub enum ClipboardPayload {
     InlineImage { filename: String, bytes: Vec<u8> },
     TempFile(PathBuf),
     InviteUri(String),
+    PlainText(String),
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +108,8 @@ pub enum Message {
     },
     ClipboardProcessed(Option<ClipboardPayload>),
     CopyChatText(u64, String),
+    ChatEditorAction((ClientUuid, u64), text_editor::Action),
+    CopySelectedChatText,
     CopyImageToClipboard([u8; 16]),
     OpenImageLightbox([u8; 16]),
     CloseImageLightbox,
@@ -159,6 +165,8 @@ pub struct SquadApp {
     pub local_peer_id: PeerId,
     pub peers: Vec<PeerUiSnapshot>,
     pub chat_messages: Vec<ChatItemUi>,
+    pub chat_text_editors: HashMap<(ClientUuid, u64), text_editor::Content>,
+    pub active_chat_selection: Option<String>,
     pub image_handles: HashMap<[u8; 16], iced_image::Handle>,
     pub inline_image_bytes: HashMap<[u8; 16], (String, Vec<u8>)>,
     pub copied_msg_id: Option<(u64, std::time::Instant)>,
@@ -252,6 +260,8 @@ impl SquadApp {
             local_peer_id: 0,
             peers: Vec::new(),
             chat_messages: Vec::new(),
+            chat_text_editors: HashMap::new(),
+            active_chat_selection: None,
             image_handles: HashMap::new(),
             inline_image_bytes: HashMap::new(),
             copied_msg_id: None,
@@ -310,6 +320,14 @@ impl SquadApp {
                 modifiers,
                 ..
             }) => {
+                let is_c = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("c"))
+                    || matches!(
+                        physical_key,
+                        keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
+                    );
+                if modifiers.command() && is_c && status != iced::event::Status::Captured {
+                    return Some(Message::CopySelectedChatText);
+                }
                 let is_v = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("v"))
                     || matches!(
                         physical_key,
@@ -397,6 +415,8 @@ impl SquadApp {
                             MeshEvent::LeftRoom => {
                                 self.peers.clear();
                                 self.chat_messages.clear();
+                                self.chat_text_editors.clear();
+                                self.active_chat_selection = None;
                                 self.image_handles.clear();
                                 self.inline_image_bytes.clear();
                                 self.copied_msg_id = None;
@@ -441,12 +461,21 @@ impl SquadApp {
                                         && existing.msg_id == item.msg_id
                                 });
                                 if !already {
+                                    if let ChatContentUi::Text(ref body_text) = item.content {
+                                        self.chat_text_editors.insert(
+                                            (item.sender_uuid, item.msg_id),
+                                            text_editor::Content::with_text(body_text),
+                                        );
+                                    }
                                     self.chat_messages.push(item);
                                     self.chat_messages
                                         .sort_by_key(|m| (m.timestamp_ms, m.msg_id));
                                     if self.chat_messages.len() > 30 {
                                         let drop_n = self.chat_messages.len() - 30;
-                                        self.chat_messages.drain(0..drop_n);
+                                        for dropped in self.chat_messages.drain(0..drop_n) {
+                                            self.chat_text_editors
+                                                .remove(&(dropped.sender_uuid, dropped.msg_id));
+                                        }
                                     }
                                 }
                             }
@@ -576,6 +605,8 @@ impl SquadApp {
                 let _ = self.mesh_tx.try_send(MeshCommand::LeaveRoom);
                 self.peers.clear();
                 self.chat_messages.clear();
+                self.chat_text_editors.clear();
+                self.active_chat_selection = None;
                 self.image_handles.clear();
                 self.inline_image_bytes.clear();
                 self.copied_msg_id = None;
@@ -824,6 +855,14 @@ impl SquadApp {
                             self.invite_input = uri;
                         }
                     }
+                    ClipboardPayload::PlainText(txt) => {
+                        let single_line = txt.replace(['\r', '\n'], " ");
+                        if self.screen == Screen::Lobby {
+                            self.invite_input.push_str(single_line.trim());
+                        } else if self.screen == Screen::Room {
+                            self.chat_input.push_str(&single_line);
+                        }
+                    }
                 }
                 Task::none()
             }
@@ -831,6 +870,25 @@ impl SquadApp {
             Message::CopyChatText(msg_id, text) => {
                 self.copied_msg_id = Some((msg_id, std::time::Instant::now()));
                 clipboard::write(text)
+            }
+            Message::ChatEditorAction(key, action) => {
+                if !action.is_edit() {
+                    let is_scroll = matches!(action, text_editor::Action::Scroll { .. });
+                    if let Some(editor) = self.chat_text_editors.get_mut(&key) {
+                        editor.perform(action);
+                        if !is_scroll {
+                            self.active_chat_selection = editor.selection();
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::CopySelectedChatText => {
+                if let Some(sel) = self.active_chat_selection.clone().filter(|s| !s.is_empty()) {
+                    clipboard::write(sel)
+                } else {
+                    Task::none()
+                }
             }
             Message::CopyImageToClipboard(blob_id) => {
                 if let Some((_, raw)) = self.inline_image_bytes.get(&blob_id).cloned() {
@@ -1224,6 +1282,8 @@ impl SquadApp {
 
     fn join_with_invite(&mut self, invite: InviteLink) {
         self.chat_messages.clear();
+        self.chat_text_editors.clear();
+        self.active_chat_selection = None;
         self.image_handles.clear();
         self.inline_image_bytes.clear();
         self.copied_msg_id = None;
@@ -1312,11 +1372,13 @@ fn read_clipboard_payload(
     let mut cb = arboard::Clipboard::new().ok()?;
 
     if screen == Screen::Lobby {
-        if !text_input_focused && invite_empty {
+        if !text_input_focused {
             if let Ok(txt) = cb.get_text() {
                 let trimmed = txt.trim();
-                if trimmed.starts_with("squad://") {
+                if invite_empty && trimmed.starts_with("squad://") {
                     return Some(ClipboardPayload::InviteUri(trimmed.to_string()));
+                } else if !trimmed.is_empty() {
+                    return Some(ClipboardPayload::PlainText(txt));
                 }
             }
         }
@@ -1327,8 +1389,18 @@ fn read_clipboard_payload(
         return None;
     }
 
-    let Ok(img_data) = cb.get_image() else {
-        return None;
+    let img_data = match cb.get_image() {
+        Ok(img) => img,
+        Err(_) => {
+            if !text_input_focused {
+                if let Ok(txt) = cb.get_text() {
+                    if !txt.is_empty() {
+                        return Some(ClipboardPayload::PlainText(txt));
+                    }
+                }
+            }
+            return None;
+        }
     };
     let rgba = image::RgbaImage::from_raw(
         img_data.width as u32,

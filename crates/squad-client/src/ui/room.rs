@@ -41,20 +41,29 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
         .map(|c| c.name.as_str())
         .unwrap_or("Voice Room");
 
+    let mut left_header = row![].spacing(10).align_y(Vertical::Center);
+    if let Ok(invite) = squad_proto::InviteLink::parse(&app.active_invite_uri) {
+        left_header = left_header.push(avatar_circle(
+            app.avatars.room_handle_for(&invite.room_id),
+            40.0,
+            false,
+        ));
+    }
+    left_header = left_header
+        .push(text(room_title).size(18).color(M3_PRIMARY))
+        .push(
+            container(
+                text(format!("{total_members} Online"))
+                    .size(12)
+                    .color(M3_SUCCESS),
+            )
+            .padding([4, 10])
+            .style(canvas_panel_style),
+        );
+
     let header = container(
         row![
-            row![
-                text(room_title).size(18).color(M3_PRIMARY),
-                container(
-                    text(format!("{total_members} Online"))
-                        .size(12)
-                        .color(M3_SUCCESS)
-                )
-                .padding([4, 10])
-                .style(canvas_panel_style),
-            ]
-            .spacing(10)
-            .align_y(Vertical::Center),
+            left_header,
             horizontal_space(),
             text_input("Room name...", &app.save_channel_name_input)
                 .on_input(Message::SaveChannelNameChanged)

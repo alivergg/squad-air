@@ -4,14 +4,19 @@ use crate::ui::{
     theme::{
         attachment_card_style, canvas_panel_style, chat_bubble_style, m3_text_input_style,
         pill_danger_button, pill_primary_button, pill_success_button, pill_tonal_button,
-        M3_ERROR, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_SURFACE_HIGHEST,
+        M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+        M3_SURFACE_HIGHEST,
     },
     Message, SquadApp,
 };
 use iced::{
     alignment::Vertical,
-    widget::{button, column, container, horizontal_space, image, row, scrollable, text, text_input},
-    Background, Border, ContentFit, Element, Length, Theme,
+    keyboard,
+    widget::{
+        button, column, container, horizontal_space, image, row, scrollable, text, text_editor,
+        text_input,
+    },
+    Background, Border, Color, ContentFit, Element, Length, Theme,
 };
 
 pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
@@ -128,7 +133,21 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
     );
 
     let body: Element<'a, Message> = match &item.content {
-        ChatContentUi::Text(body_text) => text(body_text).size(13).into(),
+        ChatContentUi::Text(body_text) => {
+            let key = (item.sender_uuid, item.msg_id);
+            if let Some(content) = app.chat_text_editors.get(&key) {
+                text_editor(content)
+                    .on_action(move |action| Message::ChatEditorAction(key, action))
+                    .key_binding(read_only_chat_key_binding)
+                    .padding(0)
+                    .size(13)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                    .style(chat_text_editor_style)
+                    .into()
+            } else {
+                text(body_text).size(13).into()
+            }
+        }
         ChatContentUi::InlineImage {
             blob_id,
             filename,
@@ -279,6 +298,50 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
         .padding([10, 12])
         .style(chat_bubble_style(item.is_self))
         .into()
+}
+
+fn read_only_chat_key_binding(
+    kp: text_editor::KeyPress,
+) -> Option<text_editor::Binding<Message>> {
+    if kp.status != text_editor::Status::Focused {
+        return None;
+    }
+    if kp.modifiers.command() {
+        return match kp.key.as_ref() {
+            keyboard::Key::Character("c" | "C" | "с" | "С") => Some(text_editor::Binding::Copy),
+            keyboard::Key::Character("a" | "A" | "ф" | "Ф") => {
+                Some(text_editor::Binding::SelectAll)
+            }
+            _ => None,
+        };
+    }
+    match text_editor::Binding::from_key_press(kp)? {
+        text_editor::Binding::Paste
+        | text_editor::Binding::Cut
+        | text_editor::Binding::Insert(_)
+        | text_editor::Binding::Enter
+        | text_editor::Binding::Backspace
+        | text_editor::Binding::Delete => None,
+        other => Some(other),
+    }
+}
+
+fn chat_text_editor_style(_theme: &Theme, _status: text_editor::Status) -> text_editor::Style {
+    text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: 0.0.into(),
+        },
+        icon: Color::TRANSPARENT,
+        placeholder: Color::TRANSPARENT,
+        value: M3_ON_SURFACE,
+        selection: Color {
+            a: 0.38,
+            ..M3_PRIMARY
+        },
+    }
 }
 
 fn progress_bar<'a>(pct: u32) -> Element<'a, Message> {
