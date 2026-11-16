@@ -29,3 +29,4 @@ blake3.workspace = true
 arboard.workspace = true
 image.workspace = true
 rfd.workspace = true
+squad-video = { path = "../squad-video" }

@@ -62,6 +62,7 @@ pub struct AudioEngineConfig {
     pub ns_mode: NoiseSuppressionMode,
     pub activation_mode: MicActivationMode,
     pub input_gain: f32,
+    pub vad_threshold_db: f32,
     pub bitrate_bps: i32,
 }
 
@@ -74,6 +75,7 @@ impl Default for AudioEngineConfig {
             ns_mode: NoiseSuppressionMode::Rnnoise,
             activation_mode: MicActivationMode::PushToMute,
             input_gain: 1.0,
+            vad_threshold_db: -45.0,
             bitrate_bps: 40_000,
         }
     }
@@ -110,6 +112,7 @@ struct SharedAtomics {
     hotkey_active: AtomicBool,
     activation_mode: AtomicU8,
     input_gain_bits: AtomicU32,
+    vad_threshold_db_bits: AtomicU32,
     mic_level_db_bits: AtomicU32,
     local_speaking: AtomicBool,
     df3_available: AtomicBool,
@@ -140,7 +143,10 @@ impl AudioEngineHandle {
             hotkey_active: AtomicBool::new(false),
             activation_mode: AtomicU8::new(config.activation_mode as u8),
             input_gain_bits: AtomicU32::new(config.input_gain.to_bits()),
-            mic_level_db_bits: AtomicU32::new((-90.0f32).to_bits()),
+            vad_threshold_db_bits: AtomicU32::new(
+                config.vad_threshold_db.clamp(-60.0, 0.0).to_bits(),
+            ),
+            mic_level_db_bits: AtomicU32::new((-60.0f32).to_bits()),
             local_speaking: AtomicBool::new(false),
             df3_available: AtomicBool::new(df3_avail),
         });
@@ -235,6 +241,16 @@ impl AudioEngineHandle {
             .store(gain.clamp(0.0, 2.5).to_bits(), Ordering::Relaxed);
     }
 
+    pub fn set_vad_threshold_db(&self, threshold_db: f32) {
+        self.atomics
+            .vad_threshold_db_bits
+            .store(threshold_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn vad_threshold_db(&self) -> f32 {
+        f32::from_bits(self.atomics.vad_threshold_db_bits.load(Ordering::Relaxed))
+    }
+
     pub fn local_mic_level_db(&self) -> f32 {
         f32::from_bits(self.atomics.mic_level_db_bits.load(Ordering::Relaxed))
     }
@@ -280,6 +296,61 @@ struct AudioStreams {
     play_resampler: PlaybackResampler,
 }
 
+fn pick_48k_f32_channels<I>(ranges: I, preferred_channels: Option<u16>) -> Option<usize>
+where
+    I: Iterator<Item = cpal::SupportedStreamConfigRange>,
+{
+    let target_rate = cpal::SampleRate(SAMPLE_RATE);
+    let mut fallback = None;
+    for r in ranges {
+        if r.sample_format() == cpal::SampleFormat::F32
+            && r.min_sample_rate() <= target_rate
+            && r.max_sample_rate() >= target_rate
+        {
+            if preferred_channels == Some(r.channels()) {
+                return Some(r.channels() as usize);
+            }
+            if fallback.is_none() {
+                fallback = Some(r.channels() as usize);
+            }
+        }
+    }
+    fallback
+}
+
+fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
+    let default_cfg = if is_input {
+        dev.default_input_config().ok()
+    } else {
+        dev.default_output_config().ok()
+    };
+
+    if let Some(ref cfg) = default_cfg {
+        if cfg.sample_rate().0 == SAMPLE_RATE && cfg.sample_format() == cpal::SampleFormat::F32 {
+            return (SAMPLE_RATE, cfg.channels() as usize);
+        }
+    }
+
+    let preferred_channels = default_cfg.as_ref().map(|c| c.channels());
+    let f32_48k_channels = if is_input {
+        dev.supported_input_configs()
+            .ok()
+            .and_then(|iter| pick_48k_f32_channels(iter, preferred_channels))
+    } else {
+        dev.supported_output_configs()
+            .ok()
+            .and_then(|iter| pick_48k_f32_channels(iter, preferred_channels))
+    };
+
+    if let Some(ch) = f32_48k_channels {
+        return (SAMPLE_RATE, ch);
+    }
+
+    default_cfg
+        .map(|c| (c.sample_rate().0, c.channels() as usize))
+        .unwrap_or((SAMPLE_RATE, if is_input { 1 } else { 2 }))
+}
+
 fn build_audio_streams(
     host: &cpal::Host,
     input_device_name: Option<&str>,
@@ -290,21 +361,23 @@ fn build_audio_streams(
 
     let (in_rate, in_channels) = in_device
         .as_ref()
-        .and_then(|d| d.default_input_config().ok())
-        .map(|c| (c.sample_rate().0, c.channels() as usize))
+        .map(|d| negotiate_device_format(d, true))
         .unwrap_or((SAMPLE_RATE, 1));
 
     let (out_rate, out_channels) = out_device
         .as_ref()
-        .and_then(|d| d.default_output_config().ok())
-        .map(|c| (c.sample_rate().0, c.channels() as usize))
+        .map(|d| negotiate_device_format(d, false))
         .unwrap_or((SAMPLE_RATE, 2));
 
     let capture_rb = HeapRb::<f32>::new((in_rate as usize) / 2);
     let (mut cap_prod, cap_cons) = capture_rb.split();
 
     let playback_rb = HeapRb::<f32>::new((out_rate as usize) / 2);
-    let (play_prod, mut play_cons) = playback_rb.split();
+    let (mut play_prod, mut play_cons) = playback_rb.split();
+
+    let prefill_samples = (out_rate as usize / 100) * 3;
+    let silence_prefill = vec![0.0f32; prefill_samples];
+    let _ = play_prod.push_slice(&silence_prefill);
 
     let _input_stream = in_device.and_then(|dev| {
         let stream_cfg = cpal::StreamConfig {
@@ -404,8 +477,12 @@ fn run_audio_worker(
     let mut frame_48k = [0.0f32; FRAME_SAMPLES];
     let mut mixed_48k = [0.0f32; FRAME_SAMPLES];
     let mut resampled_out = Vec::with_capacity(1024);
+    let mut underrun_cushion = Vec::with_capacity(2048);
 
     let mut seq_num: u64 = 1;
+    let mut dtx_seq_num: u64 = 1;
+    let mut voice_hold_frames: u8 = 0;
+    let mut smoothed_db: f32 = -60.0;
     let mut last_dtx_keepalive = Instant::now();
     let mut next_tick = Instant::now();
     let tick_duration = Duration::from_millis(10);
@@ -453,7 +530,20 @@ fn run_audio_worker(
         active
             .play_resampler
             .process_frame(&mixed_48k, &mut resampled_out);
-        let _ = active.play_prod.push_slice(&resampled_out);
+        if active.play_prod.occupied_len() == 0 && !resampled_out.is_empty() {
+            underrun_cushion.clear();
+            underrun_cushion.resize(resampled_out.len() * 2, 0.0);
+            let _ = active.play_prod.push_slice(&underrun_cushion);
+        }
+        if active.play_prod.occupied_len() <= resampled_out.len() * 8 {
+            let _ = active.play_prod.push_slice(&resampled_out);
+        } else {
+            let frame_energy: f32 =
+                mixed_48k.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32);
+            if frame_energy > 1e-6 {
+                let _ = active.play_prod.push_slice(&resampled_out);
+            }
+        }
 
         for (peer_id, snap) in mixer.peer_snapshots() {
             peer_stats.insert(
@@ -483,15 +573,20 @@ fn run_audio_worker(
             aec.process_capture_frame(&mut frame_48k);
             suppressor.process_frame(&mut frame_48k);
 
-            // Вычисляем уровень сигнала микрофона в dBFS
+            // Вычисляем уровень сигнала микрофона в dBFS со сглаживанием для UI и Voice Gate
             let rms =
                 (frame_48k.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
-            let db = 20.0 * rms.max(1e-5).log10();
+            let raw_db = (20.0 * rms.max(1e-5).log10()).clamp(-60.0, 0.0);
+            if raw_db > smoothed_db {
+                smoothed_db = raw_db;
+            } else {
+                smoothed_db = smoothed_db * 0.82 + raw_db * 0.18;
+            }
             atomics
                 .mic_level_db_bits
-                .store(db.to_bits(), Ordering::Relaxed);
+                .store(smoothed_db.to_bits(), Ordering::Relaxed);
 
-            // Проверяем гейт микрофона (ToggleMute / PushToTalk / PushToMute)
+            // Проверяем гейт микрофона (ToggleMute / PushToTalk / PushToMute) + Voice Sensitivity с удержанием
             let muted = atomics.mic_muted.load(Ordering::Relaxed);
             let hotkey_held = atomics.hotkey_active.load(Ordering::Relaxed);
             let mode = MicActivationMode::from_u8(atomics.activation_mode.load(Ordering::Relaxed));
@@ -504,14 +599,26 @@ fn run_audio_worker(
                     MicActivationMode::PushToMute => !hotkey_held,
                 };
 
-            let is_speaking_now = gate_open && db > -45.0;
+            let vad_threshold_db =
+                f32::from_bits(atomics.vad_threshold_db_bits.load(Ordering::Relaxed));
+            if !muted && !deafened {
+                if raw_db >= vad_threshold_db || smoothed_db >= vad_threshold_db {
+                    voice_hold_frames = 25;
+                } else {
+                    voice_hold_frames = voice_hold_frames.saturating_sub(1);
+                }
+            } else {
+                voice_hold_frames = 0;
+            }
+
+            let is_speaking_now = gate_open && voice_hold_frames > 0;
             atomics
                 .local_speaking
                 .store(is_speaking_now, Ordering::Relaxed);
 
-            if gate_open {
-                match encoder.encode_frame(&frame_48k) {
-                    Ok(Some(opus_vec)) => {
+            if is_speaking_now {
+                match encoder.encode_speech_frame(&frame_48k) {
+                    Ok(opus_vec) => {
                         let current_seq = seq_num;
                         seq_num = seq_num.wrapping_add(1);
                         let _ = outbound_tx.try_send(OutboundAudioFrame::Opus {
@@ -520,24 +627,13 @@ fn run_audio_worker(
                         });
                         last_dtx_keepalive = Instant::now();
                     }
-                    Ok(None) => {
-                        // DTX: в тишине шлем только пустой keepalive раз в 500 мс для удержания NAT
-                        if last_dtx_keepalive.elapsed() >= Duration::from_millis(500) {
-                            let current_seq = seq_num;
-                            seq_num = seq_num.wrapping_add(1);
-                            let _ = outbound_tx.try_send(OutboundAudioFrame::DtxKeepalive {
-                                seq_num: current_seq,
-                            });
-                            last_dtx_keepalive = Instant::now();
-                        }
-                    }
                     Err(e) => warn!("Opus encode error: {e}"),
                 }
             } else if last_dtx_keepalive.elapsed() >= Duration::from_millis(500) {
-                let current_seq = seq_num;
-                seq_num = seq_num.wrapping_add(1);
+                let current_dtx_seq = dtx_seq_num;
+                dtx_seq_num = dtx_seq_num.wrapping_add(1);
                 let _ = outbound_tx.try_send(OutboundAudioFrame::DtxKeepalive {
-                    seq_num: current_seq,
+                    seq_num: current_dtx_seq,
                 });
                 last_dtx_keepalive = Instant::now();
             }
@@ -548,7 +644,7 @@ fn run_audio_worker(
         let now = Instant::now();
         if next_tick > now {
             thread::sleep(next_tick - now);
-        } else {
+        } else if now.duration_since(next_tick) > Duration::from_millis(50) {
             next_tick = now;
         }
     }

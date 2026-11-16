@@ -4,6 +4,7 @@ members = [
     "crates/squad-proto",
     "crates/squad-rendezvous",
     "crates/squad-dsp",
+    "crates/squad-video",
     "crates/squad-client",
 ]
 

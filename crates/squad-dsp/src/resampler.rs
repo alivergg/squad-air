@@ -16,7 +16,7 @@ pub struct CaptureResampler {
 impl CaptureResampler {
     pub fn new(in_rate: u32) -> Self {
         let resampler = if in_rate != SAMPLE_RATE {
-            FftFixedOut::<f32>::new(in_rate as usize, SAMPLE_RATE as usize, FRAME_SAMPLES, 2, 1)
+            FftFixedOut::<f32>::new(in_rate as usize, SAMPLE_RATE as usize, FRAME_SAMPLES, 1, 1)
                 .ok()
         } else {
             None
@@ -93,7 +93,7 @@ pub struct PlaybackResampler {
 impl PlaybackResampler {
     pub fn new(out_rate: u32) -> Self {
         let resampler = if out_rate != SAMPLE_RATE {
-            FftFixedIn::<f32>::new(SAMPLE_RATE as usize, out_rate as usize, FRAME_SAMPLES, 2, 1)
+            FftFixedIn::<f32>::new(SAMPLE_RATE as usize, out_rate as usize, FRAME_SAMPLES, 1, 1)
                 .ok()
         } else {
             None

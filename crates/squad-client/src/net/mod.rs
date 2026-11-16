@@ -3,6 +3,7 @@ pub mod nat;
 pub mod transfer;
 
 pub use mesh::{
-    spawn_mesh_worker, MeshCommand, MeshEvent, PeerConnStatus, PeerUiSnapshot,
+    spawn_mesh_worker, DecodedVideoFrame, MeshCommand, MeshEvent, PeerConnStatus, PeerUiSnapshot,
+    RemoteStreamInfo,
 };
 pub use transfer::{downloads_root_dir, BlobTransferState, ChatContentUi, ChatItemUi};

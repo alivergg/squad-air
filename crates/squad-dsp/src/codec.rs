@@ -53,6 +53,14 @@ impl OpusEncoder10ms {
         }
         Ok(Some(self.scratch_out[..encoded_len].to_vec()))
     }
+
+    pub fn encode_speech_frame(
+        &mut self,
+        pcm_480: &[f32; FRAME_SAMPLES],
+    ) -> Result<Vec<u8>, OpusCodecError> {
+        let encoded_len = self.encoder.encode_float(pcm_480, &mut self.scratch_out)?;
+        Ok(self.scratch_out[..encoded_len].to_vec())
+    }
 }
 
 pub struct OpusDecoder10ms {

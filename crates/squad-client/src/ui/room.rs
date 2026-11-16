@@ -1,7 +1,7 @@
 use crate::ui::{
     chat::view_chat,
     components::{avatar_circle, mic_level_meter, telemetry_badge},
-    stream_view::view_stream_stage,
+    stream_view::{view_stream_fullscreen, view_stream_stage},
     theme::{
         canvas_panel_style, floating_dock_style, m3_slider_style, m3_text_input_style,
         peer_card_style, pill_chip_button, pill_danger_button, pill_primary_button,
@@ -20,6 +20,10 @@ use iced::{
 use squad_dsp::MicActivationMode;
 
 pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
+    if app.stream_fullscreen && app.watched_peer_id.is_some() {
+        return view_stream_fullscreen(app);
+    }
+
     let total_members = app.peers.len() + 1;
     let copy_label = if app.invite_copied_flash {
         "Copied Invite!"

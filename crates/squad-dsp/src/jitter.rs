@@ -2,8 +2,8 @@ use crate::codec::OpusDecoder10ms;
 use crate::FRAME_SAMPLES;
 use std::collections::BTreeMap;
 
-const TARGET_BUFFER_FRAMES: usize = 2; // 20 ms
-const MAX_BUFFER_FRAMES: usize = 5; // 50 ms
+const TARGET_BUFFER_FRAMES: usize = 3; // 30 ms (leaves 20 ms steady jitter cushion)
+const MAX_BUFFER_FRAMES: usize = 10; // 100 ms max burst tolerance
 const MAX_PLC_CONSECUTIVE: u32 = 3; // 30 ms max PLC before fade-out
 const SPEAKING_RMS_THRESHOLD: f32 = 0.0055; // ~ -45 dBFS
 
@@ -93,9 +93,8 @@ impl JitterBuffer {
             }
         };
 
-        self.next_expected_seq = Some(seq + 1);
-
         if let Some(opus_bytes) = self.packets.remove(&seq) {
+            self.next_expected_seq = Some(seq + 1);
             self.consecutive_missing = 0;
             self.received_window += 1;
             self.update_loss_stats();
@@ -108,8 +107,8 @@ impl JitterBuffer {
             true
         } else {
             self.consecutive_missing += 1;
-            if self.consecutive_missing <= MAX_PLC_CONSECUTIVE && !self.packets.is_empty() {
-                // Реальная потеря пакета в потоке: пробуем In-Band FEC со следующего пакета или PLC
+            if !self.packets.is_empty() {
+                self.next_expected_seq = Some(seq + 1);
                 self.lost_window += 1;
                 self.update_loss_stats();
                 let next_pkt = self.packets.get(&(seq + 1)).map(|v| v.as_slice());
@@ -119,8 +118,15 @@ impl JitterBuffer {
                 }
                 self.update_speaking_flag(out_pcm);
                 true
+            } else if self.consecutive_missing <= MAX_PLC_CONSECUTIVE {
+                self.next_expected_seq = Some(seq);
+                if self.decoder.decode_missing(None, out_pcm).is_err() {
+                    out_pcm.fill(0.0);
+                    return false;
+                }
+                self.update_speaking_flag(out_pcm);
+                true
             } else {
-                // Собеседник просто замолчал (DTX пауза)
                 self.primed = false;
                 self.next_expected_seq = None;
                 out_pcm.fill(0.0);
@@ -162,5 +168,47 @@ impl JitterBuffer {
 impl Default for JitterBuffer {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::codec::OpusEncoder10ms;
+
+    #[test]
+    fn test_jitter_buffer_late_packet_and_short_pause_no_drop() {
+        let mut encoder = OpusEncoder10ms::new(40_000).unwrap();
+        let mut pcm = [0.0f32; FRAME_SAMPLES];
+        for (i, sample) in pcm.iter_mut().enumerate() {
+            let t = i as f32 / 48_000.0;
+            *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+        }
+
+        let mut packets = Vec::new();
+        for _ in 0..6 {
+            packets.push(encoder.encode_speech_frame(&pcm).unwrap());
+        }
+
+        let mut jb = JitterBuffer::new();
+        jb.push_packet(1, packets[0].clone());
+        jb.push_packet(2, packets[1].clone());
+        jb.push_packet(3, packets[2].clone());
+
+        let mut out = [0.0f32; FRAME_SAMPLES];
+        assert!(jb.pop_pcm_frame(&mut out));
+        assert!(jb.pop_pcm_frame(&mut out));
+        assert!(jb.pop_pcm_frame(&mut out));
+
+        // Buffer is now empty and expects seq 4; one empty tick triggers PLC without skipping seq 4.
+        assert!(jb.pop_pcm_frame(&mut out));
+        assert_eq!(jb.next_expected_seq, Some(4));
+
+        // Delayed seq 4 arrives and must be accepted rather than dropped as stale.
+        jb.push_packet(4, packets[3].clone());
+        assert!(jb.pop_pcm_frame(&mut out));
+        assert_eq!(jb.next_expected_seq, Some(5));
+        let rms = (out.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
+        assert!(rms > 0.05, "Expected decoded audio for late seq 4, got rms={rms}");
     }
 }

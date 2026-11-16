@@ -130,6 +130,8 @@ pub enum Message {
     WatchPeerStream(PeerId),
     StopWatchingStream,
     ToggleStreamExpanded,
+    ToggleStreamFullscreen,
+    ExitStreamFullscreen,
     PickAvatarImage,
     AvatarImagePicked(Option<PathBuf>),
     ResetAvatarIdenticon,
@@ -174,6 +176,7 @@ pub struct SquadApp {
     pub watched_peer_id: Option<PeerId>,
     pub active_stream_frame: Option<iced_image::Handle>,
     pub stream_expanded: bool,
+    pub stream_fullscreen: bool,
 }
 
 impl SquadApp {
@@ -255,13 +258,14 @@ impl SquadApp {
             selected_capture_target_idx: 0,
             share_resolution: StreamResolution::R1080p,
             share_fps: StreamFps::Fps60,
-            share_bitrate_bps: 6_000_000,
+            share_bitrate_bps: 8_000_000,
             local_encoder_backend: detect_hardware_encoder_backend(),
             is_local_sharing: false,
             local_stream_subscribers: 0,
             watched_peer_id: None,
             active_stream_frame: None,
             stream_expanded: false,
+            stream_fullscreen: false,
         };
 
         (app, Task::none())
@@ -300,6 +304,19 @@ impl SquadApp {
                     return Some(Message::PasteFromClipboard {
                         text_input_focused: status == iced::event::Status::Captured,
                     });
+                }
+                let is_f = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("f"))
+                    || matches!(
+                        physical_key,
+                        keyboard::key::Physical::Code(keyboard::key::Code::KeyF)
+                    );
+                if status != iced::event::Status::Captured
+                    && !modifiers.command()
+                    && !modifiers.control()
+                    && !modifiers.alt()
+                    && is_f
+                {
+                    return Some(Message::ToggleStreamFullscreen);
                 }
                 if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
                     return Some(Message::EscapePressed);
@@ -360,6 +377,7 @@ impl SquadApp {
                                 self.watched_peer_id = None;
                                 self.active_stream_frame = None;
                                 self.stream_expanded = false;
+                                self.stream_fullscreen = false;
                                 if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                                     *slot = None;
                                 }
@@ -445,6 +463,10 @@ impl SquadApp {
                                     self.watched_peer_id = None;
                                     self.active_stream_frame = None;
                                     self.stream_expanded = false;
+                                    if self.stream_fullscreen {
+                                        self.stream_fullscreen = false;
+                                        return set_window_fullscreen_task(false);
+                                    }
                                 }
                             }
                             MeshEvent::LocalStreamStatus {
@@ -522,11 +544,17 @@ impl SquadApp {
                 self.watched_peer_id = None;
                 self.active_stream_frame = None;
                 self.stream_expanded = false;
+                let was_fs = self.stream_fullscreen;
+                self.stream_fullscreen = false;
                 if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                     *slot = None;
                 }
                 self.screen = Screen::Lobby;
-                Task::none()
+                if was_fs {
+                    set_window_fullscreen_task(false)
+                } else {
+                    Task::none()
+                }
             }
             Message::CopyInviteUri => {
                 self.invite_copied_flash = true;
@@ -811,6 +839,10 @@ impl SquadApp {
             Message::EscapePressed => {
                 self.lightbox_blob_id = None;
                 self.share_modal_open = false;
+                if self.stream_fullscreen {
+                    self.stream_fullscreen = false;
+                    return set_window_fullscreen_task(false);
+                }
                 Task::none()
             }
             Message::DownloadBlob(blob_id) => {
@@ -909,16 +941,36 @@ impl SquadApp {
                 self.watched_peer_id = None;
                 self.active_stream_frame = None;
                 self.stream_expanded = false;
+                let was_fs = self.stream_fullscreen;
+                self.stream_fullscreen = false;
                 if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                     *slot = None;
                 }
                 let _ = self
                     .mesh_tx
                     .try_send(MeshCommand::WatchPeerStream { peer_id: None });
-                Task::none()
+                if was_fs {
+                    set_window_fullscreen_task(false)
+                } else {
+                    Task::none()
+                }
             }
             Message::ToggleStreamExpanded => {
                 self.stream_expanded = !self.stream_expanded;
+                Task::none()
+            }
+            Message::ToggleStreamFullscreen => {
+                if self.screen == Screen::Room && self.watched_peer_id.is_some() {
+                    self.stream_fullscreen = !self.stream_fullscreen;
+                    return set_window_fullscreen_task(self.stream_fullscreen);
+                }
+                Task::none()
+            }
+            Message::ExitStreamFullscreen => {
+                if self.stream_fullscreen {
+                    self.stream_fullscreen = false;
+                    return set_window_fullscreen_task(false);
+                }
                 Task::none()
             }
             Message::PickAvatarImage => Task::perform(
@@ -1227,6 +1279,15 @@ fn open_in_file_manager(saved_path: Option<PathBuf>) {
         let _ = std::fs::create_dir_all(&dir);
         let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
     }
+}
+
+fn set_window_fullscreen_task(fullscreen: bool) -> Task<Message> {
+    let mode = if fullscreen {
+        iced::window::Mode::Fullscreen
+    } else {
+        iced::window::Mode::Windowed
+    };
+    iced::window::get_latest().and_then(move |id| iced::window::change_mode(id, mode))
 }
 
 fn hex_prefix(bytes: &[u8; 4]) -> String {
