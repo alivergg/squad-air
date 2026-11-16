@@ -12,6 +12,11 @@ pub const MAX_CHAT_TEXT_BYTES: usize = 900;
 pub const MAX_BLOB_FILENAME_BYTES: usize = 128;
 pub const BLOB_CHUNK_SIZE: usize = 1024;
 pub const INLINE_IMAGE_MAX_BYTES: usize = 200 * 1024;
+pub const MAX_STREAM_TITLE_BYTES: usize = 64;
+pub const MAX_ENCODER_BACKEND_BYTES: usize = 48;
+pub const MAX_VIDEO_FRAG_BYTES: usize = 1100;
+pub const VIDEO_FLAG_KEYFRAME: u8 = 0x01;
+pub const VIDEO_FLAG_XOR_FEC: u8 = 0x02;
 
 pub type RoomId = [u8; 16];
 pub type ClientUuid = [u8; 16];
@@ -362,6 +367,11 @@ pub enum P2pMsgType {
     BlobChunkReq = 0x41,
     BlobChunkData = 0x42,
     BlobHave = 0x43,
+    AvatarAnnounce = 0x44,
+    StreamAnnounce = 0x50,
+    StreamSubscribe = 0x51,
+    StreamPli = 0x52,
+    VideoFrameFrag = 0x53,
 }
 
 impl P2pMsgType {
@@ -380,6 +390,11 @@ impl P2pMsgType {
             0x41 => Ok(Self::BlobChunkReq),
             0x42 => Ok(Self::BlobChunkData),
             0x43 => Ok(Self::BlobHave),
+            0x44 => Ok(Self::AvatarAnnounce),
+            0x50 => Ok(Self::StreamAnnounce),
+            0x51 => Ok(Self::StreamSubscribe),
+            0x52 => Ok(Self::StreamPli),
+            0x53 => Ok(Self::VideoFrameFrag),
             other => Err(ProtoError::UnknownOpcode(other)),
         }
     }
@@ -455,6 +470,8 @@ pub enum P2pPayload {
     },
     AudioDtxKeepalive,
     ChatText {
+        sender_uuid: ClientUuid,
+        sender_nickname: String,
         msg_id: u64,
         timestamp_ms: u64,
         text: String,
@@ -464,6 +481,8 @@ pub enum P2pPayload {
     },
     HistorySyncReq,
     BlobOffer {
+        sender_uuid: ClientUuid,
+        sender_nickname: String,
         blob_id: [u8; 16],
         msg_id: u64,
         timestamp_ms: u64,
@@ -488,6 +507,30 @@ pub enum P2pPayload {
     BlobHave {
         blob_id: [u8; 16],
     },
+    AvatarAnnounce {
+        avatar_hash: [u8; 32],
+        total_size: u32,
+        total_chunks: u16,
+    },
+    StreamAnnounce {
+        is_streaming: bool,
+        width: u16,
+        height: u16,
+        fps: u8,
+        source_title: String,
+        encoder_backend: String,
+    },
+    StreamSubscribe {
+        subscribe: bool,
+    },
+    StreamPli,
+    VideoFrameFrag {
+        frame_id: u32,
+        frag_idx: u16,
+        frag_count: u16,
+        flags: u8,
+        data: Vec<u8>,
+    },
 }
 
 impl P2pPayload {
@@ -506,6 +549,11 @@ impl P2pPayload {
             P2pPayload::BlobChunkReq { .. } => P2pMsgType::BlobChunkReq,
             P2pPayload::BlobChunkData { .. } => P2pMsgType::BlobChunkData,
             P2pPayload::BlobHave { .. } => P2pMsgType::BlobHave,
+            P2pPayload::AvatarAnnounce { .. } => P2pMsgType::AvatarAnnounce,
+            P2pPayload::StreamAnnounce { .. } => P2pMsgType::StreamAnnounce,
+            P2pPayload::StreamSubscribe { .. } => P2pMsgType::StreamSubscribe,
+            P2pPayload::StreamPli => P2pMsgType::StreamPli,
+            P2pPayload::VideoFrameFrag { .. } => P2pMsgType::VideoFrameFrag,
         }
     }
 
@@ -540,11 +588,17 @@ impl P2pPayload {
             }
             P2pPayload::AudioDtxKeepalive => {}
             P2pPayload::ChatText {
+                sender_uuid,
+                sender_nickname,
                 msg_id,
                 timestamp_ms,
                 text,
             } => {
+                let nick_bytes = truncate_utf8(sender_nickname, MAX_NICKNAME_LEN);
                 let text_bytes = truncate_utf8(text, MAX_CHAT_TEXT_BYTES);
+                out.extend_from_slice(sender_uuid);
+                out.push(nick_bytes.len() as u8);
+                out.extend_from_slice(nick_bytes);
                 out.extend_from_slice(&msg_id.to_be_bytes());
                 out.extend_from_slice(&timestamp_ms.to_be_bytes());
                 out.extend_from_slice(&(text_bytes.len() as u16).to_be_bytes());
@@ -555,6 +609,8 @@ impl P2pPayload {
             }
             P2pPayload::HistorySyncReq => {}
             P2pPayload::BlobOffer {
+                sender_uuid,
+                sender_nickname,
                 blob_id,
                 msg_id,
                 timestamp_ms,
@@ -566,7 +622,11 @@ impl P2pPayload {
                 total_chunks,
                 blake3_root,
             } => {
+                let nick_bytes = truncate_utf8(sender_nickname, MAX_NICKNAME_LEN);
                 let name_bytes = truncate_utf8(filename, MAX_BLOB_FILENAME_BYTES);
+                out.extend_from_slice(sender_uuid);
+                out.push(nick_bytes.len() as u8);
+                out.extend_from_slice(nick_bytes);
                 out.extend_from_slice(blob_id);
                 out.extend_from_slice(&msg_id.to_be_bytes());
                 out.extend_from_slice(&timestamp_ms.to_be_bytes());
@@ -603,6 +663,55 @@ impl P2pPayload {
             }
             P2pPayload::BlobHave { blob_id } => {
                 out.extend_from_slice(blob_id);
+            }
+            P2pPayload::AvatarAnnounce {
+                avatar_hash,
+                total_size,
+                total_chunks,
+            } => {
+                out.extend_from_slice(avatar_hash);
+                out.extend_from_slice(&total_size.to_be_bytes());
+                out.extend_from_slice(&total_chunks.to_be_bytes());
+            }
+            P2pPayload::StreamAnnounce {
+                is_streaming,
+                width,
+                height,
+                fps,
+                source_title,
+                encoder_backend,
+            } => {
+                let title_bytes = truncate_utf8(source_title, MAX_STREAM_TITLE_BYTES);
+                let backend_bytes = truncate_utf8(encoder_backend, MAX_ENCODER_BACKEND_BYTES);
+                out.push(u8::from(*is_streaming));
+                out.extend_from_slice(&width.to_be_bytes());
+                out.extend_from_slice(&height.to_be_bytes());
+                out.push(*fps);
+                out.push(title_bytes.len() as u8);
+                out.extend_from_slice(title_bytes);
+                out.push(backend_bytes.len() as u8);
+                out.extend_from_slice(backend_bytes);
+            }
+            P2pPayload::StreamSubscribe { subscribe } => {
+                out.push(u8::from(*subscribe));
+            }
+            P2pPayload::StreamPli => {}
+            P2pPayload::VideoFrameFrag {
+                frame_id,
+                frag_idx,
+                frag_count,
+                flags,
+                data,
+            } => {
+                if data.len() > MAX_VIDEO_FRAG_BYTES {
+                    return Err(ProtoError::PacketTooLarge(data.len()));
+                }
+                out.extend_from_slice(&frame_id.to_be_bytes());
+                out.extend_from_slice(&frag_idx.to_be_bytes());
+                out.extend_from_slice(&frag_count.to_be_bytes());
+                out.push(*flags);
+                out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+                out.extend_from_slice(data);
             }
         }
         Ok(())
@@ -650,18 +759,21 @@ impl P2pPayload {
             }
             P2pMsgType::AudioDtxKeepalive => Ok(P2pPayload::AudioDtxKeepalive),
             P2pMsgType::ChatText => {
-                need_bytes(body, 0, 18)?;
-                let msg_id = u64::from_be_bytes(body[0..8].try_into().unwrap());
-                let timestamp_ms = u64::from_be_bytes(body[8..16].try_into().unwrap());
-                let len = u16::from_be_bytes([body[16], body[17]]) as usize;
+                let (sender_uuid, sender_nickname, off) = decode_sender_meta(body)?;
+                need_bytes(body, off, 18)?;
+                let msg_id = u64::from_be_bytes(body[off..off + 8].try_into().unwrap());
+                let timestamp_ms = u64::from_be_bytes(body[off + 8..off + 16].try_into().unwrap());
+                let len = u16::from_be_bytes([body[off + 16], body[off + 17]]) as usize;
                 if len > MAX_CHAT_TEXT_BYTES {
                     return Err(ProtoError::PacketTooLarge(len));
                 }
-                need_bytes(body, 18, len)?;
-                let text = std::str::from_utf8(&body[18..18 + len])
+                need_bytes(body, off + 18, len)?;
+                let text = std::str::from_utf8(&body[off + 18..off + 18 + len])
                     .map_err(|_| ProtoError::InvalidUtf8)?
                     .to_string();
                 Ok(P2pPayload::ChatText {
+                    sender_uuid,
+                    sender_nickname,
                     msg_id,
                     timestamp_ms,
                     text,
@@ -674,20 +786,21 @@ impl P2pPayload {
             }
             P2pMsgType::HistorySyncReq => Ok(P2pPayload::HistorySyncReq),
             P2pMsgType::BlobOffer => {
-                need_bytes(body, 0, 35)?;
+                let (sender_uuid, sender_nickname, off) = decode_sender_meta(body)?;
+                need_bytes(body, off, 35)?;
                 let mut blob_id = [0u8; 16];
-                blob_id.copy_from_slice(&body[0..16]);
-                let msg_id = u64::from_be_bytes(body[16..24].try_into().unwrap());
-                let timestamp_ms = u64::from_be_bytes(body[24..32].try_into().unwrap());
-                let kind = body[32];
-                let auto_download = body[33] != 0;
-                let name_len = body[34] as usize;
+                blob_id.copy_from_slice(&body[off..off + 16]);
+                let msg_id = u64::from_be_bytes(body[off + 16..off + 24].try_into().unwrap());
+                let timestamp_ms = u64::from_be_bytes(body[off + 24..off + 32].try_into().unwrap());
+                let kind = body[off + 32];
+                let auto_download = body[off + 33] != 0;
+                let name_len = body[off + 34] as usize;
                 if name_len > MAX_BLOB_FILENAME_BYTES {
                     return Err(ProtoError::PacketTooLarge(name_len));
                 }
-                need_bytes(body, 35, name_len + 46)?;
-                let name_end = 35 + name_len;
-                let filename = std::str::from_utf8(&body[35..name_end])
+                need_bytes(body, off + 35, name_len + 46)?;
+                let name_end = off + 35 + name_len;
+                let filename = std::str::from_utf8(&body[off + 35..name_end])
                     .map_err(|_| ProtoError::InvalidUtf8)?
                     .to_string();
                 let total_size = u64::from_be_bytes(body[name_end..name_end + 8].try_into().unwrap());
@@ -698,6 +811,8 @@ impl P2pPayload {
                 let mut blake3_root = [0u8; 32];
                 blake3_root.copy_from_slice(&body[name_end + 14..name_end + 46]);
                 Ok(P2pPayload::BlobOffer {
+                    sender_uuid,
+                    sender_nickname,
                     blob_id,
                     msg_id,
                     timestamp_ms,
@@ -744,6 +859,78 @@ impl P2pPayload {
                 blob_id.copy_from_slice(&body[0..16]);
                 Ok(P2pPayload::BlobHave { blob_id })
             }
+            P2pMsgType::AvatarAnnounce => {
+                need_bytes(body, 0, 38)?;
+                let mut avatar_hash = [0u8; 32];
+                avatar_hash.copy_from_slice(&body[0..32]);
+                let total_size = u32::from_be_bytes(body[32..36].try_into().unwrap());
+                let total_chunks = u16::from_be_bytes([body[36], body[37]]);
+                Ok(P2pPayload::AvatarAnnounce {
+                    avatar_hash,
+                    total_size,
+                    total_chunks,
+                })
+            }
+            P2pMsgType::StreamAnnounce => {
+                need_bytes(body, 0, 7)?;
+                let is_streaming = body[0] != 0;
+                let width = u16::from_be_bytes([body[1], body[2]]);
+                let height = u16::from_be_bytes([body[3], body[4]]);
+                let fps = body[5];
+                let title_len = body[6] as usize;
+                if title_len > MAX_STREAM_TITLE_BYTES {
+                    return Err(ProtoError::PacketTooLarge(title_len));
+                }
+                need_bytes(body, 7, title_len + 1)?;
+                let title_end = 7 + title_len;
+                let source_title = std::str::from_utf8(&body[7..title_end])
+                    .map_err(|_| ProtoError::InvalidUtf8)?
+                    .to_string();
+                let backend_len = body[title_end] as usize;
+                if backend_len > MAX_ENCODER_BACKEND_BYTES {
+                    return Err(ProtoError::PacketTooLarge(backend_len));
+                }
+                let backend_start = title_end + 1;
+                need_bytes(body, backend_start, backend_len)?;
+                let encoder_backend =
+                    std::str::from_utf8(&body[backend_start..backend_start + backend_len])
+                        .map_err(|_| ProtoError::InvalidUtf8)?
+                        .to_string();
+                Ok(P2pPayload::StreamAnnounce {
+                    is_streaming,
+                    width,
+                    height,
+                    fps,
+                    source_title,
+                    encoder_backend,
+                })
+            }
+            P2pMsgType::StreamSubscribe => {
+                need_bytes(body, 0, 1)?;
+                Ok(P2pPayload::StreamSubscribe {
+                    subscribe: body[0] != 0,
+                })
+            }
+            P2pMsgType::StreamPli => Ok(P2pPayload::StreamPli),
+            P2pMsgType::VideoFrameFrag => {
+                need_bytes(body, 0, 11)?;
+                let frame_id = u32::from_be_bytes(body[0..4].try_into().unwrap());
+                let frag_idx = u16::from_be_bytes(body[4..6].try_into().unwrap());
+                let frag_count = u16::from_be_bytes(body[6..8].try_into().unwrap());
+                let flags = body[8];
+                let data_len = u16::from_be_bytes([body[9], body[10]]) as usize;
+                if data_len > MAX_VIDEO_FRAG_BYTES {
+                    return Err(ProtoError::PacketTooLarge(data_len));
+                }
+                need_bytes(body, 11, data_len)?;
+                Ok(P2pPayload::VideoFrameFrag {
+                    frame_id,
+                    frag_idx,
+                    frag_count,
+                    flags,
+                    data: body[11..11 + data_len].to_vec(),
+                })
+            }
         }
     }
 }
@@ -758,6 +945,21 @@ fn need_bytes(buf: &[u8], offset: usize, count: usize) -> Result<(), ProtoError>
     } else {
         Ok(())
     }
+}
+
+fn decode_sender_meta(body: &[u8]) -> Result<(ClientUuid, String, usize), ProtoError> {
+    need_bytes(body, 0, 17)?;
+    let mut sender_uuid = [0u8; 16];
+    sender_uuid.copy_from_slice(&body[0..16]);
+    let nick_len = body[16] as usize;
+    if nick_len > MAX_NICKNAME_LEN {
+        return Err(ProtoError::InvalidHeader);
+    }
+    need_bytes(body, 17, nick_len)?;
+    let sender_nickname = std::str::from_utf8(&body[17..17 + nick_len])
+        .map_err(|_| ProtoError::InvalidUtf8)?
+        .to_string();
+    Ok((sender_uuid, sender_nickname, 17 + nick_len))
 }
 
 fn truncate_utf8(s: &str, max_bytes: usize) -> &[u8] {
@@ -808,9 +1010,13 @@ mod tests {
 
         let cipher = RoomCipher::from_secret(&[0x42; 32]);
         let room_prefix = [0xAA, 0xBB, 0xCC, 0xDD];
+        let author_uuid: ClientUuid = [0x33; 16];
+        let author_nick = "SwiftFalconVeryLongNicknameExceeding32Bytes".to_string();
 
         let long_text = "Привет мир! ".repeat(120);
         let chat_text = P2pPayload::ChatText {
+            sender_uuid: author_uuid,
+            sender_nickname: author_nick.clone(),
             msg_id: 9001,
             timestamp_ms: 1_700_000_001_234,
             text: long_text.clone(),
@@ -825,6 +1031,8 @@ mod tests {
             (
                 3,
                 P2pPayload::BlobOffer {
+                    sender_uuid: author_uuid,
+                    sender_nickname: author_nick.clone(),
                     blob_id: [0x11; 16],
                     msg_id: 9002,
                     timestamp_ms: 1_700_000_002_000,
@@ -854,6 +1062,22 @@ mod tests {
                 },
             ),
             (6, P2pPayload::BlobHave { blob_id: [0x11; 16] }),
+            (
+                7,
+                P2pPayload::AvatarAnnounce {
+                    avatar_hash: [0x7E; 32],
+                    total_size: 8_420,
+                    total_chunks: 9,
+                },
+            ),
+            (
+                8,
+                P2pPayload::AvatarAnnounce {
+                    avatar_hash: [0u8; 32],
+                    total_size: 0,
+                    total_chunks: 0,
+                },
+            ),
         ];
         packets.insert(0, (0, chat_text));
 
@@ -864,18 +1088,44 @@ mod tests {
 
             match (&payload, &decoded_body) {
                 (
-                    P2pPayload::ChatText { msg_id, timestamp_ms, .. },
-                    P2pPayload::ChatText { msg_id: d_id, timestamp_ms: d_ts, text: d_text },
+                    P2pPayload::ChatText {
+                        sender_uuid,
+                        msg_id,
+                        timestamp_ms,
+                        ..
+                    },
+                    P2pPayload::ChatText {
+                        sender_uuid: d_uuid,
+                        sender_nickname: d_nick,
+                        msg_id: d_id,
+                        timestamp_ms: d_ts,
+                        text: d_text,
+                    },
                 ) => {
+                    assert_eq!(sender_uuid, d_uuid);
+                    assert!(d_nick.len() <= MAX_NICKNAME_LEN);
+                    assert!(author_nick.starts_with(d_nick));
                     assert_eq!(msg_id, d_id);
                     assert_eq!(timestamp_ms, d_ts);
                     assert!(d_text.len() <= MAX_CHAT_TEXT_BYTES);
                     assert!(long_text.starts_with(d_text));
                 }
                 (
-                    P2pPayload::BlobOffer { filename, .. },
-                    P2pPayload::BlobOffer { filename: d_name, .. },
+                    P2pPayload::BlobOffer {
+                        sender_uuid,
+                        filename,
+                        ..
+                    },
+                    P2pPayload::BlobOffer {
+                        sender_uuid: d_uuid,
+                        sender_nickname: d_nick,
+                        filename: d_name,
+                        ..
+                    },
                 ) => {
+                    assert_eq!(sender_uuid, d_uuid);
+                    assert!(d_nick.len() <= MAX_NICKNAME_LEN);
+                    assert!(author_nick.starts_with(d_nick));
                     assert!(d_name.len() <= MAX_BLOB_FILENAME_BYTES);
                     assert!(filename.starts_with(d_name));
                 }
@@ -895,6 +1145,76 @@ mod tests {
             assert_eq!(hdr.msg_type, payload.msg_type());
             assert_eq!(hdr.seq_num, seq);
             assert_eq!(opened_payload, decoded_body);
+        }
+    }
+
+    #[test]
+    fn test_p2p_stream_and_video_packets_roundtrip_and_cipher() {
+        use crate::crypto::RoomCipher;
+
+        let cipher = RoomCipher::from_secret(&[0x77; 32]);
+        let room_prefix = [0x12, 0x34, 0x56, 0x78];
+
+        let packets = vec![
+            (
+                10u64,
+                P2pPayload::StreamAnnounce {
+                    is_streaming: true,
+                    width: 1920,
+                    height: 1080,
+                    fps: 60,
+                    source_title: "Counter-Strike 2 (Matchmaking Live) ".repeat(3),
+                    encoder_backend: "NVIDIA NVENC".to_string(),
+                },
+            ),
+            (11, P2pPayload::StreamSubscribe { subscribe: true }),
+            (12, P2pPayload::StreamPli),
+            (
+                13,
+                P2pPayload::VideoFrameFrag {
+                    frame_id: 42,
+                    frag_idx: 2,
+                    frag_count: 6,
+                    flags: VIDEO_FLAG_KEYFRAME | VIDEO_FLAG_XOR_FEC,
+                    data: vec![0xAB; MAX_VIDEO_FRAG_BYTES],
+                },
+            ),
+        ];
+
+        for (seq, payload) in packets {
+            let mut body = Vec::new();
+            payload.encode_body(&mut body).unwrap();
+            let decoded_body = P2pPayload::decode_body(payload.msg_type(), &body).unwrap();
+
+            match (&payload, &decoded_body) {
+                (
+                    P2pPayload::StreamAnnounce { source_title, encoder_backend, .. },
+                    P2pPayload::StreamAnnounce {
+                        source_title: d_title,
+                        encoder_backend: d_backend,
+                        ..
+                    },
+                ) => {
+                    assert!(d_title.len() <= MAX_STREAM_TITLE_BYTES);
+                    assert!(source_title.starts_with(d_title));
+                    assert!(d_backend.len() <= MAX_ENCODER_BACKEND_BYTES);
+                    assert!(encoder_backend.starts_with(d_backend));
+                }
+                _ => assert_eq!(payload, decoded_body),
+            }
+
+            let header = P2pHeader {
+                msg_type: payload.msg_type(),
+                room_prefix,
+                sender_peer_id: 2,
+                seq_num: seq,
+            };
+            let mut sealed = Vec::with_capacity(MAX_UDP_PAYLOAD);
+            cipher.seal_packet(&header, &payload, &mut sealed).unwrap();
+            assert!(sealed.len() <= MAX_UDP_PAYLOAD);
+            let (hdr, opened) = cipher.open_packet(&mut sealed).unwrap();
+            assert_eq!(hdr.msg_type, payload.msg_type());
+            assert_eq!(opened, decoded_body);
         }
     }
 }
