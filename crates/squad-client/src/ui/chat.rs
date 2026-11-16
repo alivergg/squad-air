@@ -16,13 +16,7 @@ use iced::{
 
 pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
     let header = row![
-        column![
-            text("ROOM CHAT").size(14).color(M3_ON_SURFACE_VARIANT),
-            text("E2EE P2P • Auto images <200 KB • Ctrl/Cmd+V")
-                .size(11)
-                .color(M3_ON_SURFACE_VARIANT),
-        ]
-        .spacing(2),
+        text("Room Chat").size(15).color(M3_ON_SURFACE_VARIANT),
         horizontal_space(),
         container(text(format!("{} msgs", app.chat_messages.len())).size(11))
             .padding([3, 9])
@@ -36,7 +30,7 @@ pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
             container(
                 column![
                     text("No messages yet").size(13),
-                    text("Type below, paste a screenshot (Ctrl/Cmd+V), or attach a file.")
+                    text("Say hello, paste a screenshot, or attach a file.")
                         .size(12)
                         .color(M3_ON_SURFACE_VARIANT),
                 ]
@@ -66,7 +60,7 @@ pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
             .padding([10, 12])
             .style(pill_tonal_button)
             .on_press(Message::PickFileToSend),
-        text_input("Message #room (or Cmd/Ctrl+V image)...", &app.chat_input)
+        text_input("Write a message...", &app.chat_input)
             .on_input(Message::ChatInputChanged)
             .on_submit(Message::SendChatText)
             .padding(10)

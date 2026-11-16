@@ -285,6 +285,13 @@ impl AvatarCache {
             map.insert(client_uuid, handle);
         }
     }
+
+    pub fn clear_memory_cache(&self) {
+        if let Ok(mut map) = self.handles.lock() {
+            map.clear();
+            map.shrink_to_fit();
+        }
+    }
 }
 
 impl Default for AvatarCache {

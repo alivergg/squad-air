@@ -54,7 +54,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             avatar_circle(app.avatars.handle_for(&app.config.client_uuid()), 42.0, false),
             column![
                 text(&app.config.nickname).size(13),
-                text("Online • 10ms Opus").size(11).color(M3_SUCCESS),
+                text("Online").size(11).color(M3_SUCCESS),
             ]
             .spacing(2)
             .width(Length::Fill),
@@ -74,12 +74,12 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         column![
             column![
                 text("SQUAD-AIR").size(20).color(M3_PRIMARY),
-                text("E2EE Mesh Voice & Swarm")
+                text("Private Voice & Screen Share")
                     .size(11)
                     .color(M3_ON_SURFACE_VARIANT),
             ]
             .spacing(2),
-            text("SAVED CHANNELS")
+            text("SAVED ROOMS")
                 .size(11)
                 .color(M3_ON_SURFACE_VARIANT),
             scrollable(channel_list).height(Length::Fill),
@@ -96,9 +96,9 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
 
     let create_card = container(
         column![
-            text("Create Encrypted Squad Room").size(18),
+            text("Start a Private Room").size(18),
             text(
-                "Generates a local 256-bit ChaCha20-Poly1305 room key. Zero chat or media bytes ever touch the coordinator."
+                "Create a private voice & chat room and invite friends with one link."
             )
             .size(13)
             .color(M3_ON_SURFACE_VARIANT),
@@ -121,12 +121,12 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
 
     let join_card = container(
         column![
-            text("Join or Bookmark Channel").size(18),
-            text("Paste a squad://<room>#<secret> link to connect directly via P2P UDP:")
+            text("Join or Save Room").size(18),
+            text("Paste a room invite link to join or add it to your sidebar:")
                 .size(13)
                 .color(M3_ON_SURFACE_VARIANT),
             row![
-                text_input("squad://...", &app.invite_input)
+                text_input("Paste invite link...", &app.invite_input)
                     .on_input(Message::InviteInputChanged)
                     .on_submit(Message::JoinRoomWithInput)
                     .padding(11)
@@ -140,13 +140,13 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             .spacing(10)
             .align_y(Vertical::Center),
             row![
-                text_input("Channel bookmark name (e.g. CS2 Premier)", &app.save_channel_name_input)
+                text_input("Room name (e.g. Squad Night)", &app.save_channel_name_input)
                     .on_input(Message::SaveChannelNameChanged)
                     .on_submit(Message::SaveChannelFromInput)
                     .padding(10)
                     .size(13)
                     .style(m3_text_input_style),
-                button(text("Save Channel").size(13))
+                button(text("Save Room").size(13))
                     .padding([10, 18])
                     .style(pill_tonal_button)
                     .on_press(Message::SaveChannelFromInput),
@@ -164,7 +164,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         row![
             column![
                 text("Welcome Back").size(22),
-                text(format!("Server coordinator: {}", app.config.rendezvous_server))
+                text("Ready to talk with your squad")
                     .size(12)
                     .color(M3_ON_SURFACE_VARIANT),
             ]

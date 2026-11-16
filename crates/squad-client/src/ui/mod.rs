@@ -14,7 +14,7 @@ use crate::net::{
     downloads_root_dir, spawn_mesh_worker, ChatContentUi, ChatItemUi, DecodedVideoFrame,
     MeshCommand, MeshEvent, PeerUiSnapshot,
 };
-use crate::tray::{SystemTray, TrayAction};
+use crate::tray::{release_os_memory, SystemTray, TrayAction};
 use crate::ui::avatar::{
     hash_to_hex, hex_to_hash, load_cached_avatar_jpeg, process_custom_avatar_image,
     save_cached_avatar_jpeg, AvatarCache,
@@ -28,7 +28,7 @@ use iced::{
     alignment::Vertical,
     clipboard, event, keyboard, time,
     widget::{button, column, container, horizontal_space, image as iced_image, row, stack, text},
-    Background, Border, Color, ContentFit, Element, Length, Subscription, Task, Theme,
+    Background, Border, Color, ContentFit, Element, Length, Size, Subscription, Task, Theme,
 };
 use std::borrow::Cow;
 use image::imageops::FilterType;
@@ -38,8 +38,8 @@ use squad_dsp::{
 };
 use squad_proto::{ClientUuid, InviteLink, PeerId, INLINE_IMAGE_MAX_BYTES};
 use squad_video::{
-    detect_hardware_encoder_backend, enumerate_capture_targets, request_screen_capture_permission,
-    CaptureTarget, StreamConfig, StreamFps, StreamResolution,
+    enumerate_capture_targets, request_screen_capture_permission, CaptureTarget, StreamConfig,
+    StreamFps, StreamResolution, VideoCodec,
 };
 use std::collections::HashMap;
 use std::io::Cursor;
@@ -125,10 +125,14 @@ pub enum Message {
     SetShareResolution(StreamResolution),
     SetShareFps(StreamFps),
     SetShareBitrate(u32),
+    SetShareCodec(VideoCodec),
+    ToggleShareAudio,
     StartScreenShare,
     StopScreenShare,
+    ToggleLocalStreamPreview,
     WatchPeerStream(PeerId),
     StopWatchingStream,
+    StreamVolumeChanged(f32),
     ToggleStreamExpanded,
     ToggleStreamFullscreen,
     ExitStreamFullscreen,
@@ -172,13 +176,16 @@ pub struct SquadApp {
     pub share_resolution: StreamResolution,
     pub share_fps: StreamFps,
     pub share_bitrate_bps: u32,
-    pub local_encoder_backend: String,
+    pub share_codec: VideoCodec,
+    pub share_audio: bool,
     pub is_local_sharing: bool,
+    pub local_stream_preview: bool,
     pub local_stream_subscribers: usize,
     pub watched_peer_id: Option<PeerId>,
     pub active_stream_frame: Option<iced_image::Handle>,
     pub stream_expanded: bool,
     pub stream_fullscreen: bool,
+    pub is_in_tray: bool,
 }
 
 impl SquadApp {
@@ -199,6 +206,7 @@ impl SquadApp {
 
         let audio = AudioEngineHandle::start(engine_cfg, audio_out_tx)
             .expect("Failed to initialize Squad-Air DSP audio engine");
+        audio.set_stream_gain(config.stream_volume);
 
         let video_frame_slot = Arc::new(Mutex::new(None));
         let (mesh_tx, mesh_rx) =
@@ -261,13 +269,16 @@ impl SquadApp {
             share_resolution: StreamResolution::R1080p,
             share_fps: StreamFps::Fps60,
             share_bitrate_bps: 8_000_000,
-            local_encoder_backend: detect_hardware_encoder_backend(),
+            share_codec: VideoCodec::H264,
+            share_audio: true,
             is_local_sharing: false,
+            local_stream_preview: false,
             local_stream_subscribers: 0,
             watched_peer_id: None,
             active_stream_frame: None,
             stream_expanded: false,
             stream_fullscreen: false,
+            is_in_tray: false,
         };
 
         (app, Task::none())
@@ -275,11 +286,8 @@ impl SquadApp {
 
     pub fn title(&self) -> String {
         match self.screen {
-            Screen::Lobby => format!("Squad-Air — {}", self.config.nickname),
-            Screen::Room => format!(
-                "Squad-Air • Connected ({}/10)",
-                self.peers.len() + 1
-            ),
+            Screen::Lobby => "Squad-Air".to_string(),
+            Screen::Room => "Squad-Air — Voice Room".to_string(),
             Screen::Settings => "Squad-Air — Settings".to_string(),
         }
     }
@@ -289,7 +297,12 @@ impl SquadApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let tick = time::every(Duration::from_millis(20)).map(|_| Message::Tick);
+        let tick_ms = if self.is_in_tray { 200 } else { 20 };
+        let tick = time::every(Duration::from_millis(tick_ms)).map(|_| Message::Tick);
+        let close_reqs = iced::window::close_requests().map(Message::WindowCloseRequested);
+        if self.is_in_tray {
+            return Subscription::batch([tick, close_reqs]);
+        }
         let keys = event::listen_with(|evt, status, _win| match evt {
             iced::Event::Keyboard(keyboard::Event::KeyPressed {
                 key,
@@ -342,9 +355,14 @@ impl SquadApp {
                 }
                 match self.tray.poll_action(&self.audio) {
                     Some(TrayAction::ShowWindow) => {
+                        self.is_in_tray = false;
+                        let _ = self
+                            .mesh_tx
+                            .try_send(MeshCommand::SetTrayMode { in_tray: false });
                         return iced::window::get_latest().and_then(|id| {
                             Task::batch([
                                 iced::window::change_mode(id, iced::window::Mode::Windowed),
+                                iced::window::resize(id, Size::new(1180.0, 740.0)),
                                 iced::window::gain_focus(id),
                             ])
                         });
@@ -387,6 +405,7 @@ impl SquadApp {
                                 self.local_peer_id = 0;
                                 self.share_modal_open = false;
                                 self.is_local_sharing = false;
+                                self.local_stream_preview = false;
                                 self.local_stream_subscribers = 0;
                                 self.watched_peer_id = None;
                                 self.active_stream_frame = None;
@@ -503,9 +522,11 @@ impl SquadApp {
                                 }
                             }
                             MeshEvent::StreamCodecFallbackToH264 { reason } => {
-                                self.status_banner = Some(format!(
-                                    "Switched stream to H.264 for viewer compatibility ({reason})"
-                                ));
+                                tracing::info!("Stream codec fell back to H.264: {reason}");
+                                self.share_codec = VideoCodec::H264;
+                                self.status_banner = Some(
+                                    "Switched stream to H.264 for viewer compatibility".to_string(),
+                                );
                             }
                             MeshEvent::Error(err) => {
                                 self.status_banner = Some(err);
@@ -513,10 +534,13 @@ impl SquadApp {
                         }
                     }
                 }
-                if self.watched_peer_id.is_some() {
+                if self.watched_peer_id.is_some() || self.local_stream_preview {
                     if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                         if let Some(frame) = slot.take() {
-                            if Some(frame.streamer_peer_id) == self.watched_peer_id {
+                            let matches_watch = Some(frame.streamer_peer_id) == self.watched_peer_id;
+                            let matches_preview =
+                                self.local_stream_preview && frame.streamer_peer_id == self.local_peer_id;
+                            if matches_watch || matches_preview {
                                 self.active_stream_frame = Some(iced_image::Handle::from_rgba(
                                     frame.width,
                                     frame.height,
@@ -559,6 +583,7 @@ impl SquadApp {
                 self.chat_input.clear();
                 self.share_modal_open = false;
                 self.is_local_sharing = false;
+                self.local_stream_preview = false;
                 self.local_stream_subscribers = 0;
                 self.watched_peer_id = None;
                 self.active_stream_frame = None;
@@ -920,6 +945,14 @@ impl SquadApp {
                 self.share_bitrate_bps = bps;
                 Task::none()
             }
+            Message::SetShareCodec(codec) => {
+                self.share_codec = codec;
+                Task::none()
+            }
+            Message::ToggleShareAudio => {
+                self.share_audio = !self.share_audio;
+                Task::none()
+            }
             Message::StartScreenShare => {
                 if let Some(target) = self
                     .capture_targets
@@ -931,11 +964,12 @@ impl SquadApp {
                         resolution: self.share_resolution,
                         fps: self.share_fps,
                         bitrate_bps: self.share_bitrate_bps,
-                        codec: squad_video::VideoCodec::H264,
-                        share_audio: false,
+                        codec: self.share_codec,
+                        share_audio: self.share_audio,
                     };
                     let _ = self.mesh_tx.try_send(MeshCommand::StartScreenShare { config });
                     self.is_local_sharing = true;
+                    self.local_stream_preview = false;
                     self.share_modal_open = false;
                 }
                 Task::none()
@@ -943,10 +977,48 @@ impl SquadApp {
             Message::StopScreenShare => {
                 let _ = self.mesh_tx.try_send(MeshCommand::StopScreenShare);
                 self.is_local_sharing = false;
+                self.local_stream_preview = false;
                 self.local_stream_subscribers = 0;
+                if self.watched_peer_id.is_none() {
+                    self.active_stream_frame = None;
+                    if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                        *slot = None;
+                    }
+                    if self.stream_fullscreen {
+                        self.stream_fullscreen = false;
+                        return set_window_fullscreen_task(false);
+                    }
+                }
+                Task::none()
+            }
+            Message::ToggleLocalStreamPreview => {
+                if self.is_local_sharing {
+                    self.local_stream_preview = !self.local_stream_preview;
+                    if self.local_stream_preview {
+                        self.watched_peer_id = None;
+                        self.active_stream_frame = None;
+                        self.stream_expanded = false;
+                    } else if self.watched_peer_id.is_none() {
+                        self.active_stream_frame = None;
+                        if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                            *slot = None;
+                        }
+                    }
+                    let _ = self.mesh_tx.try_send(MeshCommand::SetLocalStreamPreview {
+                        enabled: self.local_stream_preview,
+                    });
+                    if !self.local_stream_preview
+                        && self.stream_fullscreen
+                        && self.watched_peer_id.is_none()
+                    {
+                        self.stream_fullscreen = false;
+                        return set_window_fullscreen_task(false);
+                    }
+                }
                 Task::none()
             }
             Message::WatchPeerStream(peer_id) => {
+                self.local_stream_preview = false;
                 self.watched_peer_id = Some(peer_id);
                 self.active_stream_frame = None;
                 self.stream_expanded = false;
@@ -976,12 +1048,21 @@ impl SquadApp {
                     Task::none()
                 }
             }
+            Message::StreamVolumeChanged(gain) => {
+                let clamped = gain.clamp(0.0, 2.0);
+                self.audio.set_stream_gain(clamped);
+                self.config.stream_volume = clamped;
+                let _ = self.config.save();
+                Task::none()
+            }
             Message::ToggleStreamExpanded => {
                 self.stream_expanded = !self.stream_expanded;
                 Task::none()
             }
             Message::ToggleStreamFullscreen => {
-                if self.screen == Screen::Room && self.watched_peer_id.is_some() {
+                if self.screen == Screen::Room
+                    && (self.watched_peer_id.is_some() || self.local_stream_preview)
+                {
                     self.stream_fullscreen = !self.stream_fullscreen;
                     return set_window_fullscreen_task(self.stream_fullscreen);
                 }
@@ -996,7 +1077,32 @@ impl SquadApp {
             }
             Message::WindowCloseRequested(window_id) => {
                 if self.config.minimize_to_tray {
-                    iced::window::change_mode(window_id, iced::window::Mode::Hidden)
+                    self.is_in_tray = true;
+                    self.share_modal_open = false;
+                    self.lightbox_blob_id = None;
+                    self.watched_peer_id = None;
+                    self.local_stream_preview = false;
+                    self.active_stream_frame = None;
+                    self.stream_expanded = false;
+                    self.stream_fullscreen = false;
+                    self.image_handles.clear();
+                    self.image_handles.shrink_to_fit();
+                    self.inline_image_bytes.clear();
+                    self.inline_image_bytes.shrink_to_fit();
+                    self.capture_targets.clear();
+                    self.capture_targets.shrink_to_fit();
+                    self.avatars.clear_memory_cache();
+                    if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                        *slot = None;
+                    }
+                    let _ = self
+                        .mesh_tx
+                        .try_send(MeshCommand::SetTrayMode { in_tray: true });
+                    release_os_memory();
+                    Task::batch([
+                        iced::window::resize(window_id, Size::new(1.0, 1.0)),
+                        iced::window::change_mode(window_id, iced::window::Mode::Hidden),
+                    ])
                 } else {
                     let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
                     self.audio.shutdown();
@@ -1150,7 +1256,7 @@ fn view_image_lightbox<'a>(
             .padding([8, 14])
             .style(pill_tonal_button)
             .on_press(Message::SaveImageAs(blob_id)),
-        button(text("Close (Esc)").size(12))
+        button(text("Close").size(12))
             .padding([8, 14])
             .style(pill_danger_button)
             .on_press(Message::CloseImageLightbox),

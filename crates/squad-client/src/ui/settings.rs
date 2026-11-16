@@ -21,8 +21,8 @@ use squad_dsp::NoiseSuppressionMode;
 pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     let top_bar = row![
         column![
-            text("Settings & Audio Pipeline").size(22).color(M3_PRIMARY),
-            text("Changes apply live without disconnecting your voice mesh")
+            text("Settings").size(22).color(M3_PRIMARY),
+            text("Changes apply live without disconnecting your call")
                 .size(12)
                 .color(M3_ON_SURFACE_VARIANT),
         ]
@@ -39,14 +39,14 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
 
     let profile_section = container(
         column![
-            text("Profile & Rendezvous Coordinator").size(16),
+            text("Profile").size(16),
             row![
                 avatar_preview,
                 column![
                     text(if app.config.custom_avatar_hash.is_some() {
-                        "Custom 128x128 Avatar (P2P Cached)"
+                        "Custom Avatar"
                     } else {
-                        "5x5 BLAKE3 Identicon (Deterministic)"
+                        "Generated Avatar"
                     })
                     .size(12)
                     .color(M3_ON_SURFACE_VARIANT),
@@ -55,7 +55,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                             .padding([7, 14])
                             .style(pill_primary_button)
                             .on_press(Message::PickAvatarImage),
-                        button(text("Reset to 5x5 Identicon").size(12))
+                        button(text("Reset Avatar").size(12))
                             .padding([7, 14])
                             .style(pill_tonal_button)
                             .on_press(Message::ResetAvatarIdenticon),
@@ -68,8 +68,8 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             .align_y(Vertical::Center),
             row![
                 column![
-                    text("Nickname").size(12).color(M3_ON_SURFACE_VARIANT),
-                    text_input("Your nickname", &app.config.nickname)
+                    text("Display Name").size(12).color(M3_ON_SURFACE_VARIANT),
+                    text_input("Your name", &app.config.nickname)
                         .on_input(Message::NicknameChanged)
                         .padding(10)
                         .size(14)
@@ -78,10 +78,10 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                 .width(Length::FillPortion(1))
                 .spacing(6),
                 column![
-                    text("Rendezvous Server (UDP host:port)")
+                    text("Voice Server")
                         .size(12)
                         .color(M3_ON_SURFACE_VARIANT),
-                    text_input("127.0.0.1:3478", &app.config.rendezvous_server)
+                    text_input("host:port", &app.config.rendezvous_server)
                         .on_input(Message::RendezvousServerChanged)
                         .padding(10)
                         .size(14)
@@ -170,23 +170,23 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     let ns_mode = app.config.ns_mode;
     let aec_on = app.config.aec_enabled;
     let df3_badge = if app.audio.is_df3_available() {
-        "DeepFilterNet3 (ONNX Ready)"
+        "Enhanced"
     } else {
-        "DeepFilterNet3 (Auto RNNoise Fallback)"
+        "Enhanced (Auto)"
     };
 
     let dsp_section = container(
         column![
-            text("Voice Processing (48 kHz • 10 ms Frame Pipeline)").size(16),
+            text("Voice & Audio Processing").size(16),
             row![
-                text("1. Acoustic Echo Cancellation (WebRTC AEC3):")
+                text("Echo Cancellation:")
                     .size(14)
                     .width(Length::Fixed(330.0)),
                 button(text("Off").size(13))
                     .padding([8, 18])
                     .style(pill_chip_button(!aec_on))
                     .on_press(Message::SetAecEnabled(false)),
-                button(text("On (Speakers Mode)").size(13))
+                button(text("On (Speakers)").size(13))
                     .padding([8, 18])
                     .style(pill_chip_button(aec_on))
                     .on_press(Message::SetAecEnabled(true)),
@@ -194,14 +194,14 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             .spacing(10)
             .align_y(Vertical::Center),
             row![
-                text("2. Neural Noise Suppression:")
+                text("Noise Suppression:")
                     .size(14)
                     .width(Length::Fixed(330.0)),
                 button(text("Off").size(13))
                     .padding([8, 16])
                     .style(pill_chip_button(ns_mode == NoiseSuppressionMode::Off))
                     .on_press(Message::SetNsMode(NoiseSuppressionMode::Off)),
-                button(text("RNNoise (nnnoiseless)").size(13))
+                button(text("Standard").size(13))
                     .padding([8, 16])
                     .style(pill_chip_button(ns_mode == NoiseSuppressionMode::Rnnoise))
                     .on_press(Message::SetNsMode(NoiseSuppressionMode::Rnnoise)),
@@ -215,7 +215,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             .spacing(10)
             .align_y(Vertical::Center),
             row![
-                text("3. Microphone Input Pre-Gain:")
+                text("Microphone Gain:")
                     .size(14)
                     .width(Length::Fixed(330.0)),
                 slider(0.2..=2.5, app.config.input_gain, Message::InputGainChanged)
@@ -228,7 +228,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             .spacing(12)
             .align_y(Vertical::Center),
             row![
-                text("4. Microphone Activation Sensitivity (Voice Gate):")
+                text("Microphone Sensitivity:")
                     .size(14)
                     .width(Length::Fixed(330.0)),
                 slider(
@@ -245,7 +245,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             .spacing(12)
             .align_y(Vertical::Center),
             row![
-                text("Live Input Level (-60 dB .. 0 dB):")
+                text("Live Input Level:")
                     .size(12)
                     .color(M3_ON_SURFACE_VARIANT)
                     .width(Length::Fixed(330.0)),
@@ -264,8 +264,8 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     .style(surface_card_style);
 
     let mut hotkey_col = column![
-        text("Non-Blocking Global Hotkeys (Passive Polling)").size(16),
-        text("Keys are never swallowed: typing 'V' in apps or using Push-to-Talk in CS2 continues normally. Supports KeyV, CapsLock, F9, Mouse4, Mouse5.")
+        text("Keyboard Shortcuts").size(16),
+        text("Works in fullscreen games without blocking your keys.")
             .size(12)
             .color(M3_ON_SURFACE_VARIANT),
         row![
@@ -345,7 +345,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             row![
                 column![
                     text("Minimize to System Tray on Close").size(13),
-                    text("Keep P2P voice mesh and tray icon active when closing the window")
+                    text("Keep your voice call and tray icon running in the background")
                         .size(11)
                         .color(M3_ON_SURFACE_VARIANT),
                 ]

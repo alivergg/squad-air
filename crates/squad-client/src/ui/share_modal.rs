@@ -9,7 +9,7 @@ use iced::{
     widget::{button, column, container, horizontal_space, row, scrollable, text},
     Background, Border, Color, Element, Length, Shadow, Theme, Vector,
 };
-use squad_video::{CaptureTarget, StreamFps, StreamResolution};
+use squad_video::{CaptureTarget, StreamFps, StreamResolution, VideoCodec};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareSourceTab {
@@ -41,19 +41,6 @@ fn modal_card_style(_theme: &Theme) -> container::Style {
     }
 }
 
-fn encoder_badge_style(_theme: &Theme) -> container::Style {
-    container::Style {
-        background: Some(Background::Color(M3_PRIMARY_CONTAINER)),
-        text_color: Some(M3_ON_PRIMARY_CONTAINER),
-        border: Border {
-            color: M3_PRIMARY,
-            width: 1.0,
-            radius: 8.0.into(),
-        },
-        ..Default::default()
-    }
-}
-
 fn target_row_button_style(selected: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_theme: &Theme, status: button::Status| {
         let (bg, border_color) = if selected {
@@ -82,29 +69,22 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
     let header = row![
         column![
             text("Share Your Screen").size(18).color(M3_ON_SURFACE),
-            text("End-to-End Encrypted Peer-to-Peer UDP Stream")
-                .size(11)
+            text("Choose a screen or application window to share with your room")
+                .size(12)
                 .color(M3_ON_SURFACE_VARIANT),
         ]
         .spacing(2),
         horizontal_space(),
-        container(
-            text(format!("GPU Encoder: {}", app.local_encoder_backend))
-                .size(11)
-                .color(M3_ON_PRIMARY_CONTAINER),
-        )
-        .padding([6, 10])
-        .style(encoder_badge_style),
     ]
     .spacing(12)
     .align_y(Vertical::Center);
 
     let tabs = row![
-        button(text("Screens / Monitors").size(12))
+        button(text("Screens").size(12))
             .padding([8, 12])
             .style(pill_chip_button(app.share_tab == ShareSourceTab::Monitors))
             .on_press(Message::SelectShareTab(ShareSourceTab::Monitors)),
-        button(text("Applications & Windows").size(12))
+        button(text("Windows").size(12))
             .padding([8, 12])
             .style(pill_chip_button(app.share_tab == ShareSourceTab::Windows))
             .on_press(Message::SelectShareTab(ShareSourceTab::Windows)),
@@ -258,6 +238,35 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
     .spacing(8)
     .align_y(Vertical::Center);
 
+    let codec_row = row![
+        text("Codec").size(12).color(M3_ON_SURFACE_VARIANT).width(Length::Fixed(80.0)),
+        button(text("H.264 (Compatible)").size(12))
+            .padding([7, 12])
+            .style(pill_chip_button(app.share_codec == VideoCodec::H264))
+            .on_press(Message::SetShareCodec(VideoCodec::H264)),
+        button(text("H.265 (High Efficiency)").size(12))
+            .padding([7, 12])
+            .style(pill_chip_button(app.share_codec == VideoCodec::H265))
+            .on_press(Message::SetShareCodec(VideoCodec::H265)),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    let audio_label = if app.share_audio {
+        "[✓] Share System Audio"
+    } else {
+        "[ ] Share System Audio"
+    };
+    let audio_row = row![
+        text("Sound").size(12).color(M3_ON_SURFACE_VARIANT).width(Length::Fixed(80.0)),
+        button(text(audio_label).size(12))
+            .padding([7, 12])
+            .style(pill_chip_button(app.share_audio))
+            .on_press(Message::ToggleShareAudio),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
     let mut go_live_btn = button(text("Go Live").size(13))
         .padding([10, 18])
         .style(pill_primary_button);
@@ -266,9 +275,6 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
     }
 
     let footer = row![
-        text("Zero-Waste: encodes only while a peer watches")
-            .size(11)
-            .color(M3_ON_SURFACE_VARIANT),
         horizontal_space(),
         button(text("Cancel").size(13))
             .padding([10, 16])
@@ -280,9 +286,10 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
     .align_y(Vertical::Center);
 
     let card = container(
-        column![header, tabs, source_list, resolution_row, fps_row, footer].spacing(14),
+        column![header, tabs, source_list, resolution_row, fps_row, codec_row, audio_row, footer]
+            .spacing(12),
     )
-    .width(Length::Fixed(600.0))
+    .width(Length::Fixed(620.0))
     .padding(22)
     .style(modal_card_style);
 

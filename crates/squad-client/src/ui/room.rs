@@ -20,7 +20,8 @@ use iced::{
 use squad_dsp::MicActivationMode;
 
 pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
-    if app.stream_fullscreen && app.watched_peer_id.is_some() {
+    let has_stage = app.watched_peer_id.is_some() || app.local_stream_preview;
+    if app.stream_fullscreen && has_stage {
         return view_stream_fullscreen(app);
     }
 
@@ -30,37 +31,32 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     } else {
         "Copy Invite"
     };
-    let already_saved = app
+    let saved_channel = app
         .config
         .saved_channels
         .iter()
-        .any(|c| c.invite_uri == app.active_invite_uri);
+        .find(|c| c.invite_uri == app.active_invite_uri);
+    let already_saved = saved_channel.is_some();
+    let room_title = saved_channel
+        .map(|c| c.name.as_str())
+        .unwrap_or("Voice Room");
 
     let header = container(
         row![
-            column![
-                row![
-                    text("# squad-voice").size(18).color(M3_PRIMARY),
-                    container(
-                        text(format!("{total_members}/10 Online • E2EE"))
-                            .size(12)
-                            .color(M3_SUCCESS)
-                    )
-                    .padding([4, 10])
-                    .style(canvas_panel_style),
-                ]
-                .spacing(10)
-                .align_y(Vertical::Center),
-                text(format!(
-                    "Slot #{} • Server {}",
-                    app.local_peer_id, app.config.rendezvous_server
-                ))
-                .size(11)
-                .color(M3_ON_SURFACE_VARIANT),
+            row![
+                text(room_title).size(18).color(M3_PRIMARY),
+                container(
+                    text(format!("{total_members} Online"))
+                        .size(12)
+                        .color(M3_SUCCESS)
+                )
+                .padding([4, 10])
+                .style(canvas_panel_style),
             ]
-            .spacing(3),
+            .spacing(10)
+            .align_y(Vertical::Center),
             horizontal_space(),
-            text_input("Channel name...", &app.save_channel_name_input)
+            text_input("Room name...", &app.save_channel_name_input)
                 .on_input(Message::SaveChannelNameChanged)
                 .on_submit(Message::SaveActiveChannel)
                 .width(Length::Fixed(165.0))
@@ -96,40 +92,54 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     .style(surface_card_style);
 
     let local_speaking = app.audio.is_local_speaking();
-    let self_card: Element<'_, Message> = container(
-        row![
-            avatar_circle(
-                app.avatars.handle_for(&app.config.client_uuid()),
-                42.0,
-                local_speaking
-            ),
-            column![
-                text(format!("{} (You)", app.config.nickname)).size(14),
-                text(if app.audio.is_mic_muted() {
-                    "Microphone Muted"
-                } else if local_speaking {
-                    "Transmitting 10ms Opus"
-                } else {
-                    "DTX Standby (0 kbps)"
-                })
-                .size(12)
-                .color(if local_speaking {
-                    M3_SUCCESS
-                } else {
-                    M3_ON_SURFACE_VARIANT
-                }),
-            ]
-            .spacing(3),
-            horizontal_space(),
-            mic_level_meter(app.audio.local_mic_level_db(), local_speaking),
+    let mut self_row = row![
+        avatar_circle(
+            app.avatars.handle_for(&app.config.client_uuid()),
+            42.0,
+            local_speaking
+        ),
+        column![
+            text(format!("{} (You)", app.config.nickname)).size(14),
+            text(if app.audio.is_mic_muted() {
+                "Muted"
+            } else if local_speaking {
+                "Speaking"
+            } else {
+                "Connected"
+            })
+            .size(12)
+            .color(if local_speaking {
+                M3_SUCCESS
+            } else {
+                M3_ON_SURFACE_VARIANT
+            }),
         ]
-        .spacing(12)
-        .align_y(Vertical::Center),
-    )
-    .width(Length::Fill)
-    .padding(14)
-    .style(peer_card_style(local_speaking))
-    .into();
+        .spacing(3),
+        horizontal_space(),
+    ]
+    .spacing(12)
+    .align_y(Vertical::Center);
+
+    if app.is_local_sharing {
+        let preview_label = if app.local_stream_preview {
+            "Hide Preview"
+        } else {
+            "Preview"
+        };
+        self_row = self_row.push(
+            button(text(preview_label).size(11))
+                .padding([6, 12])
+                .style(pill_chip_button(app.local_stream_preview))
+                .on_press(Message::ToggleLocalStreamPreview),
+        );
+    }
+    self_row = self_row.push(mic_level_meter(app.audio.local_mic_level_db(), local_speaking));
+
+    let self_card: Element<'_, Message> = container(self_row)
+        .width(Length::Fill)
+        .padding(14)
+        .style(peer_card_style(local_speaking))
+        .into();
 
     let mut grid_rows = column![self_card].spacing(10);
     for chunk in app.peers.chunks(2) {
@@ -145,9 +155,19 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                     avatar_circle(app.avatars.handle_for(&peer_uuid), 42.0, peer.is_speaking),
                     column![
                         text(&peer.nickname).size(14),
-                        text(format!("Peer #{}", peer.peer_id))
-                            .size(11)
-                            .color(M3_ON_SURFACE_VARIANT),
+                        text(if peer.stream_info.is_some() {
+                            "Sharing Screen"
+                        } else if peer.is_speaking {
+                            "Speaking"
+                        } else {
+                            "Connected"
+                        })
+                        .size(11)
+                        .color(if peer.is_speaking {
+                            M3_SUCCESS
+                        } else {
+                            M3_ON_SURFACE_VARIANT
+                        }),
                     ]
                     .spacing(2),
                     horizontal_space(),
@@ -191,7 +211,7 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                 };
 
                 let stream_row = row![
-                    container(text(format!("LIVE • {} FPS", stream.fps)).size(10).color(M3_ON_PRIMARY))
+                    container(text("LIVE").size(10).color(M3_ON_PRIMARY))
                         .padding([3, 7])
                         .style(|_t: &Theme| container::Style {
                             background: Some(Background::Color(M3_ERROR)),
@@ -228,7 +248,7 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
 
     let voice_stage = container(
         column![
-            text("VOICE STAGE").size(13).color(M3_ON_SURFACE_VARIANT),
+            text("Voice").size(14).color(M3_ON_SURFACE_VARIANT),
             scrollable(grid_rows).height(Length::Fill),
         ]
         .spacing(10),
@@ -238,7 +258,7 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     .padding(16)
     .style(canvas_panel_style);
 
-    let left_stage: Element<'_, Message> = if app.watched_peer_id.is_some() {
+    let left_stage: Element<'_, Message> = if has_stage {
         if app.stream_expanded {
             container(view_stream_stage(app))
                 .width(Length::FillPortion(6))

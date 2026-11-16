@@ -46,6 +46,8 @@ pub struct AppConfig {
     pub custom_avatar_hash: Option<String>,
     #[serde(default = "default_minimize_to_tray")]
     pub minimize_to_tray: bool,
+    #[serde(default = "default_stream_volume")]
+    pub stream_volume: f32,
 }
 
 impl Default for AppConfig {
@@ -68,6 +70,7 @@ impl Default for AppConfig {
             saved_channels: Vec::new(),
             custom_avatar_hash: None,
             minimize_to_tray: default_minimize_to_tray(),
+            stream_volume: default_stream_volume(),
         }
     }
 }
@@ -167,6 +170,10 @@ fn default_vad_threshold_db() -> f32 {
 
 fn default_minimize_to_tray() -> bool {
     true
+}
+
+fn default_stream_volume() -> f32 {
+    1.0
 }
 
 fn uuid_key(client_uuid: &ClientUuid) -> String {

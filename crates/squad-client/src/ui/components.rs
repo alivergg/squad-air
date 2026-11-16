@@ -43,10 +43,10 @@ pub fn avatar_circle<'a, Message: 'a>(
 
 pub fn telemetry_badge<'a, Message: 'a>(peer: &PeerUiSnapshot) -> Element<'a, Message> {
     let (label, color) = match peer.status {
-        PeerConnStatus::Punching => ("PUNCHING NAT...".to_string(), M3_WARNING),
-        PeerConnStatus::NatFailed => ("NAT BLOCKED".to_string(), M3_ERROR),
+        PeerConnStatus::Punching => ("Connecting...".to_string(), M3_WARNING),
+        PeerConnStatus::NatFailed => ("Offline".to_string(), M3_ERROR),
         PeerConnStatus::Connected => {
-            let txt = format!("{} ms • {:.1}% loss", peer.rtt_ms, peer.loss_pct);
+            let txt = format!("{} ms", peer.rtt_ms);
             let col = if peer.rtt_ms < 60 && peer.loss_pct < 1.0 {
                 M3_SUCCESS
             } else if peer.rtt_ms < 120 && peer.loss_pct < 5.0 {
@@ -75,7 +75,7 @@ pub fn mic_level_meter<'a, Message: 'a>(db: f32, is_speaking: bool) -> Element<'
     let normalized = ((db + 60.0) / 60.0).clamp(0.04, 1.0);
     let fill_width = (normalized * 110.0) as u16;
 
-    let bar = container(
+    container(
         container(text(""))
             .width(Length::Fixed(fill_width as f32))
             .height(Length::Fixed(8.0))
@@ -101,12 +101,8 @@ pub fn mic_level_meter<'a, Message: 'a>(db: f32, is_speaking: bool) -> Element<'
             ..Default::default()
         },
         ..Default::default()
-    });
-
-    row![bar, text(format!("{:.0} dB", db.max(-60.0))).size(12).color(M3_ON_SURFACE_VARIANT)]
-        .spacing(8)
-        .align_y(Vertical::Center)
-        .into()
+    })
+    .into()
 }
 
 pub fn mic_sensitivity_meter<'a, Message: 'a>(
