@@ -328,6 +328,8 @@ struct AudioStreams {
     play_prod: <HeapRb<f32> as Split>::Prod,
     cap_resampler: CaptureResampler,
     play_resampler: PlaybackResampler,
+    input_stream_failed: Arc<AtomicBool>,
+    output_stream_failed: Arc<AtomicBool>,
 }
 
 fn pick_48k_f32_channels<I>(ranges: I, preferred_channels: Option<u16>) -> Option<usize>
@@ -385,35 +387,29 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
         .unwrap_or((SAMPLE_RATE, if is_input { 1 } else { 2 }))
 }
 
-fn build_audio_streams(
+fn build_input_stream_half(
     host: &cpal::Host,
     input_device_name: Option<&str>,
-    output_device_name: Option<&str>,
-) -> AudioStreams {
+) -> (
+    Option<cpal::Stream>,
+    <HeapRb<f32> as Split>::Cons,
+    CaptureResampler,
+    Arc<AtomicBool>,
+    u32,
+    usize,
+) {
     let in_device = select_device(host, input_device_name, true);
-    let out_device = select_device(host, output_device_name, false);
-
     let (in_rate, in_channels) = in_device
         .as_ref()
         .map(|d| negotiate_device_format(d, true))
         .unwrap_or((SAMPLE_RATE, 1));
 
-    let (out_rate, out_channels) = out_device
-        .as_ref()
-        .map(|d| negotiate_device_format(d, false))
-        .unwrap_or((SAMPLE_RATE, 2));
-
     let capture_rb = HeapRb::<f32>::new((in_rate as usize) / 2);
     let (mut cap_prod, cap_cons) = capture_rb.split();
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_cb = Arc::clone(&failed);
 
-    let playback_rb = HeapRb::<f32>::new((out_rate as usize) / 2);
-    let (mut play_prod, mut play_cons) = playback_rb.split();
-
-    let prefill_samples = (out_rate as usize / 100) * 3;
-    let silence_prefill = vec![0.0f32; prefill_samples];
-    let _ = play_prod.push_slice(&silence_prefill);
-
-    let _input_stream = in_device.and_then(|dev| {
+    let stream = in_device.and_then(|dev| {
         let stream_cfg = cpal::StreamConfig {
             channels: in_channels as u16,
             sample_rate: cpal::SampleRate(in_rate),
@@ -431,15 +427,63 @@ fn build_audio_streams(
                     }
                 }
             },
-            |err| {
-                let _ = err;
+            move |err| {
+                warn!("Audio input stream error: {err}");
+                failed_cb.store(true, Ordering::Relaxed);
             },
             None,
         )
         .ok()
     });
 
-    let _output_stream = out_device.and_then(|dev| {
+    let stream = stream.and_then(|s| {
+        if let Err(err) = s.play() {
+            warn!("Audio input stream play failed: {err}");
+            failed.store(true, Ordering::Relaxed);
+            None
+        } else {
+            Some(s)
+        }
+    });
+
+    (
+        stream,
+        cap_cons,
+        CaptureResampler::new(in_rate),
+        failed,
+        in_rate,
+        in_channels,
+    )
+}
+
+fn build_output_stream_half(
+    host: &cpal::Host,
+    output_device_name: Option<&str>,
+) -> (
+    Option<cpal::Stream>,
+    <HeapRb<f32> as Split>::Prod,
+    PlaybackResampler,
+    Arc<AtomicBool>,
+    u32,
+    usize,
+) {
+    let out_device = select_device(host, output_device_name, false);
+    let (out_rate, out_channels) = out_device
+        .as_ref()
+        .map(|d| negotiate_device_format(d, false))
+        .unwrap_or((SAMPLE_RATE, 2));
+
+    let playback_rb = HeapRb::<f32>::new((out_rate as usize) / 2);
+    let (mut play_prod, mut play_cons) = playback_rb.split();
+
+    let prefill_samples = (out_rate as usize / 100) * 3;
+    let silence_prefill = vec![0.0f32; prefill_samples];
+    let _ = play_prod.push_slice(&silence_prefill);
+
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_cb = Arc::clone(&failed);
+
+    let stream = out_device.and_then(|dev| {
         let stream_cfg = cpal::StreamConfig {
             channels: out_channels as u16,
             sample_rate: cpal::SampleRate(out_rate),
@@ -458,20 +502,44 @@ fn build_audio_streams(
                     }
                 }
             },
-            |err| {
-                let _ = err;
+            move |err| {
+                warn!("Audio output stream error: {err}");
+                failed_cb.store(true, Ordering::Relaxed);
             },
             None,
         )
         .ok()
     });
 
-    if let Some(ref s) = _input_stream {
-        let _ = s.play();
-    }
-    if let Some(ref s) = _output_stream {
-        let _ = s.play();
-    }
+    let stream = stream.and_then(|s| {
+        if let Err(err) = s.play() {
+            warn!("Audio output stream play failed: {err}");
+            failed.store(true, Ordering::Relaxed);
+            None
+        } else {
+            Some(s)
+        }
+    });
+
+    (
+        stream,
+        play_prod,
+        PlaybackResampler::new(out_rate),
+        failed,
+        out_rate,
+        out_channels,
+    )
+}
+
+fn build_audio_streams(
+    host: &cpal::Host,
+    input_device_name: Option<&str>,
+    output_device_name: Option<&str>,
+) -> AudioStreams {
+    let (_input_stream, cap_cons, cap_resampler, input_stream_failed, in_rate, in_channels) =
+        build_input_stream_half(host, input_device_name);
+    let (_output_stream, play_prod, play_resampler, output_stream_failed, out_rate, out_channels) =
+        build_output_stream_half(host, output_device_name);
 
     info!(
         "Squad-Air DSP worker active (Capture: {} Hz/{}ch, Playback: {} Hz/{}ch)",
@@ -483,8 +551,10 @@ fn build_audio_streams(
         _output_stream,
         cap_cons,
         play_prod,
-        cap_resampler: CaptureResampler::new(in_rate),
-        play_resampler: PlaybackResampler::new(out_rate),
+        cap_resampler,
+        play_resampler,
+        input_stream_failed,
+        output_stream_failed,
     }
 }
 
@@ -567,7 +637,10 @@ fn run_audio_worker(
         config.input_device_name.as_deref(),
         config.output_device_name.as_deref(),
     ));
+    let mut current_input_dev = config.input_device_name.clone();
     let mut current_output_dev = config.output_device_name.clone();
+    let mut silent_capture_ticks: u32 = 0;
+    let mut last_hotplug_attempt = Instant::now();
     let mut stream_loopback: Option<LoopbackStream> = None;
     let mut stream_encoder =
         OpusEncoder10ms::new(64_000).expect("Stream Opus encoder init");
@@ -626,7 +699,10 @@ fn run_audio_worker(
                     input_device_name,
                     output_device_name,
                 } => {
+                    current_input_dev = input_device_name.clone();
                     current_output_dev = output_device_name.clone();
+                    silent_capture_ticks = 0;
+                    last_hotplug_attempt = Instant::now();
                     // Drop existing streams first so OS backends can re-acquire the device cleanly.
                     drop(streams.take());
                     streams = Some(build_audio_streams(
@@ -648,6 +724,57 @@ fn run_audio_worker(
         let Some(active) = streams.as_mut() else {
             continue;
         };
+
+        let need_input = active.input_stream_failed.load(Ordering::Relaxed)
+            || active._input_stream.is_none()
+            || silent_capture_ticks >= 150;
+        let need_output =
+            active.output_stream_failed.load(Ordering::Relaxed) || active._output_stream.is_none();
+
+        if (need_input || need_output) && last_hotplug_attempt.elapsed() >= Duration::from_secs(1) {
+            last_hotplug_attempt = Instant::now();
+            if need_input {
+                drop(active._input_stream.take());
+                let (in_stream, cap_cons, cap_resampler, input_failed, in_rate, in_channels) =
+                    build_input_stream_half(&host, current_input_dev.as_deref());
+                if in_stream.is_some() {
+                    info!(
+                        "Hot-plug recovered audio input stream ({} Hz/{}ch)",
+                        in_rate, in_channels
+                    );
+                }
+                active._input_stream = in_stream;
+                active.cap_cons = cap_cons;
+                active.cap_resampler = cap_resampler;
+                active.input_stream_failed = input_failed;
+                silent_capture_ticks = 0;
+            }
+            if need_output {
+                drop(active._output_stream.take());
+                let (
+                    out_stream,
+                    play_prod,
+                    play_resampler,
+                    output_failed,
+                    out_rate,
+                    out_channels,
+                ) = build_output_stream_half(&host, current_output_dev.as_deref());
+                if out_stream.is_some() {
+                    info!(
+                        "Hot-plug recovered audio output stream ({} Hz/{}ch)",
+                        out_rate, out_channels
+                    );
+                }
+                active._output_stream = out_stream;
+                active.play_prod = play_prod;
+                active.play_resampler = play_resampler;
+                active.output_stream_failed = output_failed;
+                if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
+                    drop(stream_loopback.take());
+                    stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
+                }
+            }
+        }
 
         // 2. Сводим выходной 10-мс кадр всех участников комнаты и пушим референс в AEC3
         let deafened = atomics.deafened.load(Ordering::Relaxed);
@@ -683,9 +810,18 @@ fn run_audio_worker(
         }
 
         // 3. Забираем сырые сэмплы с микрофона и прогоняем через Capture DSP-тракт
+        let mut got_capture_samples = false;
         while active.cap_cons.occupied_len() > 0 {
             let n = active.cap_cons.pop_slice(&mut raw_in_buf);
+            if n > 0 {
+                got_capture_samples = true;
+            }
             active.cap_resampler.push_samples(&raw_in_buf[..n]);
+        }
+        if got_capture_samples {
+            silent_capture_ticks = 0;
+        } else {
+            silent_capture_ticks = silent_capture_ticks.saturating_add(1);
         }
 
         while active.cap_resampler.pop_frame(&mut frame_48k) {
