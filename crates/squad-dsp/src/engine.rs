@@ -52,6 +52,7 @@ pub struct PeerAudioStats {
 pub enum OutboundAudioFrame {
     Opus { seq_num: u64, opus_bytes: Bytes },
     DtxKeepalive { seq_num: u64 },
+    StreamOpus { seq_num: u64, opus_bytes: Bytes },
 }
 
 #[derive(Debug, Clone)]
@@ -87,10 +88,18 @@ enum EngineCmd {
         seq_num: u64,
         opus_data: Vec<u8>,
     },
+    PushRemoteStreamOpus {
+        peer_id: PeerId,
+        seq_num: u64,
+        opus_data: Vec<u8>,
+    },
     SetPeerGain {
         peer_id: PeerId,
         gain: f32,
     },
+    SetStreamGain(f32),
+    ClearStreamAudio,
+    SetShareStreamAudio(bool),
     RemovePeer {
         peer_id: PeerId,
     },
@@ -110,6 +119,7 @@ struct SharedAtomics {
     mic_muted: AtomicBool,
     deafened: AtomicBool,
     hotkey_active: AtomicBool,
+    stream_audio_sharing: AtomicBool,
     activation_mode: AtomicU8,
     input_gain_bits: AtomicU32,
     vad_threshold_db_bits: AtomicU32,
@@ -141,6 +151,7 @@ impl AudioEngineHandle {
             mic_muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             hotkey_active: AtomicBool::new(false),
+            stream_audio_sharing: AtomicBool::new(false),
             activation_mode: AtomicU8::new(config.activation_mode as u8),
             input_gain_bits: AtomicU32::new(config.input_gain.to_bits()),
             vad_threshold_db_bits: AtomicU32::new(
@@ -174,6 +185,29 @@ impl AudioEngineHandle {
             seq_num,
             opus_data: opus_payload.to_vec(),
         });
+    }
+
+    pub fn push_remote_stream_opus(&self, peer_id: PeerId, seq_num: u64, opus_payload: &[u8]) {
+        let _ = self.cmd_tx.try_send(EngineCmd::PushRemoteStreamOpus {
+            peer_id,
+            seq_num,
+            opus_data: opus_payload.to_vec(),
+        });
+    }
+
+    pub fn set_stream_gain(&self, gain: f32) {
+        let _ = self.cmd_tx.try_send(EngineCmd::SetStreamGain(gain));
+    }
+
+    pub fn clear_stream_audio(&self) {
+        let _ = self.cmd_tx.try_send(EngineCmd::ClearStreamAudio);
+    }
+
+    pub fn set_share_stream_audio(&self, enabled: bool) {
+        self.atomics
+            .stream_audio_sharing
+            .store(enabled, Ordering::Relaxed);
+        let _ = self.cmd_tx.try_send(EngineCmd::SetShareStreamAudio(enabled));
     }
 
     pub fn set_peer_gain(&self, peer_id: PeerId, gain: f32) {
@@ -454,6 +488,71 @@ fn build_audio_streams(
     }
 }
 
+struct LoopbackStream {
+    _stream: cpal::Stream,
+    cons: <HeapRb<f32> as Split>::Cons,
+    resampler: CaptureResampler,
+}
+
+fn build_loopback_stream(
+    host: &cpal::Host,
+    _output_device_name: Option<&str>,
+) -> Option<LoopbackStream> {
+    #[cfg(target_os = "windows")]
+    let target_dev = select_device(host, _output_device_name, false);
+
+    #[cfg(not(target_os = "windows"))]
+    let target_dev = host.input_devices().ok().and_then(|mut iter| {
+        iter.find(|d| {
+            d.name()
+                .map(|n| {
+                    let low = n.to_ascii_lowercase();
+                    low.contains("blackhole")
+                        || low.contains("loopback")
+                        || low.contains("soundflower")
+                })
+                .unwrap_or(false)
+        })
+    });
+
+    let dev = target_dev?;
+    #[cfg(target_os = "windows")]
+    let (lb_rate, lb_channels) = negotiate_device_format(&dev, false);
+    #[cfg(not(target_os = "windows"))]
+    let (lb_rate, lb_channels) = negotiate_device_format(&dev, true);
+
+    let rb = HeapRb::<f32>::new((lb_rate as usize) / 2);
+    let (mut prod, cons) = rb.split();
+    let stream_cfg = cpal::StreamConfig {
+        channels: lb_channels as u16,
+        sample_rate: cpal::SampleRate(lb_rate),
+        buffer_size: cpal::BufferSize::Default,
+    };
+    let stream = dev
+        .build_input_stream(
+            &stream_cfg,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                if lb_channels == 1 {
+                    let _ = prod.push_slice(data);
+                } else {
+                    for frame in data.chunks(lb_channels) {
+                        let mono = frame.iter().copied().sum::<f32>() / (frame.len() as f32);
+                        let _ = prod.try_push(mono);
+                    }
+                }
+            },
+            |_err| {},
+            None,
+        )
+        .ok()?;
+    let _ = stream.play();
+    Some(LoopbackStream {
+        _stream: stream,
+        cons,
+        resampler: CaptureResampler::new(lb_rate),
+    })
+}
+
 fn run_audio_worker(
     config: AudioEngineConfig,
     mut suppressor: NoiseSuppressor,
@@ -468,6 +567,13 @@ fn run_audio_worker(
         config.input_device_name.as_deref(),
         config.output_device_name.as_deref(),
     ));
+    let mut current_output_dev = config.output_device_name.clone();
+    let mut stream_loopback: Option<LoopbackStream> = None;
+    let mut stream_encoder =
+        OpusEncoder10ms::new(64_000).expect("Stream Opus encoder init");
+    let mut stream_seq_num: u64 = 1;
+    let mut stream_frame_48k = [0.0f32; FRAME_SAMPLES];
+
     let mut aec = EchoCanceller::new(config.aec_enabled);
     let mut encoder = OpusEncoder10ms::new(config.bitrate_bps).expect("Opus encoder init");
     let cue_bank = SoundCueBank::load_optional();
@@ -496,7 +602,22 @@ fn run_audio_worker(
                     seq_num,
                     opus_data,
                 } => mixer.push_peer_opus(peer_id, seq_num, opus_data),
+                EngineCmd::PushRemoteStreamOpus {
+                    peer_id,
+                    seq_num,
+                    opus_data,
+                } => mixer.push_stream_opus(peer_id, seq_num, opus_data),
                 EngineCmd::SetPeerGain { peer_id, gain } => mixer.set_peer_gain(peer_id, gain),
+                EngineCmd::SetStreamGain(gain) => mixer.set_stream_gain(gain),
+                EngineCmd::ClearStreamAudio => mixer.clear_stream_audio(),
+                EngineCmd::SetShareStreamAudio(enabled) => {
+                    if enabled {
+                        stream_loopback =
+                            build_loopback_stream(&host, current_output_dev.as_deref());
+                    } else {
+                        drop(stream_loopback.take());
+                    }
+                }
                 EngineCmd::RemovePeer { peer_id } => mixer.remove_peer(peer_id),
                 EngineCmd::ClearPeers => mixer.clear_peers(),
                 EngineCmd::SetAec(enabled) => aec.set_enabled(enabled),
@@ -505,6 +626,7 @@ fn run_audio_worker(
                     input_device_name,
                     output_device_name,
                 } => {
+                    current_output_dev = output_device_name.clone();
                     // Drop existing streams first so OS backends can re-acquire the device cleanly.
                     drop(streams.take());
                     streams = Some(build_audio_streams(
@@ -512,6 +634,11 @@ fn run_audio_worker(
                         input_device_name.as_deref(),
                         output_device_name.as_deref(),
                     ));
+                    if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
+                        drop(stream_loopback.take());
+                        stream_loopback =
+                            build_loopback_stream(&host, current_output_dev.as_deref());
+                    }
                 }
                 EngineCmd::PlayCue(cue) => mixer.trigger_cue(cue),
                 EngineCmd::Shutdown => return,
@@ -636,6 +763,30 @@ fn run_audio_worker(
                     seq_num: current_dtx_seq,
                 });
                 last_dtx_keepalive = Instant::now();
+            }
+        }
+
+        if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
+            if let Some(ref mut lb) = stream_loopback {
+                while lb.cons.occupied_len() > 0 {
+                    let n = lb.cons.pop_slice(&mut raw_in_buf);
+                    lb.resampler.push_samples(&raw_in_buf[..n]);
+                }
+                while lb.resampler.pop_frame(&mut stream_frame_48k) {
+                    let peak = stream_frame_48k
+                        .iter()
+                        .fold(0.0f32, |m, &x| m.max(x.abs()));
+                    if peak > 1e-5 {
+                        if let Ok(opus_vec) = stream_encoder.encode_speech_frame(&stream_frame_48k) {
+                            let cur_seq = stream_seq_num;
+                            stream_seq_num = stream_seq_num.wrapping_add(1);
+                            let _ = outbound_tx.try_send(OutboundAudioFrame::StreamOpus {
+                                seq_num: cur_seq,
+                                opus_bytes: Bytes::from(opus_vec),
+                            });
+                        }
+                    }
+                }
             }
         }
 

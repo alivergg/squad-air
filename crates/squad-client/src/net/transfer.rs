@@ -243,6 +243,27 @@ impl SwarmChatManager {
         self.data_root = Some(data_root);
     }
 
+    pub fn trim_memory(&mut self) {
+        if let Some(ref root) = self.data_root {
+            for (blob_id, src) in &mut self.local_blobs {
+                if let LocalBlobSource::Memory(bytes) = src {
+                    let path = inline_cache_path(root, blob_id);
+                    if path.is_file() {
+                        *src = LocalBlobSource::Disk {
+                            path,
+                            total_size: bytes.len() as u64,
+                        };
+                    }
+                }
+            }
+        }
+        self.outbound_chunks.shrink_to_fit();
+        self.queued_chunk_keys.shrink_to_fit();
+        self.pending_reliable.shrink_to_fit();
+        self.pending_deliveries.shrink_to_fit();
+        self.seen_messages.shrink_to_fit();
+    }
+
     pub async fn load_room_from_disk(
         &mut self,
         local_uuid: ClientUuid,

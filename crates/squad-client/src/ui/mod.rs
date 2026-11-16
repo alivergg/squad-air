@@ -502,6 +502,11 @@ impl SquadApp {
                                         .set_from_jpeg_option(client_uuid, jpeg_bytes.as_deref());
                                 }
                             }
+                            MeshEvent::StreamCodecFallbackToH264 { reason } => {
+                                self.status_banner = Some(format!(
+                                    "Switched stream to H.264 for viewer compatibility ({reason})"
+                                ));
+                            }
                             MeshEvent::Error(err) => {
                                 self.status_banner = Some(err);
                             }

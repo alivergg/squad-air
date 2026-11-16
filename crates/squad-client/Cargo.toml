@@ -30,3 +30,4 @@ arboard.workspace = true
 image.workspace = true
 rfd.workspace = true
 squad-video = { path = "../squad-video" }
+socket2 = "0.6"

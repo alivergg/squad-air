@@ -5205,6 +5205,7 @@ dependencies = [
  "rand 0.8.8",
  "rfd",
  "serde",
+ "socket2",
  "squad-dsp",
  "squad-proto",
  "squad-video",

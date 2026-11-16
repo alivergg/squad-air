@@ -17,6 +17,8 @@ struct ActiveCueCursor {
 
 pub struct AudioMixer {
     peers: HashMap<PeerId, PeerChannel>,
+    stream_peers: HashMap<PeerId, PeerChannel>,
+    stream_gain: f32,
     cue_bank: SoundCueBank,
     active_cues: Vec<ActiveCueCursor>,
     peer_scratch: [f32; FRAME_SAMPLES],
@@ -26,6 +28,8 @@ impl AudioMixer {
     pub fn new(cue_bank: SoundCueBank) -> Self {
         Self {
             peers: HashMap::with_capacity(10),
+            stream_peers: HashMap::with_capacity(4),
+            stream_gain: 1.0,
             cue_bank,
             active_cues: Vec::with_capacity(4),
             peer_scratch: [0.0; FRAME_SAMPLES],
@@ -40,6 +44,25 @@ impl AudioMixer {
         channel.jitter.push_packet(seq_num, opus_payload);
     }
 
+    pub fn push_stream_opus(&mut self, peer_id: PeerId, seq_num: u64, opus_payload: Vec<u8>) {
+        let channel = self
+            .stream_peers
+            .entry(peer_id)
+            .or_insert_with(|| PeerChannel {
+                jitter: JitterBuffer::new(),
+                gain: 1.0,
+            });
+        channel.jitter.push_packet(seq_num, opus_payload);
+    }
+
+    pub fn set_stream_gain(&mut self, gain: f32) {
+        self.stream_gain = gain.clamp(0.0, 2.0);
+    }
+
+    pub fn clear_stream_audio(&mut self) {
+        self.stream_peers.clear();
+    }
+
     /// Устанавливает индивидуальную громкость участника (`0.0` = 0%, `1.0` = 100%, `2.0` = 200%).
     pub fn set_peer_gain(&mut self, peer_id: PeerId, gain: f32) {
         let clamped = gain.clamp(0.0, 2.0);
@@ -52,10 +75,12 @@ impl AudioMixer {
 
     pub fn remove_peer(&mut self, peer_id: PeerId) {
         self.peers.remove(&peer_id);
+        self.stream_peers.remove(&peer_id);
     }
 
     pub fn clear_peers(&mut self) {
         self.peers.clear();
+        self.stream_peers.clear();
     }
 
     pub fn trigger_cue(&mut self, cue: SoundCue) {
@@ -74,6 +99,16 @@ impl AudioMixer {
                 if g > 0.0001 {
                     for (dst, &src) in out_frame.iter_mut().zip(self.peer_scratch.iter()) {
                         *dst += src * g;
+                    }
+                }
+            }
+        }
+
+        if !deafened && self.stream_gain > 0.0001 {
+            for channel in self.stream_peers.values_mut() {
+                if channel.jitter.pop_pcm_frame(&mut self.peer_scratch) {
+                    for (dst, &src) in out_frame.iter_mut().zip(self.peer_scratch.iter()) {
+                        *dst += src * self.stream_gain;
                     }
                 }
             }
