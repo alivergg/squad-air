@@ -387,17 +387,28 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
         .unwrap_or((SAMPLE_RATE, if is_input { 1 } else { 2 }))
 }
 
+struct InputStreamHalf {
+    stream: Option<cpal::Stream>,
+    cap_cons: <HeapRb<f32> as Split>::Cons,
+    cap_resampler: CaptureResampler,
+    failed: Arc<AtomicBool>,
+    sample_rate: u32,
+    channels: usize,
+}
+
+struct OutputStreamHalf {
+    stream: Option<cpal::Stream>,
+    play_prod: <HeapRb<f32> as Split>::Prod,
+    play_resampler: PlaybackResampler,
+    failed: Arc<AtomicBool>,
+    sample_rate: u32,
+    channels: usize,
+}
+
 fn build_input_stream_half(
     host: &cpal::Host,
     input_device_name: Option<&str>,
-) -> (
-    Option<cpal::Stream>,
-    <HeapRb<f32> as Split>::Cons,
-    CaptureResampler,
-    Arc<AtomicBool>,
-    u32,
-    usize,
-) {
+) -> InputStreamHalf {
     let in_device = select_device(host, input_device_name, true);
     let (in_rate, in_channels) = in_device
         .as_ref()
@@ -446,27 +457,20 @@ fn build_input_stream_half(
         }
     });
 
-    (
+    InputStreamHalf {
         stream,
         cap_cons,
-        CaptureResampler::new(in_rate),
+        cap_resampler: CaptureResampler::new(in_rate),
         failed,
-        in_rate,
-        in_channels,
-    )
+        sample_rate: in_rate,
+        channels: in_channels,
+    }
 }
 
 fn build_output_stream_half(
     host: &cpal::Host,
     output_device_name: Option<&str>,
-) -> (
-    Option<cpal::Stream>,
-    <HeapRb<f32> as Split>::Prod,
-    PlaybackResampler,
-    Arc<AtomicBool>,
-    u32,
-    usize,
-) {
+) -> OutputStreamHalf {
     let out_device = select_device(host, output_device_name, false);
     let (out_rate, out_channels) = out_device
         .as_ref()
@@ -521,14 +525,14 @@ fn build_output_stream_half(
         }
     });
 
-    (
+    OutputStreamHalf {
         stream,
         play_prod,
-        PlaybackResampler::new(out_rate),
+        play_resampler: PlaybackResampler::new(out_rate),
         failed,
-        out_rate,
-        out_channels,
-    )
+        sample_rate: out_rate,
+        channels: out_channels,
+    }
 }
 
 fn build_audio_streams(
@@ -536,25 +540,23 @@ fn build_audio_streams(
     input_device_name: Option<&str>,
     output_device_name: Option<&str>,
 ) -> AudioStreams {
-    let (_input_stream, cap_cons, cap_resampler, input_stream_failed, in_rate, in_channels) =
-        build_input_stream_half(host, input_device_name);
-    let (_output_stream, play_prod, play_resampler, output_stream_failed, out_rate, out_channels) =
-        build_output_stream_half(host, output_device_name);
+    let input = build_input_stream_half(host, input_device_name);
+    let output = build_output_stream_half(host, output_device_name);
 
     info!(
         "Squad-Air DSP worker active (Capture: {} Hz/{}ch, Playback: {} Hz/{}ch)",
-        in_rate, in_channels, out_rate, out_channels
+        input.sample_rate, input.channels, output.sample_rate, output.channels
     );
 
     AudioStreams {
-        _input_stream,
-        _output_stream,
-        cap_cons,
-        play_prod,
-        cap_resampler,
-        play_resampler,
-        input_stream_failed,
-        output_stream_failed,
+        _input_stream: input.stream,
+        _output_stream: output.stream,
+        cap_cons: input.cap_cons,
+        play_prod: output.play_prod,
+        cap_resampler: input.cap_resampler,
+        play_resampler: output.play_resampler,
+        input_stream_failed: input.failed,
+        output_stream_failed: output.failed,
     }
 }
 
@@ -735,40 +737,32 @@ fn run_audio_worker(
             last_hotplug_attempt = Instant::now();
             if need_input {
                 drop(active._input_stream.take());
-                let (in_stream, cap_cons, cap_resampler, input_failed, in_rate, in_channels) =
-                    build_input_stream_half(&host, current_input_dev.as_deref());
-                if in_stream.is_some() {
+                let input = build_input_stream_half(&host, current_input_dev.as_deref());
+                if input.stream.is_some() {
                     info!(
                         "Hot-plug recovered audio input stream ({} Hz/{}ch)",
-                        in_rate, in_channels
+                        input.sample_rate, input.channels
                     );
                 }
-                active._input_stream = in_stream;
-                active.cap_cons = cap_cons;
-                active.cap_resampler = cap_resampler;
-                active.input_stream_failed = input_failed;
+                active._input_stream = input.stream;
+                active.cap_cons = input.cap_cons;
+                active.cap_resampler = input.cap_resampler;
+                active.input_stream_failed = input.failed;
                 silent_capture_ticks = 0;
             }
             if need_output {
                 drop(active._output_stream.take());
-                let (
-                    out_stream,
-                    play_prod,
-                    play_resampler,
-                    output_failed,
-                    out_rate,
-                    out_channels,
-                ) = build_output_stream_half(&host, current_output_dev.as_deref());
-                if out_stream.is_some() {
+                let output = build_output_stream_half(&host, current_output_dev.as_deref());
+                if output.stream.is_some() {
                     info!(
                         "Hot-plug recovered audio output stream ({} Hz/{}ch)",
-                        out_rate, out_channels
+                        output.sample_rate, output.channels
                     );
                 }
-                active._output_stream = out_stream;
-                active.play_prod = play_prod;
-                active.play_resampler = play_resampler;
-                active.output_stream_failed = output_failed;
+                active._output_stream = output.stream;
+                active.play_prod = output.play_prod;
+                active.play_resampler = output.play_resampler;
+                active.output_stream_failed = output.failed;
                 if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
                     drop(stream_loopback.take());
                     stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());

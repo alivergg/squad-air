@@ -32,7 +32,7 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle) {
     };
 
     unsafe {
-        let ns_view = handle.ns_view.as_ptr() as *mut c_void;
+        let ns_view = handle.ns_view.as_ptr();
         if ns_view.is_null() {
             return;
         }
@@ -48,49 +48,34 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle) {
         let send_void_usize: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) =
             transmute(objc_msgSend as *const ());
 
-        let ns_window = send_ptr(ns_view, sel_registerName(b"window\0".as_ptr() as *const c_char));
+        let ns_window = send_ptr(ns_view, sel_registerName(c"window".as_ptr()));
         if ns_window.is_null() {
             return;
         }
 
-        let ns_color_cls = objc_getClass(b"NSColor\0".as_ptr() as *const c_char);
-        let clear_color = send_ptr(
-            ns_color_cls,
-            sel_registerName(b"clearColor\0".as_ptr() as *const c_char),
-        );
+        let ns_color_cls = objc_getClass(c"NSColor".as_ptr());
+        let clear_color = send_ptr(ns_color_cls, sel_registerName(c"clearColor".as_ptr()));
 
-        send_void_bool(
-            ns_window,
-            sel_registerName(b"setOpaque:\0".as_ptr() as *const c_char),
-            false,
-        );
-        send_void_bool(
-            ns_window,
-            sel_registerName(b"setHasShadow:\0".as_ptr() as *const c_char),
-            false,
-        );
+        send_void_bool(ns_window, sel_registerName(c"setOpaque:".as_ptr()), false);
+        send_void_bool(ns_window, sel_registerName(c"setHasShadow:".as_ptr()), false);
         if !clear_color.is_null() {
             send_void_ptr(
                 ns_window,
-                sel_registerName(b"setBackgroundColor:\0".as_ptr() as *const c_char),
+                sel_registerName(c"setBackgroundColor:".as_ptr()),
                 clear_color,
             );
         }
         send_void_bool(
             ns_window,
-            sel_registerName(b"setIgnoresMouseEvents:\0".as_ptr() as *const c_char),
+            sel_registerName(c"setIgnoresMouseEvents:".as_ptr()),
             true,
         );
         // NSStatusWindowLevel = 25 floats cleanly above standard and auxiliary fullscreen spaces.
-        send_void_isize(
-            ns_window,
-            sel_registerName(b"setLevel:\0".as_ptr() as *const c_char),
-            25,
-        );
+        send_void_isize(ns_window, sel_registerName(c"setLevel:".as_ptr()), 25);
         // NSWindowCollectionBehaviorCanJoinAllSpaces | NSWindowCollectionBehaviorFullScreenAuxiliary.
         send_void_usize(
             ns_window,
-            sel_registerName(b"setCollectionBehavior:\0".as_ptr() as *const c_char),
+            sel_registerName(c"setCollectionBehavior:".as_ptr()),
             (1 << 0) | (1 << 8),
         );
     }

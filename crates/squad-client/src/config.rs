@@ -193,6 +193,18 @@ fn default_overlay_opacity() -> f32 {
     0.82
 }
 
+fn uuid_key(client_uuid: &ClientUuid) -> String {
+    Uuid::from_bytes(*client_uuid).to_string()
+}
+
+fn generate_default_nickname() -> String {
+    let mut rng = rand::thread_rng();
+    let adj = ADJECTIVES[rng.gen_range(0..ADJECTIVES.len())];
+    let animal = ANIMALS[rng.gen_range(0..ANIMALS.len())];
+    let digits = rng.gen_range(100..1000);
+    format!("{adj}{animal}-{digits}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -214,16 +226,4 @@ mod tests {
         assert!(decoded.overlay_speaking_only);
         assert!((decoded.overlay_opacity - 0.65).abs() < 1e-4);
     }
-}
-
-fn uuid_key(client_uuid: &ClientUuid) -> String {
-    Uuid::from_bytes(*client_uuid).to_string()
-}
-
-fn generate_default_nickname() -> String {
-    let mut rng = rand::thread_rng();
-    let adj = ADJECTIVES[rng.gen_range(0..ADJECTIVES.len())];
-    let animal = ANIMALS[rng.gen_range(0..ANIMALS.len())];
-    let digits = rng.gen_range(100..1000);
-    format!("{adj}{animal}-{digits}")
 }
