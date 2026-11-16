@@ -51,7 +51,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
 
     let user_footer = container(
         row![
-            avatar_circle(&app.config.nickname, false),
+            avatar_circle(app.avatars.handle_for(&app.config.client_uuid()), 42.0, false),
             column![
                 text(&app.config.nickname).size(13),
                 text("Online • 10ms Opus").size(11).color(M3_SUCCESS),

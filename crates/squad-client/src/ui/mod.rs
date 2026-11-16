@@ -1,21 +1,29 @@
+pub mod avatar;
 pub mod chat;
 pub mod components;
 pub mod lobby;
 pub mod room;
 pub mod settings;
+pub mod share_modal;
+pub mod stream_view;
 pub mod theme;
 
 use crate::config::AppConfig;
 use crate::hotkeys::{request_macos_permissions, HotkeyController};
 use crate::net::{
-    downloads_root_dir, spawn_mesh_worker, ChatContentUi, ChatItemUi, MeshCommand, MeshEvent,
-    PeerUiSnapshot,
+    downloads_root_dir, spawn_mesh_worker, ChatContentUi, ChatItemUi, DecodedVideoFrame,
+    MeshCommand, MeshEvent, PeerUiSnapshot,
 };
 use crate::tray::{SystemTray, TrayAction};
+use crate::ui::avatar::{
+    hash_to_hex, hex_to_hash, load_cached_avatar_jpeg, process_custom_avatar_image,
+    save_cached_avatar_jpeg, AvatarCache,
+};
+use crate::ui::share_modal::ShareSourceTab;
 use crate::ui::theme::{material_dark_theme, root_container_style};
 use iced::{
     clipboard, event, keyboard, time,
-    widget::{container, image as iced_image},
+    widget::{container, image as iced_image, stack},
     Element, Length, Subscription, Task, Theme,
 };
 use image::imageops::FilterType;
@@ -24,6 +32,10 @@ use squad_dsp::{
     MicActivationMode, NoiseSuppressionMode, SoundCue,
 };
 use squad_proto::{ClientUuid, InviteLink, PeerId, INLINE_IMAGE_MAX_BYTES};
+use squad_video::{
+    detect_hardware_encoder_backend, enumerate_capture_targets, request_screen_capture_permission,
+    CaptureTarget, StreamConfig, StreamFps, StreamResolution,
+};
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -62,6 +74,7 @@ pub enum Message {
     SetAecEnabled(bool),
     SetNsMode(NoiseSuppressionMode),
     InputGainChanged(f32),
+    VadThresholdChanged(f32),
     NicknameChanged(String),
     RendezvousServerChanged(String),
     HotkeyPtmChanged(String),
@@ -89,6 +102,22 @@ pub enum Message {
         client_uuid: ClientUuid,
         gain: f32,
     },
+    OpenShareModal,
+    CloseShareModal,
+    SelectShareTab(ShareSourceTab),
+    RefreshCaptureTargets,
+    SelectCaptureTarget(usize),
+    SetShareResolution(StreamResolution),
+    SetShareFps(StreamFps),
+    SetShareBitrate(u32),
+    StartScreenShare,
+    StopScreenShare,
+    WatchPeerStream(PeerId),
+    StopWatchingStream,
+    ToggleStreamExpanded,
+    PickAvatarImage,
+    AvatarImagePicked(Option<PathBuf>),
+    ResetAvatarIdenticon,
 }
 
 pub struct SquadApp {
@@ -100,6 +129,7 @@ pub struct SquadApp {
     pub mesh_rx: Arc<Mutex<mpsc::Receiver<MeshEvent>>>,
     pub hotkeys: HotkeyController,
     pub tray: SystemTray,
+    pub avatars: AvatarCache,
     pub invite_input: String,
     pub save_channel_name_input: String,
     pub active_invite_uri: String,
@@ -112,6 +142,20 @@ pub struct SquadApp {
     pub invite_copied_flash: bool,
     pub input_devices: Vec<String>,
     pub output_devices: Vec<String>,
+    pub video_frame_slot: Arc<Mutex<Option<DecodedVideoFrame>>>,
+    pub share_modal_open: bool,
+    pub share_tab: ShareSourceTab,
+    pub capture_targets: Vec<CaptureTarget>,
+    pub selected_capture_target_idx: usize,
+    pub share_resolution: StreamResolution,
+    pub share_fps: StreamFps,
+    pub share_bitrate_bps: u32,
+    pub local_encoder_backend: String,
+    pub is_local_sharing: bool,
+    pub local_stream_subscribers: usize,
+    pub watched_peer_id: Option<PeerId>,
+    pub active_stream_frame: Option<iced_image::Handle>,
+    pub stream_expanded: bool,
 }
 
 impl SquadApp {
@@ -126,22 +170,43 @@ impl SquadApp {
             ns_mode: config.ns_mode,
             activation_mode: config.activation_mode,
             input_gain: config.input_gain,
+            vad_threshold_db: config.vad_threshold_db,
             bitrate_bps: 40_000,
         };
 
         let audio = AudioEngineHandle::start(engine_cfg, audio_out_tx)
             .expect("Failed to initialize Squad-Air DSP audio engine");
 
-        let (mesh_tx, mesh_rx) = spawn_mesh_worker(audio.clone(), audio_out_rx);
+        let video_frame_slot = Arc::new(Mutex::new(None));
+        let (mesh_tx, mesh_rx) =
+            spawn_mesh_worker(audio.clone(), audio_out_rx, Arc::clone(&video_frame_slot));
         let hotkeys = HotkeyController::new(
             &config.hotkey_toggle_mute,
             &config.hotkey_ptt,
             &config.hotkey_ptm,
         );
         let tray = SystemTray::new();
+        let mut config_mut = config;
+        let avatars = AvatarCache::new();
+        if let Some(ref hex_hash) = config_mut.custom_avatar_hash {
+            if let Some(hash) = hex_to_hash(hex_hash) {
+                if let Some(jpeg) = load_cached_avatar_jpeg(&hash) {
+                    avatars.set_from_jpeg_option(config_mut.client_uuid, Some(&jpeg));
+                    let _ = mesh_tx.try_send(MeshCommand::SetLocalAvatar {
+                        avatar: Some((hash, jpeg)),
+                    });
+                } else {
+                    config_mut.custom_avatar_hash = None;
+                    let _ = config_mut.save();
+                }
+            } else {
+                config_mut.custom_avatar_hash = None;
+                let _ = config_mut.save();
+            }
+        }
 
         let app = Self {
-            config,
+            config: config_mut,
             screen: Screen::Lobby,
             previous_screen: Screen::Lobby,
             audio,
@@ -149,6 +214,7 @@ impl SquadApp {
             mesh_rx: Arc::new(Mutex::new(mesh_rx)),
             hotkeys,
             tray,
+            avatars,
             invite_input: String::new(),
             save_channel_name_input: String::new(),
             active_invite_uri: String::new(),
@@ -161,6 +227,20 @@ impl SquadApp {
             invite_copied_flash: false,
             input_devices: list_input_devices(),
             output_devices: list_output_devices(),
+            video_frame_slot,
+            share_modal_open: false,
+            share_tab: ShareSourceTab::Monitors,
+            capture_targets: Vec::new(),
+            selected_capture_target_idx: 0,
+            share_resolution: StreamResolution::R1080p,
+            share_fps: StreamFps::Fps60,
+            share_bitrate_bps: 6_000_000,
+            local_encoder_backend: detect_hardware_encoder_backend(),
+            is_local_sharing: false,
+            local_stream_subscribers: 0,
+            watched_peer_id: None,
+            active_stream_frame: None,
+            stream_expanded: false,
         };
 
         (app, Task::none())
@@ -231,6 +311,15 @@ impl SquadApp {
                                 self.image_handles.clear();
                                 self.chat_input.clear();
                                 self.local_peer_id = 0;
+                                self.share_modal_open = false;
+                                self.is_local_sharing = false;
+                                self.local_stream_subscribers = 0;
+                                self.watched_peer_id = None;
+                                self.active_stream_frame = None;
+                                self.stream_expanded = false;
+                                if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                                    *slot = None;
+                                }
                                 self.screen = Screen::Lobby;
                             }
                             MeshEvent::PeersUpdated(snapshots) => {
@@ -288,8 +377,48 @@ impl SquadApp {
                                     }
                                 }
                             }
+                            MeshEvent::RemoteStreamUpdated { peer_id, stream } => {
+                                if let Some(peer) =
+                                    self.peers.iter_mut().find(|p| p.peer_id == peer_id)
+                                {
+                                    peer.stream_info = stream.clone();
+                                }
+                                if stream.is_none() && self.watched_peer_id == Some(peer_id) {
+                                    self.watched_peer_id = None;
+                                    self.active_stream_frame = None;
+                                    self.stream_expanded = false;
+                                }
+                            }
+                            MeshEvent::LocalStreamStatus {
+                                is_sharing,
+                                subscriber_count,
+                            } => {
+                                self.is_local_sharing = is_sharing;
+                                self.local_stream_subscribers = subscriber_count;
+                            }
+                            MeshEvent::PeerAvatarLoaded {
+                                client_uuid,
+                                jpeg_bytes,
+                                ..
+                            } => {
+                                self.avatars
+                                    .set_from_jpeg_option(client_uuid, jpeg_bytes.as_deref());
+                            }
                             MeshEvent::Error(err) => {
                                 self.status_banner = Some(err);
+                            }
+                        }
+                    }
+                }
+                if self.watched_peer_id.is_some() {
+                    if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                        if let Some(frame) = slot.take() {
+                            if Some(frame.streamer_peer_id) == self.watched_peer_id {
+                                self.active_stream_frame = Some(iced_image::Handle::from_rgba(
+                                    frame.width,
+                                    frame.height,
+                                    frame.rgba,
+                                ));
                             }
                         }
                     }
@@ -322,6 +451,15 @@ impl SquadApp {
                 self.chat_messages.clear();
                 self.image_handles.clear();
                 self.chat_input.clear();
+                self.share_modal_open = false;
+                self.is_local_sharing = false;
+                self.local_stream_subscribers = 0;
+                self.watched_peer_id = None;
+                self.active_stream_frame = None;
+                self.stream_expanded = false;
+                if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                    *slot = None;
+                }
                 self.screen = Screen::Lobby;
                 Task::none()
             }
@@ -382,6 +520,12 @@ impl SquadApp {
             Message::InputGainChanged(gain) => {
                 self.config.input_gain = gain;
                 self.audio.set_input_gain(gain);
+                Task::none()
+            }
+            Message::VadThresholdChanged(threshold_db) => {
+                self.config.vad_threshold_db = threshold_db;
+                self.audio.set_vad_threshold_db(threshold_db);
+                let _ = self.config.save();
                 Task::none()
             }
             Message::NicknameChanged(nick) => {
@@ -553,6 +697,138 @@ impl SquadApp {
                 self.config.set_peer_volume(&client_uuid, gain);
                 Task::none()
             }
+            Message::OpenShareModal => {
+                request_screen_capture_permission();
+                self.capture_targets = enumerate_capture_targets();
+                self.select_first_target_for_tab();
+                self.share_modal_open = true;
+                Task::none()
+            }
+            Message::CloseShareModal => {
+                self.share_modal_open = false;
+                Task::none()
+            }
+            Message::SelectShareTab(tab) => {
+                self.share_tab = tab;
+                self.select_first_target_for_tab();
+                Task::none()
+            }
+            Message::RefreshCaptureTargets => {
+                self.capture_targets = enumerate_capture_targets();
+                self.select_first_target_for_tab();
+                Task::none()
+            }
+            Message::SelectCaptureTarget(idx) => {
+                if idx < self.capture_targets.len() {
+                    self.selected_capture_target_idx = idx;
+                }
+                Task::none()
+            }
+            Message::SetShareResolution(res) => {
+                self.share_resolution = res;
+                Task::none()
+            }
+            Message::SetShareFps(fps) => {
+                self.share_fps = fps;
+                Task::none()
+            }
+            Message::SetShareBitrate(bps) => {
+                self.share_bitrate_bps = bps;
+                Task::none()
+            }
+            Message::StartScreenShare => {
+                if let Some(target) = self
+                    .capture_targets
+                    .get(self.selected_capture_target_idx)
+                    .cloned()
+                {
+                    let config = StreamConfig {
+                        target,
+                        resolution: self.share_resolution,
+                        fps: self.share_fps,
+                        bitrate_bps: self.share_bitrate_bps,
+                    };
+                    let _ = self.mesh_tx.try_send(MeshCommand::StartScreenShare { config });
+                    self.is_local_sharing = true;
+                    self.share_modal_open = false;
+                }
+                Task::none()
+            }
+            Message::StopScreenShare => {
+                let _ = self.mesh_tx.try_send(MeshCommand::StopScreenShare);
+                self.is_local_sharing = false;
+                self.local_stream_subscribers = 0;
+                Task::none()
+            }
+            Message::WatchPeerStream(peer_id) => {
+                self.watched_peer_id = Some(peer_id);
+                self.active_stream_frame = None;
+                self.stream_expanded = false;
+                if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                    *slot = None;
+                }
+                let _ = self
+                    .mesh_tx
+                    .try_send(MeshCommand::WatchPeerStream { peer_id: Some(peer_id) });
+                Task::none()
+            }
+            Message::StopWatchingStream => {
+                self.watched_peer_id = None;
+                self.active_stream_frame = None;
+                self.stream_expanded = false;
+                if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                    *slot = None;
+                }
+                let _ = self
+                    .mesh_tx
+                    .try_send(MeshCommand::WatchPeerStream { peer_id: None });
+                Task::none()
+            }
+            Message::ToggleStreamExpanded => {
+                self.stream_expanded = !self.stream_expanded;
+                Task::none()
+            }
+            Message::PickAvatarImage => Task::perform(
+                async {
+                    rfd::AsyncFileDialog::new()
+                        .add_filter("Images", &["png", "jpg", "jpeg", "webp"])
+                        .pick_file()
+                        .await
+                        .map(|h| h.path().to_path_buf())
+                },
+                Message::AvatarImagePicked,
+            ),
+            Message::AvatarImagePicked(Some(path)) => {
+                match std::fs::read(&path)
+                    .map_err(|e| format!("Failed to read image: {e}"))
+                    .and_then(|bytes| process_custom_avatar_image(&bytes))
+                {
+                    Ok((jpeg, hash, rgba)) => {
+                        let _ = save_cached_avatar_jpeg(&hash, &jpeg);
+                        self.avatars.set_custom_rgba(self.config.client_uuid, rgba);
+                        self.config.custom_avatar_hash = Some(hash_to_hex(&hash));
+                        let _ = self.config.save();
+                        self.status_banner = None;
+                        let _ = self.mesh_tx.try_send(MeshCommand::SetLocalAvatar {
+                            avatar: Some((hash, jpeg)),
+                        });
+                    }
+                    Err(err) => {
+                        self.status_banner = Some(err);
+                    }
+                }
+                Task::none()
+            }
+            Message::AvatarImagePicked(None) => Task::none(),
+            Message::ResetAvatarIdenticon => {
+                self.avatars.reset_to_identicon(self.config.client_uuid);
+                self.config.custom_avatar_hash = None;
+                let _ = self.config.save();
+                let _ = self
+                    .mesh_tx
+                    .try_send(MeshCommand::SetLocalAvatar { avatar: None });
+                Task::none()
+            }
         }
     }
 
@@ -563,11 +839,37 @@ impl SquadApp {
             Screen::Settings => settings::view_settings(self),
         };
 
-        container(content)
+        let base = container(content)
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(root_container_style)
-            .into()
+            .style(root_container_style);
+
+        if self.share_modal_open {
+            stack![base, share_modal::view_share_modal(self)].into()
+        } else {
+            base.into()
+        }
+    }
+
+    fn select_first_target_for_tab(&mut self) {
+        let current_matches = self
+            .capture_targets
+            .get(self.selected_capture_target_idx)
+            .map(|t| match self.share_tab {
+                ShareSourceTab::Monitors => t.is_monitor(),
+                ShareSourceTab::Windows => !t.is_monitor(),
+            })
+            .unwrap_or(false);
+        if !current_matches {
+            if let Some((idx, _)) = self.capture_targets.iter().enumerate().find(|(_, t)| {
+                match self.share_tab {
+                    ShareSourceTab::Monitors => t.is_monitor(),
+                    ShareSourceTab::Windows => !t.is_monitor(),
+                }
+            }) {
+                self.selected_capture_target_idx = idx;
+            }
+        }
     }
 
     fn try_join_uri(&mut self, uri: &str) {

@@ -1,5 +1,6 @@
 use crate::net::{BlobTransferState, ChatContentUi, ChatItemUi};
 use crate::ui::{
+    components::avatar_circle,
     theme::{
         attachment_card_style, canvas_panel_style, chat_bubble_style, m3_text_input_style,
         pill_danger_button, pill_primary_button, pill_success_button, pill_tonal_button,
@@ -105,12 +106,14 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
     };
 
     let meta_row = row![
+        avatar_circle(app.avatars.handle_for(&item.sender_uuid), 24.0, false),
         text(author_label).size(12).color(author_color),
         horizontal_space(),
         text(format_utc_hhmm(item.timestamp_ms))
             .size(11)
             .color(M3_ON_SURFACE_VARIANT),
     ]
+    .spacing(6)
     .align_y(Vertical::Center);
 
     let body: Element<'a, Message> = match &item.content {

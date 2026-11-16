@@ -1,5 +1,6 @@
 use squad_proto::{
-    P2pHeader, P2pPayload, PeerId, RoomCipher, BLOB_CHUNK_SIZE, INLINE_IMAGE_MAX_BYTES,
+    ClientUuid, P2pHeader, P2pPayload, PeerId, RoomCipher, BLOB_CHUNK_SIZE,
+    INLINE_IMAGE_MAX_BYTES,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -19,6 +20,10 @@ const WINDOW_RETRY_COOLDOWN: Duration = Duration::from_millis(160);
 const QOS_MAX_CHUNKS_PER_TICK: usize = 15;
 const MAX_OUTBOUND_CHUNK_QUEUE: usize = 4096;
 const MAX_DOWNLOAD_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB safety cap
+const MAX_AVATAR_BYTES: usize = 64 * 1024;
+const BLOB_KIND_INLINE_IMAGE: u8 = 1;
+const BLOB_KIND_FILE: u8 = 2;
+const BLOB_KIND_AVATAR: u8 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobTransferState {
@@ -53,6 +58,8 @@ pub enum ChatContentUi {
 
 #[derive(Debug, Clone)]
 pub struct ChatItemUi {
+    pub msg_id: u64,
+    pub sender_uuid: ClientUuid,
     pub sender_nickname: String,
     pub timestamp_ms: u64,
     pub is_self: bool,
@@ -67,11 +74,17 @@ pub enum TransferEvent {
         state: BlobTransferState,
         inline_bytes: Option<Vec<u8>>,
     },
+    PeerAvatarLoaded {
+        client_uuid: ClientUuid,
+        avatar_hash: [u8; 32],
+        jpeg_bytes: Option<Vec<u8>>,
+    },
     Error(String),
 }
 
 pub struct TransferCtx<'a> {
     pub local_peer_id: PeerId,
+    pub local_uuid: ClientUuid,
     pub local_nickname: &'a str,
     pub socket: &'a UdpSocket,
     pub cipher: &'a RoomCipher,
@@ -116,6 +129,8 @@ enum HistoryPayload {
 
 #[derive(Debug, Clone)]
 struct HistoryEntry {
+    sender_uuid: ClientUuid,
+    sender_nickname: String,
     msg_id: u64,
     timestamp_ms: u64,
     payload: HistoryPayload,
@@ -165,13 +180,15 @@ struct TrackedBlob {
 pub struct SwarmChatManager {
     local_msg_counter: u64,
     history: VecDeque<HistoryEntry>,
-    seen_messages: HashSet<(PeerId, u64)>,
+    seen_messages: HashSet<(ClientUuid, u64)>,
     pending_reliable: Vec<PendingReliable>,
     local_blobs: HashMap<[u8; 16], LocalBlobSource>,
     remote_blobs: HashMap<[u8; 16], TrackedBlob>,
     outbound_chunks: VecDeque<(PeerId, [u8; 16], u32)>,
     queued_chunk_keys: HashSet<(PeerId, [u8; 16], u32)>,
     last_swarm_tick: Instant,
+    local_avatar: Option<([u8; 32], Vec<u8>)>,
+    avatar_targets: HashMap<[u8; 16], (ClientUuid, [u8; 32])>,
 }
 
 impl SwarmChatManager {
@@ -186,6 +203,56 @@ impl SwarmChatManager {
             outbound_chunks: VecDeque::new(),
             queued_chunk_keys: HashSet::new(),
             last_swarm_tick: Instant::now(),
+            local_avatar: None,
+            avatar_targets: HashMap::new(),
+        }
+    }
+
+    pub fn set_initial_local_avatar(&mut self, avatar: Option<([u8; 32], Vec<u8>)>) {
+        if let Some((hash, ref bytes)) = avatar {
+            self.local_blobs
+                .insert(avatar_blob_id(&hash), LocalBlobSource::Memory(bytes.clone()));
+        }
+        self.local_avatar = avatar;
+    }
+
+    pub async fn set_local_avatar(
+        &mut self,
+        avatar: Option<([u8; 32], Vec<u8>)>,
+        connected_peers: &[(PeerId, SocketAddr)],
+        ctx: &mut TransferCtx<'_>,
+    ) {
+        self.set_initial_local_avatar(avatar);
+        let pkt = self.build_avatar_announce_payload();
+        for &(_, addr) in connected_peers {
+            ctx.send_p2p(addr, &pkt).await;
+        }
+    }
+
+    pub async fn announce_avatar_to_peer(
+        &self,
+        peer_addr: SocketAddr,
+        ctx: &mut TransferCtx<'_>,
+    ) {
+        if self.local_avatar.is_some() {
+            let pkt = self.build_avatar_announce_payload();
+            ctx.send_p2p(peer_addr, &pkt).await;
+        }
+    }
+
+    fn build_avatar_announce_payload(&self) -> P2pPayload {
+        if let Some((hash, ref bytes)) = self.local_avatar {
+            P2pPayload::AvatarAnnounce {
+                avatar_hash: hash,
+                total_size: bytes.len() as u32,
+                total_chunks: bytes.len().div_ceil(BLOB_CHUNK_SIZE) as u16,
+            }
+        } else {
+            P2pPayload::AvatarAnnounce {
+                avatar_hash: [0u8; 32],
+                total_size: 0,
+                total_chunks: 0,
+            }
         }
     }
 
@@ -216,8 +283,10 @@ impl SwarmChatManager {
         let timestamp_ms = now_millis();
         let text_owned = trimmed.to_string();
 
-        self.seen_messages.insert((ctx.local_peer_id, msg_id));
+        self.seen_messages.insert((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
+            sender_uuid: ctx.local_uuid,
+            sender_nickname: ctx.local_nickname.to_string(),
             msg_id,
             timestamp_ms,
             payload: HistoryPayload::Text(text_owned.clone()),
@@ -226,6 +295,8 @@ impl SwarmChatManager {
         let _ = ctx
             .evt_tx
             .send(TransferEvent::ChatItemReceived(ChatItemUi {
+                msg_id,
+                sender_uuid: ctx.local_uuid,
                 sender_nickname: ctx.local_nickname.to_string(),
                 timestamp_ms,
                 is_self: true,
@@ -234,6 +305,8 @@ impl SwarmChatManager {
             .await;
 
         let payload = P2pPayload::ChatText {
+            sender_uuid: ctx.local_uuid,
+            sender_nickname: ctx.local_nickname.to_string(),
             msg_id,
             timestamp_ms,
             text: text_owned,
@@ -269,8 +342,10 @@ impl SwarmChatManager {
 
         self.local_blobs
             .insert(blob_id, LocalBlobSource::Memory(bytes.clone()));
-        self.seen_messages.insert((ctx.local_peer_id, msg_id));
+        self.seen_messages.insert((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
+            sender_uuid: ctx.local_uuid,
+            sender_nickname: ctx.local_nickname.to_string(),
             msg_id,
             timestamp_ms,
             payload: HistoryPayload::BlobOffer {
@@ -288,6 +363,8 @@ impl SwarmChatManager {
         let _ = ctx
             .evt_tx
             .send(TransferEvent::ChatItemReceived(ChatItemUi {
+                msg_id,
+                sender_uuid: ctx.local_uuid,
                 sender_nickname: ctx.local_nickname.to_string(),
                 timestamp_ms,
                 is_self: true,
@@ -302,6 +379,8 @@ impl SwarmChatManager {
             .await;
 
         let offer = P2pPayload::BlobOffer {
+            sender_uuid: ctx.local_uuid,
+            sender_nickname: ctx.local_nickname.to_string(),
             blob_id,
             msg_id,
             timestamp_ms,
@@ -374,8 +453,10 @@ impl SwarmChatManager {
                 total_size,
             },
         );
-        self.seen_messages.insert((ctx.local_peer_id, msg_id));
+        self.seen_messages.insert((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
+            sender_uuid: ctx.local_uuid,
+            sender_nickname: ctx.local_nickname.to_string(),
             msg_id,
             timestamp_ms,
             payload: HistoryPayload::BlobOffer {
@@ -393,6 +474,8 @@ impl SwarmChatManager {
         let _ = ctx
             .evt_tx
             .send(TransferEvent::ChatItemReceived(ChatItemUi {
+                msg_id,
+                sender_uuid: ctx.local_uuid,
                 sender_nickname: ctx.local_nickname.to_string(),
                 timestamp_ms,
                 is_self: true,
@@ -408,6 +491,8 @@ impl SwarmChatManager {
             .await;
 
         let offer = P2pPayload::BlobOffer {
+            sender_uuid: ctx.local_uuid,
+            sender_nickname: ctx.local_nickname.to_string(),
             blob_id,
             msg_id,
             timestamp_ms,
@@ -485,6 +570,7 @@ impl SwarmChatManager {
     pub async fn handle_payload(
         &mut self,
         sender_peer_id: PeerId,
+        sender_uuid: ClientUuid,
         sender_nickname: &str,
         sender_addr: SocketAddr,
         payload: P2pPayload,
@@ -493,6 +579,8 @@ impl SwarmChatManager {
     ) {
         match payload {
             P2pPayload::ChatText {
+                sender_uuid,
+                sender_nickname: pkt_nick,
                 msg_id,
                 timestamp_ms,
                 text,
@@ -500,11 +588,19 @@ impl SwarmChatManager {
                 ctx.send_p2p(sender_addr, &P2pPayload::ChatAck { msg_id })
                     .await;
 
-                if !self.seen_messages.insert((sender_peer_id, msg_id)) {
+                if !self.seen_messages.insert((sender_uuid, msg_id)) {
                     return;
                 }
 
+                let display_nick = if pkt_nick.trim().is_empty() {
+                    sender_nickname.to_string()
+                } else {
+                    pkt_nick
+                };
+
                 self.push_history(HistoryEntry {
+                    sender_uuid,
+                    sender_nickname: display_nick.clone(),
                     msg_id,
                     timestamp_ms,
                     payload: HistoryPayload::Text(text.clone()),
@@ -513,9 +609,11 @@ impl SwarmChatManager {
                 let _ = ctx
                     .evt_tx
                     .send(TransferEvent::ChatItemReceived(ChatItemUi {
-                        sender_nickname: sender_nickname.to_string(),
+                        msg_id,
+                        sender_uuid,
+                        sender_nickname: display_nick,
                         timestamp_ms,
-                        is_self: false,
+                        is_self: sender_uuid == ctx.local_uuid,
                         content: ChatContentUi::Text(text),
                     }))
                     .await;
@@ -530,6 +628,8 @@ impl SwarmChatManager {
                 for (idx, entry) in entries.into_iter().enumerate() {
                     let pkt = match entry.payload {
                         HistoryPayload::Text(text) => P2pPayload::ChatText {
+                            sender_uuid: entry.sender_uuid,
+                            sender_nickname: entry.sender_nickname,
                             msg_id: entry.msg_id,
                             timestamp_ms: entry.timestamp_ms,
                             text,
@@ -544,6 +644,8 @@ impl SwarmChatManager {
                             total_chunks,
                             blake3_root,
                         } => P2pPayload::BlobOffer {
+                            sender_uuid: entry.sender_uuid,
+                            sender_nickname: entry.sender_nickname,
                             blob_id,
                             msg_id: entry.msg_id,
                             timestamp_ms: entry.timestamp_ms,
@@ -568,6 +670,8 @@ impl SwarmChatManager {
                 self.announce_haves_to_peer(sender_addr, ctx).await;
             }
             P2pPayload::BlobOffer {
+                sender_uuid,
+                sender_nickname: pkt_nick,
                 blob_id,
                 msg_id,
                 timestamp_ms,
@@ -598,9 +702,15 @@ impl SwarmChatManager {
                     blob.seeders.insert(sender_peer_id);
                 }
 
-                if !self.seen_messages.insert((sender_peer_id, msg_id)) {
+                if !self.seen_messages.insert((sender_uuid, msg_id)) {
                     return;
                 }
+
+                let display_nick = if pkt_nick.trim().is_empty() {
+                    sender_nickname.to_string()
+                } else {
+                    pkt_nick
+                };
 
                 let meta = BlobMetadata {
                     blob_id,
@@ -612,6 +722,8 @@ impl SwarmChatManager {
                 };
 
                 self.push_history(HistoryEntry {
+                    sender_uuid,
+                    sender_nickname: display_nick.clone(),
                     msg_id,
                     timestamp_ms,
                     payload: HistoryPayload::BlobOffer {
@@ -674,12 +786,73 @@ impl SwarmChatManager {
                 let _ = ctx
                     .evt_tx
                     .send(TransferEvent::ChatItemReceived(ChatItemUi {
-                        sender_nickname: sender_nickname.to_string(),
+                        msg_id,
+                        sender_uuid,
+                        sender_nickname: display_nick,
                         timestamp_ms,
-                        is_self: false,
+                        is_self: sender_uuid == ctx.local_uuid,
                         content,
                     }))
                     .await;
+            }
+            P2pPayload::AvatarAnnounce {
+                avatar_hash,
+                total_size,
+                total_chunks,
+            } => {
+                if avatar_hash == [0u8; 32] {
+                    let _ = ctx
+                        .evt_tx
+                        .send(TransferEvent::PeerAvatarLoaded {
+                            client_uuid: sender_uuid,
+                            avatar_hash,
+                            jpeg_bytes: None,
+                        })
+                        .await;
+                    return;
+                }
+                if total_size == 0
+                    || (total_size as usize) > MAX_AVATAR_BYTES
+                    || total_chunks == 0
+                    || (total_chunks as u64) != (total_size as u64).div_ceil(BLOB_CHUNK_SIZE as u64)
+                {
+                    return;
+                }
+                if let Some(cached) = crate::ui::avatar::load_cached_avatar_jpeg(&avatar_hash) {
+                    let _ = ctx
+                        .evt_tx
+                        .send(TransferEvent::PeerAvatarLoaded {
+                            client_uuid: sender_uuid,
+                            avatar_hash,
+                            jpeg_bytes: Some(cached),
+                        })
+                        .await;
+                    return;
+                }
+                let blob_id = avatar_blob_id(&avatar_hash);
+                let meta = BlobMetadata {
+                    blob_id,
+                    kind: BLOB_KIND_AVATAR,
+                    filename: "avatar.jpg".to_string(),
+                    total_size: total_size as u64,
+                    total_chunks: total_chunks as u32,
+                    blake3_root: avatar_hash,
+                };
+                if let Ok(dl) = init_download(&meta) {
+                    let mut seeders = HashSet::new();
+                    seeders.insert(sender_peer_id);
+                    self.remote_blobs.insert(
+                        blob_id,
+                        TrackedBlob {
+                            meta,
+                            seeders,
+                            seeder_rr_cursor: 0,
+                            download: Some(dl),
+                            completed: false,
+                        },
+                    );
+                    self.avatar_targets.insert(blob_id, (sender_uuid, avatar_hash));
+                }
             }
             P2pPayload::BlobChunkReq {
                 blob_id,
@@ -775,29 +948,49 @@ impl SwarmChatManager {
             if let Some(mem) = dl_done.in_memory {
                 if *blake3::hash(&mem).as_bytes() == meta.blake3_root {
                     blob.completed = true;
-                    self.local_blobs
-                        .insert(blob_id, LocalBlobSource::Memory(mem.clone()));
-                    info!("Swarm inline image verified: {}", meta.filename);
-                    let _ = ctx
-                        .evt_tx
-                        .send(TransferEvent::BlobStateChanged {
-                            blob_id,
-                            state: BlobTransferState::Completed { saved_path: None },
-                            inline_bytes: Some(mem),
-                        })
-                        .await;
-                    self.broadcast_have(blob_id, connected_peers, ctx).await;
+                    if meta.kind == BLOB_KIND_AVATAR {
+                        let _ = crate::ui::avatar::save_cached_avatar_jpeg(&meta.blake3_root, &mem);
+                        let (target_uuid, full_hash) = self
+                            .avatar_targets
+                            .remove(&blob_id)
+                            .unwrap_or(([0u8; 16], meta.blake3_root));
+                        let _ = ctx
+                            .evt_tx
+                            .send(TransferEvent::PeerAvatarLoaded {
+                                client_uuid: target_uuid,
+                                avatar_hash: full_hash,
+                                jpeg_bytes: Some(mem),
+                            })
+                            .await;
+                    } else {
+                        self.local_blobs
+                            .insert(blob_id, LocalBlobSource::Memory(mem.clone()));
+                        info!("Swarm inline image verified: {}", meta.filename);
+                        let _ = ctx
+                            .evt_tx
+                            .send(TransferEvent::BlobStateChanged {
+                                blob_id,
+                                state: BlobTransferState::Completed { saved_path: None },
+                                inline_bytes: Some(mem),
+                            })
+                            .await;
+                        self.broadcast_have(blob_id, connected_peers, ctx).await;
+                    }
                 } else {
-                    let _ = ctx
-                        .evt_tx
-                        .send(TransferEvent::BlobStateChanged {
-                            blob_id,
-                            state: BlobTransferState::Failed(
-                                "BLAKE3 integrity check failed".to_string(),
-                            ),
-                            inline_bytes: None,
-                        })
-                        .await;
+                    if meta.kind == BLOB_KIND_AVATAR {
+                        self.avatar_targets.remove(&blob_id);
+                    } else {
+                        let _ = ctx
+                            .evt_tx
+                            .send(TransferEvent::BlobStateChanged {
+                                blob_id,
+                                state: BlobTransferState::Failed(
+                                    "BLAKE3 integrity check failed".to_string(),
+                                ),
+                                inline_bytes: None,
+                            })
+                            .await;
+                    }
                 }
             } else if let Some(part_path) = dl_done.part_path {
                 drop(dl_done.part_file);
@@ -1028,7 +1221,9 @@ fn init_download(meta: &BlobMetadata) -> Result<ActiveDownload, String> {
     let total_chunks = meta.total_chunks as usize;
     let received = vec![false; total_chunks];
 
-    if meta.kind == 1 && meta.total_size <= INLINE_IMAGE_MAX_BYTES as u64 {
+    if (meta.kind == BLOB_KIND_INLINE_IMAGE || meta.kind == BLOB_KIND_AVATAR)
+        && meta.total_size <= INLINE_IMAGE_MAX_BYTES as u64
+    {
         return Ok(ActiveDownload {
             received,
             received_count: 0,
@@ -1169,6 +1364,13 @@ fn unique_destination_path(dir: &Path, filename: &str) -> PathBuf {
 }
 
 #[inline]
+fn avatar_blob_id(hash: &[u8; 32]) -> [u8; 16] {
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&hash[..16]);
+    id
+}
+
+#[inline]
 fn now_millis() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1197,8 +1399,14 @@ mod tests {
                     .get(&hdr.sender_peer_id)
                     .map(String::as_str)
                     .unwrap_or("Peer");
+                let sender_uuid = match hdr.sender_peer_id {
+                    1 => [0x11; 16],
+                    2 => [0x22; 16],
+                    _ => [0x33; 16],
+                };
                 mgr.handle_payload(
                     hdr.sender_peer_id,
+                    sender_uuid,
                     nick,
                     src,
                     payload,
@@ -1249,6 +1457,7 @@ mod tests {
         {
             let mut ctx_a = TransferCtx {
                 local_peer_id: 1,
+                local_uuid: [0x11; 16],
                 local_nickname: "Alpha",
                 socket: &sock_a,
                 cipher: &cipher,
@@ -1279,6 +1488,7 @@ mod tests {
             {
                 let mut ctx_b = TransferCtx {
                     local_peer_id: 2,
+                    local_uuid: [0x22; 16],
                     local_nickname: "Bravo",
                     socket: &sock_b,
                     cipher: &cipher,
@@ -1293,6 +1503,7 @@ mod tests {
             {
                 let mut ctx_a = TransferCtx {
                     local_peer_id: 1,
+                    local_uuid: [0x11; 16],
                     local_nickname: "Alpha",
                     socket: &sock_a,
                     cipher: &cipher,
@@ -1334,6 +1545,7 @@ mod tests {
         {
             let mut ctx_c = TransferCtx {
                 local_peer_id: 3,
+                local_uuid: [0x33; 16],
                 local_nickname: "Charlie",
                 socket: &sock_c,
                 cipher: &cipher,
@@ -1361,6 +1573,7 @@ mod tests {
             {
                 let mut ctx_b = TransferCtx {
                     local_peer_id: 2,
+                    local_uuid: [0x22; 16],
                     local_nickname: "Bravo",
                     socket: &sock_b,
                     cipher: &cipher,
@@ -1375,6 +1588,7 @@ mod tests {
             {
                 let mut ctx_c = TransferCtx {
                     local_peer_id: 3,
+                    local_uuid: [0x33; 16],
                     local_nickname: "Charlie",
                     socket: &sock_c,
                     cipher: &cipher,
@@ -1420,6 +1634,7 @@ mod tests {
         {
             let mut ctx_a = TransferCtx {
                 local_peer_id: 1,
+                local_uuid: [0x11; 16],
                 local_nickname: "Alpha",
                 socket: &sock_a,
                 cipher: &cipher,
@@ -1437,6 +1652,7 @@ mod tests {
             {
                 let mut ctx_b = TransferCtx {
                     local_peer_id: 2,
+                    local_uuid: [0x22; 16],
                     local_nickname: "Bravo",
                     socket: &sock_b,
                     cipher: &cipher,
@@ -1468,6 +1684,7 @@ mod tests {
             {
                 let mut ctx_b = TransferCtx {
                     local_peer_id: 2,
+                    local_uuid: [0x22; 16],
                     local_nickname: "Bravo",
                     socket: &sock_b,
                     cipher: &cipher,
@@ -1482,6 +1699,7 @@ mod tests {
             {
                 let mut ctx_a = TransferCtx {
                     local_peer_id: 1,
+                    local_uuid: [0x11; 16],
                     local_nickname: "Alpha",
                     socket: &sock_a,
                     cipher: &cipher,

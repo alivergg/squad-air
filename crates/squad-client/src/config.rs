@@ -33,6 +33,8 @@ pub struct AppConfig {
     pub ns_mode: NoiseSuppressionMode,
     pub activation_mode: MicActivationMode,
     pub input_gain: f32,
+    #[serde(default = "default_vad_threshold_db")]
+    pub vad_threshold_db: f32,
     pub hotkey_ptm: String,
     pub hotkey_ptt: String,
     pub hotkey_toggle_mute: String,
@@ -40,6 +42,10 @@ pub struct AppConfig {
     pub peer_volumes: HashMap<String, f32>,
     #[serde(default)]
     pub saved_channels: Vec<SavedChannel>,
+    #[serde(default)]
+    pub custom_avatar_hash: Option<String>,
+    #[serde(default = "default_minimize_to_tray")]
+    pub minimize_to_tray: bool,
 }
 
 impl Default for AppConfig {
@@ -54,11 +60,14 @@ impl Default for AppConfig {
             ns_mode: NoiseSuppressionMode::Rnnoise,
             activation_mode: MicActivationMode::PushToMute,
             input_gain: 1.0,
+            vad_threshold_db: default_vad_threshold_db(),
             hotkey_ptm: "KeyV".to_string(),
             hotkey_ptt: "CapsLock".to_string(),
             hotkey_toggle_mute: "F9".to_string(),
             peer_volumes: HashMap::new(),
             saved_channels: Vec::new(),
+            custom_avatar_hash: None,
+            minimize_to_tray: default_minimize_to_tray(),
         }
     }
 }
@@ -150,6 +159,14 @@ impl AppConfig {
             let _ = self.save();
         }
     }
+}
+
+fn default_vad_threshold_db() -> f32 {
+    -45.0
+}
+
+fn default_minimize_to_tray() -> bool {
+    true
 }
 
 fn uuid_key(client_uuid: &ClientUuid) -> String {

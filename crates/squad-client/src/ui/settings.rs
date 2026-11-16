@@ -1,5 +1,6 @@
 use crate::hotkeys::{is_macos_accessibility_trusted, is_macos_input_monitoring_trusted};
 use crate::ui::{
+    components::{avatar_circle, mic_sensitivity_meter},
     theme::{
         m3_menu_style, m3_pick_list_style, m3_slider_style, m3_text_input_style,
         pill_chip_button, pill_primary_button, pill_tonal_button, surface_card_style,
@@ -34,9 +35,37 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     ]
     .align_y(Vertical::Center);
 
+    let avatar_preview = avatar_circle(app.avatars.handle_for(&app.config.client_uuid()), 72.0, false);
+
     let profile_section = container(
         column![
             text("Profile & Rendezvous Coordinator").size(16),
+            row![
+                avatar_preview,
+                column![
+                    text(if app.config.custom_avatar_hash.is_some() {
+                        "Custom 128x128 Avatar (P2P Cached)"
+                    } else {
+                        "5x5 BLAKE3 Identicon (Deterministic)"
+                    })
+                    .size(12)
+                    .color(M3_ON_SURFACE_VARIANT),
+                    row![
+                        button(text("Choose Image...").size(12))
+                            .padding([7, 14])
+                            .style(pill_primary_button)
+                            .on_press(Message::PickAvatarImage),
+                        button(text("Reset to 5x5 Identicon").size(12))
+                            .padding([7, 14])
+                            .style(pill_tonal_button)
+                            .on_press(Message::ResetAvatarIdenticon),
+                    ]
+                    .spacing(8),
+                ]
+                .spacing(8),
+            ]
+            .spacing(16)
+            .align_y(Vertical::Center),
             row![
                 column![
                     text("Nickname").size(12).color(M3_ON_SURFACE_VARIANT),
@@ -195,6 +224,35 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                 text(format!("{:.0}%", app.config.input_gain * 100.0))
                     .size(13)
                     .width(Length::Fixed(52.0)),
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+            row![
+                text("4. Microphone Activation Sensitivity (Voice Gate):")
+                    .size(14)
+                    .width(Length::Fixed(330.0)),
+                slider(
+                    -60.0..=0.0,
+                    app.config.vad_threshold_db,
+                    Message::VadThresholdChanged
+                )
+                .step(1.0_f32)
+                .style(m3_slider_style),
+                text(format!("{:.0} dB", app.config.vad_threshold_db))
+                    .size(13)
+                    .width(Length::Fixed(52.0)),
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+            row![
+                text("Live Input Level (-60 dB .. 0 dB):")
+                    .size(12)
+                    .color(M3_ON_SURFACE_VARIANT)
+                    .width(Length::Fixed(330.0)),
+                mic_sensitivity_meter(
+                    app.audio.local_mic_level_db(),
+                    app.config.vad_threshold_db
+                ),
             ]
             .spacing(12)
             .align_y(Vertical::Center),

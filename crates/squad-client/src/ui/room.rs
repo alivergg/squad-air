@@ -1,10 +1,11 @@
 use crate::ui::{
     chat::view_chat,
     components::{avatar_circle, mic_level_meter, telemetry_badge},
+    stream_view::view_stream_stage,
     theme::{
         canvas_panel_style, floating_dock_style, m3_slider_style, m3_text_input_style,
         peer_card_style, pill_chip_button, pill_danger_button, pill_primary_button,
-        pill_success_button, pill_tonal_button, surface_card_style, M3_ERROR,
+        pill_success_button, pill_tonal_button, surface_card_style, M3_ERROR, M3_ON_PRIMARY,
         M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
     },
     Message, SquadApp,
@@ -14,7 +15,7 @@ use iced::{
     widget::{
         button, column, container, horizontal_space, row, scrollable, slider, text, text_input,
     },
-    Element, Length,
+    Background, Border, Element, Length, Theme,
 };
 use squad_dsp::MicActivationMode;
 
@@ -93,7 +94,11 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     let local_speaking = app.audio.is_local_speaking();
     let self_card: Element<'_, Message> = container(
         row![
-            avatar_circle(&app.config.nickname, local_speaking),
+            avatar_circle(
+                app.avatars.handle_for(&app.config.client_uuid()),
+                42.0,
+                local_speaking
+            ),
             column![
                 text(format!("{} (You)", app.config.nickname)).size(14),
                 text(if app.audio.is_mic_muted() {
@@ -131,46 +136,83 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             let peer_id = peer.peer_id;
             let peer_uuid = peer.client_uuid;
 
-            let card = container(
-                column![
-                    row![
-                        avatar_circle(&peer.nickname, peer.is_speaking),
-                        column![
-                            text(&peer.nickname).size(14),
-                            text(format!("Peer #{}", peer.peer_id))
-                                .size(11)
-                                .color(M3_ON_SURFACE_VARIANT),
-                        ]
-                        .spacing(2),
-                        horizontal_space(),
-                        telemetry_badge(peer),
+            let mut card_col = column![
+                row![
+                    avatar_circle(app.avatars.handle_for(&peer_uuid), 42.0, peer.is_speaking),
+                    column![
+                        text(&peer.nickname).size(14),
+                        text(format!("Peer #{}", peer.peer_id))
+                            .size(11)
+                            .color(M3_ON_SURFACE_VARIANT),
                     ]
-                    .spacing(10)
-                    .align_y(Vertical::Center),
-                    row![
-                        text("Vol").size(12).color(M3_ON_SURFACE_VARIANT),
-                        slider(0.0..=200.0, vol_gain * 100.0, move |v| {
-                            Message::PeerVolumeChanged {
-                                peer_id,
-                                client_uuid: peer_uuid,
-                                gain: v / 100.0,
-                            }
-                        })
-                        .step(1.0_f32)
-                        .style(m3_slider_style),
-                        text(format!("{vol_pct}%"))
-                            .size(12)
-                            .width(Length::Fixed(40.0))
-                            .align_x(Horizontal::Right),
-                    ]
-                    .spacing(8)
-                    .align_y(Vertical::Center),
+                    .spacing(2),
+                    horizontal_space(),
+                    telemetry_badge(peer),
                 ]
-                .spacing(10),
-            )
-            .width(Length::FillPortion(1))
-            .padding(14)
-            .style(peer_card_style(peer.is_speaking));
+                .spacing(10)
+                .align_y(Vertical::Center),
+                row![
+                    text("Vol").size(12).color(M3_ON_SURFACE_VARIANT),
+                    slider(0.0..=200.0, vol_gain * 100.0, move |v| {
+                        Message::PeerVolumeChanged {
+                            peer_id,
+                            client_uuid: peer_uuid,
+                            gain: v / 100.0,
+                        }
+                    })
+                    .step(1.0_f32)
+                    .style(m3_slider_style),
+                    text(format!("{vol_pct}%"))
+                        .size(12)
+                        .width(Length::Fixed(40.0))
+                        .align_x(Horizontal::Right),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center),
+            ]
+            .spacing(10);
+
+            if let Some(ref stream) = peer.stream_info {
+                let is_watching = app.watched_peer_id == Some(peer_id);
+                let watch_btn = if is_watching {
+                    button(text("Watching").size(11))
+                        .padding([5, 10])
+                        .style(pill_chip_button(true))
+                        .on_press(Message::StopWatchingStream)
+                } else {
+                    button(text("Watch").size(11))
+                        .padding([5, 10])
+                        .style(pill_primary_button)
+                        .on_press(Message::WatchPeerStream(peer_id))
+                };
+
+                let stream_row = row![
+                    container(text(format!("LIVE • {} FPS", stream.fps)).size(10).color(M3_ON_PRIMARY))
+                        .padding([3, 7])
+                        .style(|_t: &Theme| container::Style {
+                            background: Some(Background::Color(M3_ERROR)),
+                            border: Border {
+                                radius: 6.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }),
+                    text(&stream.source_title)
+                        .size(11)
+                        .color(M3_ON_SURFACE_VARIANT),
+                    horizontal_space(),
+                    watch_btn,
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center);
+
+                card_col = card_col.push(stream_row);
+            }
+
+            let card = container(card_col)
+                .width(Length::FillPortion(1))
+                .padding(14)
+                .style(peer_card_style(peer.is_speaking));
 
             r = r.push(card);
         }
@@ -187,22 +229,60 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
         ]
         .spacing(10),
     )
-    .width(Length::FillPortion(6))
+    .width(Length::Fill)
     .height(Length::Fill)
     .padding(16)
     .style(canvas_panel_style);
+
+    let left_stage: Element<'_, Message> = if app.watched_peer_id.is_some() {
+        if app.stream_expanded {
+            container(view_stream_stage(app))
+                .width(Length::FillPortion(6))
+                .height(Length::Fill)
+                .into()
+        } else {
+            column![view_stream_stage(app), voice_stage]
+                .spacing(12)
+                .width(Length::FillPortion(6))
+                .height(Length::Fill)
+                .into()
+        }
+    } else {
+        container(voice_stage)
+            .width(Length::FillPortion(6))
+            .height(Length::Fill)
+            .into()
+    };
 
     let chat_panel = container(view_chat(app))
         .width(Length::FillPortion(5))
         .height(Length::Fill);
 
-    let main_split = row![voice_stage, chat_panel]
+    let main_split = row![left_stage, chat_panel]
         .spacing(14)
         .height(Length::Fill);
 
     let is_muted = app.audio.is_mic_muted();
     let is_deafened = app.audio.is_deafened();
     let act_mode = app.config.activation_mode;
+
+    let share_btn = if app.is_local_sharing {
+        button(
+            text(format!(
+                "Stop Sharing • {} watching",
+                app.local_stream_subscribers
+            ))
+            .size(12),
+        )
+        .padding([9, 14])
+        .style(pill_danger_button)
+        .on_press(Message::StopScreenShare)
+    } else {
+        button(text("Share Screen").size(12))
+            .padding([9, 14])
+            .style(pill_tonal_button)
+            .on_press(Message::OpenShareModal)
+    };
 
     let bottom_dock = container(
         row![
@@ -222,6 +302,7 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                     pill_tonal_button
                 })
                 .on_press(Message::ToggleDeafen),
+            share_btn,
             text("Input Mode:").size(12).color(M3_ON_SURFACE_VARIANT),
             button(text("Push-to-Mute").size(12))
                 .padding([8, 12])
