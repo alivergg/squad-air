@@ -466,3 +466,213 @@ async fn test_e2e_video_idr_gating_and_neutral_gray_accuracy() {
         );
     }
 }
+
+#[tokio::test]
+async fn test_e2e_h265_decoder_error_triggers_auto_h264_fallback_and_full_1080p() {
+    use squad_video::{
+        fragment_frame, DecoderError, FrameReassembler, H264Decoder, H264Encoder,
+        SyntheticPatternCapture, VideoCodec,
+    };
+
+    let invite = InviteLink::generate();
+    let cipher_a = RoomCipher::from_secret(&invite.secret);
+    let cipher_b = RoomCipher::from_secret(&invite.secret);
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = sock_a.local_addr().unwrap();
+    let addr_b = sock_b.local_addr().unwrap();
+
+    // 1. Verify StreamAnnounce (codec=H265, has_audio=true) and StreamAudioOpus roundtrip over UDP
+    let announce = P2pPayload::StreamAnnounce {
+        is_streaming: true,
+        codec: VideoCodec::H265.as_u8(),
+        has_audio: true,
+        width: 1920,
+        height: 1080,
+        fps: 60,
+        source_title: "Display 1".into(),
+        encoder_backend: "NVIDIA NVENC".into(),
+    };
+    let mut wire = Vec::new();
+    let mut seq = 1u64;
+    let hdr_ann = P2pHeader {
+        msg_type: P2pMsgType::StreamAnnounce,
+        room_prefix: invite.room_prefix(),
+        sender_peer_id: 1,
+        seq_num: seq,
+    };
+    seq += 1;
+    cipher_a.seal_packet(&hdr_ann, &announce, &mut wire).unwrap();
+    sock_a.send_to(&wire, addr_b).await.unwrap();
+
+    let mut rx_buf = [0u8; 1500];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, dec_ann) = cipher_b.open_packet(&mut rx_buf[..len]).unwrap();
+    assert_eq!(dec_ann, announce);
+
+    let audio_pkt = P2pPayload::StreamAudioOpus {
+        opus_data: vec![0x42; 96],
+    };
+    let hdr_aud = P2pHeader {
+        msg_type: P2pMsgType::StreamAudioOpus,
+        room_prefix: invite.room_prefix(),
+        sender_peer_id: 1,
+        seq_num: seq,
+    };
+    seq += 1;
+    cipher_a.seal_packet(&hdr_aud, &audio_pkt, &mut wire).unwrap();
+    sock_a.send_to(&wire, addr_b).await.unwrap();
+    let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, dec_aud) = cipher_b.open_packet(&mut rx_buf[..len]).unwrap();
+    assert_eq!(dec_aud, audio_pkt);
+
+    // 2. Streamer encodes 1920x1080 in H.265
+    let mut cap = SyntheticPatternCapture::new(1920, 1080);
+    let f1 = cap.next_frame();
+    let mut enc = H264Encoder::new_with_codec(60, 8_000_000, VideoCodec::H265);
+    let hevc_frame = enc.encode(&f1);
+    assert!(hevc_frame.is_keyframe);
+
+    let frags_hevc = fragment_frame(1, true, &hevc_frame.annex_b);
+    let frag_count_hevc = frags_hevc.len();
+    for frag in frags_hevc {
+        let hdr = P2pHeader {
+            msg_type: P2pMsgType::VideoFrameFrag,
+            room_prefix: invite.room_prefix(),
+            sender_peer_id: 1,
+            seq_num: seq,
+        };
+        seq += 1;
+        let payload = P2pPayload::VideoFrameFrag {
+            frame_id: frag.frame_id,
+            frag_idx: frag.frag_idx,
+            frag_count: frag.frag_count,
+            flags: frag.flags,
+            data: frag.data,
+        };
+        cipher_a.seal_packet(&hdr, &payload, &mut wire).unwrap();
+        sock_a.send_to(&wire, addr_b).await.unwrap();
+    }
+
+    let mut reassembler = FrameReassembler::new();
+    let mut reassembled_hevc = None;
+    for _ in 0..frag_count_hevc {
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, payload) = cipher_b.open_packet(&mut rx_buf[..len]).unwrap();
+        if let P2pPayload::VideoFrameFrag {
+            frame_id,
+            frag_idx,
+            frag_count,
+            flags,
+            data,
+        } = payload
+        {
+            let (out, _) = reassembler.push_fragment(frame_id, frag_idx, frag_count, flags, data);
+            if out.is_some() {
+                reassembled_hevc = out;
+            }
+        }
+    }
+
+    let hevc_assembled = reassembled_hevc.expect("H.265 IDR frame must reassemble");
+    let mut viewer_dec = H264Decoder::new();
+    viewer_dec.set_hevc_decode_supported(false);
+    let err = viewer_dec
+        .decode_checked(&hevc_assembled.annex_b_bytes)
+        .unwrap_err();
+    let DecoderError::UnsupportedCodec(reason) = err else {
+        panic!("Expected UnsupportedCodec error, got {err:?}");
+    };
+
+    // 3. Viewer sends StreamDecoderError back to streamer; streamer falls back to H.264
+    let err_hdr = P2pHeader {
+        msg_type: P2pMsgType::StreamDecoderError,
+        room_prefix: invite.room_prefix(),
+        sender_peer_id: 2,
+        seq_num: 1,
+    };
+    let err_payload = P2pPayload::StreamDecoderError {
+        failed_codec: VideoCodec::H265.as_u8(),
+        reason,
+    };
+    cipher_b.seal_packet(&err_hdr, &err_payload, &mut wire).unwrap();
+    sock_b.send_to(&wire, addr_a).await.unwrap();
+
+    let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_a.recv_from(&mut rx_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let (_, recv_err) = cipher_a.open_packet(&mut rx_buf[..len]).unwrap();
+    assert!(matches!(
+        recv_err,
+        P2pPayload::StreamDecoderError { failed_codec: 1, .. }
+    ));
+
+    enc.set_codec(VideoCodec::H264);
+    assert_eq!(enc.codec(), VideoCodec::H264);
+    let f2 = cap.next_frame();
+    let h264_frame = enc.encode(&f2);
+    assert!(h264_frame.is_keyframe);
+
+    let frags_h264 = fragment_frame(2, true, &h264_frame.annex_b);
+    let frag_count_h264 = frags_h264.len();
+    for frag in frags_h264 {
+        let hdr = P2pHeader {
+            msg_type: P2pMsgType::VideoFrameFrag,
+            room_prefix: invite.room_prefix(),
+            sender_peer_id: 1,
+            seq_num: seq,
+        };
+        seq += 1;
+        let payload = P2pPayload::VideoFrameFrag {
+            frame_id: frag.frame_id,
+            frag_idx: frag.frag_idx,
+            frag_count: frag.frag_count,
+            flags: frag.flags,
+            data: frag.data,
+        };
+        cipher_a.seal_packet(&hdr, &payload, &mut wire).unwrap();
+        sock_a.send_to(&wire, addr_b).await.unwrap();
+    }
+
+    let mut reassembled_h264 = None;
+    for _ in 0..frag_count_h264 {
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let (_, payload) = cipher_b.open_packet(&mut rx_buf[..len]).unwrap();
+        if let P2pPayload::VideoFrameFrag {
+            frame_id,
+            frag_idx,
+            frag_count,
+            flags,
+            data,
+        } = payload
+        {
+            let (out, _) = reassembler.push_fragment(frame_id, frag_idx, frag_count, flags, data);
+            if out.is_some() {
+                reassembled_h264 = out;
+            }
+        }
+    }
+
+    let h264_assembled = reassembled_h264.expect("H.264 fallback IDR must reassemble");
+    let decoded = viewer_dec
+        .decode_checked(&h264_assembled.annex_b_bytes)
+        .expect("H.264 fallback must decode cleanly")
+        .expect("H.264 fallback must output 1080p RGBA frame");
+    assert_eq!(decoded.width, 1920);
+    assert_eq!(decoded.height, 1080);
+    assert_eq!(decoded.rgba.len(), 1920 * 1080 * 4);
+}

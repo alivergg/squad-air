@@ -1543,24 +1543,26 @@ fn reconcile_capture_worker(
 
             while !stop_clone.load(Ordering::Acquire) {
                 let tick_start = Instant::now();
-                let raw = capturer.capture_frame();
+                let mut raw = capturer.capture_frame();
+                let has_subscribers = subs_clone.load(Ordering::Acquire);
 
                 if preview_clone.load(Ordering::Acquire) {
+                    let preview_rgba = if has_subscribers {
+                        raw.rgba.clone()
+                    } else {
+                        std::mem::take(&mut raw.rgba)
+                    };
                     if let Ok(mut guard) = slot_clone.try_lock() {
                         *guard = Some(DecodedVideoFrame {
                             streamer_peer_id: local_pid,
                             width: raw.width,
                             height: raw.height,
-                            rgba: if subs_clone.load(Ordering::Acquire) {
-                                raw.rgba.clone()
-                            } else {
-                                raw.rgba.clone()
-                            },
+                            rgba: preview_rgba,
                         });
                     }
                 }
 
-                if subs_clone.load(Ordering::Acquire) {
+                if has_subscribers {
                     if force_clone.swap(false, Ordering::AcqRel) {
                         encoder.force_keyframe();
                     }

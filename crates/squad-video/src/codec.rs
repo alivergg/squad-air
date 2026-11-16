@@ -335,7 +335,7 @@ impl H264Encoder {
                 } else {
                     FLAT_IDR_DEFLATE_LIMIT
                 };
-                if 1 + compressed.len() <= limit {
+                if compressed.len() < limit {
                     let mut out = Vec::with_capacity(1 + compressed.len());
                     out.push(IDR_MODE_DEFLATE_RGB);
                     out.extend_from_slice(&compressed);
@@ -355,13 +355,13 @@ impl H264Encoder {
             if enc
                 .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
                 .is_ok()
-                && 1 + best_jpeg.len() <= MAX_IDR_PAYLOAD_BYTES
+                && best_jpeg.len() < MAX_IDR_PAYLOAD_BYTES
             {
                 break;
             }
         }
 
-        if 1 + best_jpeg.len() > MAX_IDR_PAYLOAD_BYTES {
+        if best_jpeg.len() >= MAX_IDR_PAYLOAD_BYTES {
             let mut fallback = Vec::new();
             let mut enc = JpegEncoder::new_with_quality(&mut fallback, 15);
             if enc
