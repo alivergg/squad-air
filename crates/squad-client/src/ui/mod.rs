@@ -14,7 +14,7 @@ use crate::config::AppConfig;
 use crate::hotkeys::{is_supported_hotkey_name, request_macos_permissions, HotkeyController};
 use crate::net::{
     downloads_root_dir, spawn_mesh_worker, ChatContentUi, ChatItemUi, DecodedVideoFrame,
-    MeshCommand, MeshEvent, PeerUiSnapshot,
+    DiscoveredLanRoom, MeshCommand, MeshEvent, PeerUiSnapshot,
 };
 use crate::tray::{release_os_memory, SystemTray, TrayAction};
 use crate::ui::avatar::{
@@ -93,6 +93,9 @@ pub enum Message {
     ClearCopiedFlash,
     ReleaseMemory,
     CreateRoom,
+    LanRoomNameChanged(String),
+    HostLanRoom,
+    JoinLanRoom(DiscoveredLanRoom),
     InviteInputChanged(String),
     JoinRoomWithInput,
     LeaveRoom,
@@ -338,6 +341,8 @@ pub struct SquadApp {
     pub main_window_id: Option<iced::window::Id>,
     pub overlay_window_id: Option<iced::window::Id>,
     pub recording_hotkey: Option<HotkeySlot>,
+    pub lan_rooms: Vec<DiscoveredLanRoom>,
+    pub lan_room_name_input: String,
     ui_sync: Arc<UiSyncState>,
 }
 
@@ -465,6 +470,8 @@ impl SquadApp {
             main_window_id: Some(main_window_id),
             overlay_window_id: None,
             recording_hotkey: None,
+            lan_rooms: Vec::new(),
+            lan_room_name_input: String::new(),
             ui_sync,
         };
 
@@ -809,6 +816,9 @@ impl SquadApp {
                                     "Switched stream to H.264 for viewer compatibility".to_string(),
                                 );
                             }
+                            MeshEvent::LanRoomsUpdated(rooms) => {
+                                self.lan_rooms = rooms;
+                            }
                             MeshEvent::Error(err) => {
                                 self.status_banner = Some(err);
                             }
@@ -829,8 +839,41 @@ impl SquadApp {
                 let uri = invite.to_uri();
                 self.active_invite_uri = uri.clone();
                 self.invite_copied_flash = true;
-                let join_task = self.join_with_invite(invite);
+                let join_task = self.join_with_invite(
+                    invite,
+                    self.config.rendezvous_server.clone(),
+                    false,
+                    None,
+                );
                 Task::batch([join_task, clipboard::write(uri)])
+            }
+            Message::LanRoomNameChanged(val) => {
+                self.lan_room_name_input = val;
+                Task::none()
+            }
+            Message::HostLanRoom => {
+                let room_name = self.lan_room_name_input.trim().to_string();
+                self.prepare_for_room_entry();
+                let _ = self.mesh_tx.try_send(MeshCommand::HostLanRoom {
+                    room_name,
+                    nickname: self.config.nickname.clone(),
+                    client_uuid: self.config.client_uuid(),
+                });
+                self.enter_room_ui_state()
+            }
+            Message::JoinLanRoom(room) => {
+                let invite = InviteLink {
+                    room_id: room.room_id,
+                    secret: room.secret,
+                };
+                self.active_invite_uri = invite.to_uri();
+                self.invite_copied_flash = false;
+                self.join_with_invite(
+                    invite,
+                    room.host_addr.to_string(),
+                    true,
+                    Some(room.room_name),
+                )
             }
             Message::InviteInputChanged(val) => {
                 self.invite_input = val;
@@ -1695,7 +1738,7 @@ impl SquadApp {
             Ok(invite) => {
                 self.active_invite_uri = invite.to_uri();
                 self.invite_copied_flash = false;
-                self.join_with_invite(invite)
+                self.join_with_invite(invite, self.config.rendezvous_server.clone(), false, None)
             }
             Err(e) => {
                 self.status_banner = Some(format!("Invalid invite link: {e}"));
@@ -1704,7 +1747,7 @@ impl SquadApp {
         }
     }
 
-    fn join_with_invite(&mut self, invite: InviteLink) -> Task<Message> {
+    fn prepare_for_room_entry(&mut self) {
         self.chat_messages.clear();
         self.chat_text_editors.clear();
         self.active_chat_selection = None;
@@ -1713,13 +1756,9 @@ impl SquadApp {
         self.copied_msg_id = None;
         self.lightbox_blob_id = None;
         self.chat_input.clear();
-        let _ = self.mesh_tx.try_send(MeshCommand::JoinRoom {
-            rendezvous_server: self.config.rendezvous_server.clone(),
-            invite,
-            nickname: self.config.nickname.clone(),
-            client_uuid: self.config.client_uuid(),
-            initial_volumes: HashMap::new(),
-        });
+    }
+
+    fn enter_room_ui_state(&mut self) -> Task<Message> {
         self.screen = Screen::Room;
         self.audio.set_streams_active(true);
         self.audio.set_monitoring_in_settings(false);
@@ -1728,6 +1767,26 @@ impl SquadApp {
         self.ui_sync.in_settings.store(false, Ordering::Release);
         self.ui_sync.audio_ui_notify.notify_one();
         self.sync_overlay_window()
+    }
+
+    fn join_with_invite(
+        &mut self,
+        invite: InviteLink,
+        rendezvous_server: String,
+        is_lan_room: bool,
+        room_name: Option<String>,
+    ) -> Task<Message> {
+        self.prepare_for_room_entry();
+        let _ = self.mesh_tx.try_send(MeshCommand::JoinRoom {
+            rendezvous_server,
+            invite,
+            nickname: self.config.nickname.clone(),
+            client_uuid: self.config.client_uuid(),
+            initial_volumes: HashMap::new(),
+            is_lan_room,
+            room_name,
+        });
+        self.enter_room_ui_state()
     }
 
     fn sync_overlay_window(&mut self) -> Task<Message> {

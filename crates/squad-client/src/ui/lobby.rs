@@ -107,10 +107,11 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     .padding(16)
     .style(sidebar_panel_style);
 
-    let create_card = container(
-        column![
+    let create_card =
+        container(
+            column![
             text("Start a Private Room").size(18),
-            text("Create a private voice & chat room and invite friends with one link.")
+            text("Create an internet room by link or host a zero-config room directly on your LAN.")
                 .size(13)
                 .color(M3_ON_SURFACE_VARIANT),
             vertical_space().height(4),
@@ -123,12 +124,26 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             .padding([12, 20])
             .style(pill_primary_button)
             .on_press(Message::CreateRoom),
+            row![
+                text_input("LAN room name (optional)", &app.lan_room_name_input)
+                    .on_input(Message::LanRoomNameChanged)
+                    .on_submit(Message::HostLanRoom)
+                    .padding(10)
+                    .size(13)
+                    .style(m3_text_input_style),
+                button(text("Host LAN Room").size(13))
+                    .padding([10, 18])
+                    .style(pill_tonal_button)
+                    .on_press(Message::HostLanRoom),
+            ]
+            .spacing(10)
+            .align_y(Vertical::Center),
         ]
-        .spacing(10),
-    )
-    .width(Length::Fill)
-    .padding(22)
-    .style(surface_card_style);
+            .spacing(10),
+        )
+        .width(Length::Fill)
+        .padding(22)
+        .style(surface_card_style);
 
     let join_card = container(
         column![
@@ -171,6 +186,49 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     .padding(22)
     .style(surface_card_style);
 
+    let mut lan_list = column![].spacing(8).width(Length::Fill);
+    if app.lan_rooms.is_empty() {
+        lan_list = lan_list.push(
+            text("No LAN rooms discovered right now. Friends hosting on your Wi-Fi / LAN appear here automatically.")
+                .size(12)
+                .color(M3_ON_SURFACE_VARIANT),
+        );
+    } else {
+        for room in &app.lan_rooms {
+            let room_clone = room.clone();
+            let subtitle = format!(
+                "Host: {}  •  {}/{} online  •  {}",
+                room.host_nickname, room.peer_count, room.max_peers, room.host_addr
+            );
+            let lan_row = container(
+                row![
+                    avatar_circle(app.avatars.room_handle_for(&room.room_id), 32.0, false),
+                    column![
+                        text(&room.room_name).size(14),
+                        text(subtitle).size(11).color(M3_ON_SURFACE_VARIANT),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    button(text("Join LAN").size(12))
+                        .padding([8, 16])
+                        .style(pill_primary_button)
+                        .on_press(Message::JoinLanRoom(room_clone)),
+                ]
+                .spacing(10)
+                .align_y(Vertical::Center),
+            )
+            .padding(10)
+            .width(Length::Fill)
+            .style(canvas_panel_style);
+            lan_list = lan_list.push(lan_row);
+        }
+    }
+
+    let lan_card = container(column![text("LAN Rooms Nearby").size(16), lan_list,].spacing(10))
+        .width(Length::Fill)
+        .padding(20)
+        .style(surface_card_style);
+
     let mut main_col = column![
         row![
             column![
@@ -185,6 +243,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         .align_y(Vertical::Center),
         create_card,
         join_card,
+        lan_card,
     ]
     .spacing(16)
     .width(Length::Fill);
@@ -198,7 +257,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         );
     }
 
-    let workspace = container(main_col)
+    let workspace = container(scrollable(main_col).height(Length::Fill))
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(24)
