@@ -5240,6 +5240,7 @@ dependencies = [
  "socket2",
  "squad-dsp",
  "squad-proto",
+ "squad-rendezvous",
  "squad-video",
  "thiserror 2.0.21",
  "tokio",

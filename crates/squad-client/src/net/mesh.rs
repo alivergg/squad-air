@@ -1,3 +1,7 @@
+use crate::net::lan::{
+    bind_lan_broadcast_sender, bind_lan_discovery_listener, broadcast_lan_packet,
+    start_embedded_rendezvous, DiscoveredLanRoom, EmbeddedRendezvousHandle,
+};
 use crate::net::nat::discover_lan_ipv4_addrs;
 use crate::net::transfer::{
     app_data_root_dir, BlobTransferState, ChatItemUi, SwarmChatManager, TransferCtx, TransferEvent,
@@ -7,8 +11,9 @@ use crate::tray::release_os_memory;
 use squad_dsp::{AudioEngineHandle, OutboundAudioFrame, SoundCue};
 use squad_proto::{
     encode_relay_datagram_into, is_relay_datagram, parse_relay_header, ClientUuid, InviteLink,
-    P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, SignalingPacket,
-    MAX_RELAY_UDP_PAYLOAD, MAX_UDP_PAYLOAD, RELAY_HEADER_LEN,
+    LanDiscoveryPacket, P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, RoomId,
+    SignalingPacket, LAN_DISCOVERY_PORT, MAX_RELAY_UDP_PAYLOAD, MAX_ROOM_PEERS, MAX_UDP_PAYLOAD,
+    RELAY_HEADER_LEN,
 };
 use squad_video::{
     detect_hardware_encoder_backend, fragment_frame, is_hevc_hardware_supported, DecoderError,
@@ -32,6 +37,10 @@ const RELAY_DIRECT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_STALE_TIMEOUT: Duration = Duration::from_secs(6);
 const RELAY_STALE_TIMEOUT: Duration = Duration::from_secs(12);
+const LAN_BEACON_INTERVAL: Duration = Duration::from_millis(1500);
+const LAN_ROOM_TTL: Duration = Duration::from_secs(5);
+const LAN_RV_LOST_TIMEOUT: Duration = Duration::from_secs(7);
+const LAN_MIGRATION_GRACE: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerConnStatus {
@@ -91,6 +100,13 @@ pub enum MeshCommand {
         nickname: String,
         client_uuid: ClientUuid,
         initial_volumes: HashMap<ClientUuid, f32>,
+        is_lan_room: bool,
+        room_name: Option<String>,
+    },
+    HostLanRoom {
+        room_name: String,
+        nickname: String,
+        client_uuid: ClientUuid,
     },
     LeaveRoom,
     SendChatText {
@@ -155,6 +171,7 @@ pub enum MeshEvent {
     StreamCodecFallbackToH264 {
         reason: String,
     },
+    LanRoomsUpdated(Vec<DiscoveredLanRoom>),
     Error(String),
 }
 
@@ -241,6 +258,12 @@ struct ActiveSession {
     video_reassembler: FrameReassembler,
     hevc_decode_supported: bool,
     last_pli_sent: Instant,
+    is_lan_room: bool,
+    lan_room_name: String,
+    embedded_rv: Option<EmbeddedRendezvousHandle>,
+    last_rv_rx: Instant,
+    migrating_until: Option<Instant>,
+    migration_claimed_at: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -389,14 +412,28 @@ pub fn spawn_mesh_worker(
         let mut seal_buf = Vec::with_capacity(MAX_UDP_PAYLOAD);
         let mut relay_buf = Vec::with_capacity(MAX_RELAY_UDP_PAYLOAD);
 
+        let lan_rx_sock = bind_lan_discovery_listener(LAN_DISCOVERY_PORT)
+            .map_err(|e| {
+                warn!("LAN discovery listener unavailable on UDP {LAN_DISCOVERY_PORT}: {e}")
+            })
+            .ok();
+        let lan_tx_sock = bind_lan_broadcast_sender().ok();
+        let mut lan_rx_buf = [0u8; MAX_UDP_PAYLOAD];
+        let mut discovered_lan: HashMap<RoomId, (DiscoveredLanRoom, Instant)> = HashMap::new();
+        let mut last_published_lan: Vec<DiscoveredLanRoom> = Vec::new();
+
         let mut register_tick = tokio::time::interval(REGISTER_INTERVAL);
         let mut punch_tick = tokio::time::interval(PUNCH_INTERVAL);
         let mut ping_tick = tokio::time::interval(PING_INTERVAL);
         let mut qos_tick = tokio::time::interval(Duration::from_millis(10));
         qos_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut ui_sync_tick = tokio::time::interval(Duration::from_millis(120));
+        let mut lan_tick = tokio::time::interval(LAN_BEACON_INTERVAL);
 
         loop {
+            let lan_work_active = session.as_ref().is_some_and(|s| s.embedded_rv.is_some())
+                || !discovered_lan.is_empty();
+
             tokio::select! {
                 biased;
 
@@ -408,6 +445,8 @@ pub fn spawn_mesh_worker(
                             nickname,
                             client_uuid,
                             initial_volumes,
+                            is_lan_room,
+                            room_name,
                         } => {
                             let rv_addr = match resolve_host(&rendezvous_server) {
                                 Ok(a) => a,
@@ -417,41 +456,39 @@ pub fn spawn_mesh_worker(
                                 }
                             };
 
-                            audio_engine.clear_peers();
-                            audio_engine.set_share_stream_audio(false);
-                            let lan_addrs = discover_lan_ipv4_addrs(bound_port);
-                            let cipher = RoomCipher::from_secret(&invite.secret);
-                            let room_prefix = invite.room_prefix();
+                            if let Some(old_sess) = session.take() {
+                                teardown_session(
+                                    &socket,
+                                    lan_tx_sock.as_ref(),
+                                    old_sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                    true,
+                                )
+                                .await;
+                            }
 
-                            let mut transfer = SwarmChatManager::new();
-                            transfer.set_initial_local_avatar(pending_local_avatar.clone());
-                            transfer.set_room_persistence(invite.room_id, app_data_root_dir());
-                            transfer.load_room_from_disk(client_uuid, &tr_tx).await;
-                            forward_transfer_events(&mut tr_rx, &evt_tx).await;
-
-                            let new_sess = ActiveSession {
-                                rendezvous_addr: rv_addr,
-                                invite: invite.clone(),
-                                cipher,
-                                room_prefix,
-                                local_uuid: client_uuid,
+                            let new_sess = init_session(
+                                rv_addr,
+                                invite,
                                 nickname,
-                                local_peer_id: 0,
-                                lan_addrs,
-                                peers: HashMap::new(),
-                                control_seq: 1,
-                                transfer,
-                                local_encoder_backend: local_encoder_backend.clone(),
-                                local_stream_config: None,
-                                local_preview_enabled: false,
-                                stream_subscribers: HashSet::new(),
-                                next_video_frame_id: Arc::new(AtomicU32::new(1)),
-                                watched_peer_id: None,
-                                sent_decoder_error_to: None,
-                                video_reassembler: FrameReassembler::new(),
+                                client_uuid,
+                                bound_port,
+                                pending_local_avatar.clone(),
+                                local_encoder_backend.clone(),
                                 hevc_decode_supported,
-                                last_pli_sent: Instant::now() - Duration::from_secs(5),
-                            };
+                                is_lan_room,
+                                room_name.unwrap_or_default(),
+                                None,
+                                &audio_engine,
+                                &tr_tx,
+                                &mut tr_rx,
+                                &evt_tx,
+                            )
+                            .await;
+
+                            discovered_lan.remove(&new_sess.invite.room_id);
+                            publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx).await;
 
                             send_register(&socket, &new_sess).await;
                             stop_capture_worker(&mut capture_worker);
@@ -462,6 +499,73 @@ pub fn spawn_mesh_worker(
                             audio_engine.play_cue(SoundCue::Join);
 
                             let _ = initial_volumes;
+                        }
+                        MeshCommand::HostLanRoom {
+                            room_name,
+                            nickname,
+                            client_uuid,
+                        } => {
+                            if let Some(old_sess) = session.take() {
+                                teardown_session(
+                                    &socket,
+                                    lan_tx_sock.as_ref(),
+                                    old_sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                    true,
+                                )
+                                .await;
+                            }
+
+                            let embedded_rv = match start_embedded_rendezvous().await {
+                                Ok(rv) => rv,
+                                Err(e) => {
+                                    let _ = evt_tx
+                                        .send(MeshEvent::Error(format!(
+                                            "Failed to start embedded LAN host: {e}"
+                                        )))
+                                        .await;
+                                    continue;
+                                }
+                            };
+                            let rv_addr = SocketAddr::from(([127, 0, 0, 1], embedded_rv.port));
+                            let invite = InviteLink::generate();
+                            let clean_name = if room_name.trim().is_empty() {
+                                format!("{nickname}'s LAN")
+                            } else {
+                                room_name.trim().to_string()
+                            };
+
+                            let new_sess = init_session(
+                                rv_addr,
+                                invite,
+                                nickname,
+                                client_uuid,
+                                bound_port,
+                                pending_local_avatar.clone(),
+                                local_encoder_backend.clone(),
+                                hevc_decode_supported,
+                                true,
+                                clean_name,
+                                Some(embedded_rv),
+                                &audio_engine,
+                                &tr_tx,
+                                &mut tr_rx,
+                                &evt_tx,
+                            )
+                            .await;
+
+                            discovered_lan.remove(&new_sess.invite.room_id);
+                            publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx).await;
+
+                            send_register(&socket, &new_sess).await;
+                            broadcast_lan_announce(lan_tx_sock.as_ref(), &new_sess).await;
+                            stop_capture_worker(&mut capture_worker);
+                            decode_handle.reset();
+                            *video_frame_slot.lock().unwrap() = None;
+                            last_snapshots.clear();
+                            session = Some(new_sess);
+                            audio_engine.play_cue(SoundCue::Join);
                         }
                         MeshCommand::LeaveRoom => {
                             stop_capture_worker(&mut capture_worker);
@@ -484,7 +588,15 @@ pub fn spawn_mesh_worker(
                                     )
                                     .await;
                                 }
-                                send_leave(&socket, &sess).await;
+                                teardown_session(
+                                    &socket,
+                                    lan_tx_sock.as_ref(),
+                                    sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                    true,
+                                )
+                                .await;
                                 audio_engine.clear_peers();
                                 audio_engine.play_cue(SoundCue::Leave);
                                 evt_tx.send(MeshEvent::LeftRoom).await;
@@ -801,7 +913,15 @@ pub fn spawn_mesh_worker(
                             audio_engine.set_share_stream_audio(false);
                             audio_engine.clear_stream_audio();
                             if let Some(sess) = session.take() {
-                                send_leave(&socket, &sess).await;
+                                teardown_session(
+                                    &socket,
+                                    lan_tx_sock.as_ref(),
+                                    sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                    true,
+                                )
+                                .await;
                             }
                             break;
                         }
@@ -897,6 +1017,9 @@ pub fn spawn_mesh_worker(
 
                 Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) => {
                     let Some(sess) = session.as_mut() else { continue; };
+                    if src_addr == sess.rendezvous_addr {
+                        sess.last_rv_rx = Instant::now();
+                    }
                     let datagram = &mut recv_buf[..len];
 
                     let mut rx_ctx = MeshRxCtx {
@@ -910,6 +1033,7 @@ pub fn spawn_mesh_worker(
                         video_frame_slot: &video_frame_slot,
                         video_notify: &video_notify,
                         decode_handle: &decode_handle,
+                        lan_tx_sock: lan_tx_sock.as_ref(),
                     };
                     if is_relay_datagram(datagram) {
                         if src_addr == sess.rendezvous_addr {
@@ -1075,8 +1199,98 @@ pub fn spawn_mesh_worker(
 
                 // Периодический Heartbeat на Rendezvous-сервер (раз в 2 сек)
                 _ = register_tick.tick() => {
-                    if let Some(sess) = session.as_ref() {
+                    if let Some(sess) = session.as_mut() {
+                        if sess.is_lan_room
+                            && sess.embedded_rv.is_none()
+                            && sess.local_peer_id != 0
+                            && sess.last_rv_rx.elapsed() > LAN_RV_LOST_TIMEOUT
+                            && sess
+                                .migration_claimed_at
+                                .is_none_or(|t| t.elapsed() > Duration::from_secs(5))
+                        {
+                            let min_active_other = sess
+                                .peers
+                                .iter()
+                                .filter(|(_, p)| {
+                                    matches!(
+                                        p.status,
+                                        PeerConnStatus::Connected | PeerConnStatus::Relayed
+                                    )
+                                })
+                                .map(|(&pid, _)| pid)
+                                .min();
+                            if min_active_other.is_some_and(|min_id| sess.local_peer_id < min_id) {
+                                promote_to_lan_host(
+                                    &socket,
+                                    lan_tx_sock.as_ref(),
+                                    sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                )
+                                .await;
+                            }
+                        }
                         send_register(&socket, sess).await;
+                    }
+                }
+
+                Some((len, src_addr)) = recv_lan_opt(lan_rx_sock.as_ref(), &mut lan_rx_buf) => {
+                    let now = Instant::now();
+                    if let Ok(pkt) = LanDiscoveryPacket::decode(&lan_rx_buf[..len]) {
+                        match pkt {
+                            LanDiscoveryPacket::Announce {
+                                room_id,
+                                secret,
+                                rv_port,
+                                peer_count,
+                                max_peers,
+                                room_name,
+                                host_nickname,
+                            } => {
+                                let is_own_active = session
+                                    .as_ref()
+                                    .is_some_and(|s| s.invite.room_id == room_id);
+                                if !is_own_active && rv_port != 0 {
+                                    let room = DiscoveredLanRoom {
+                                        room_id,
+                                        secret,
+                                        host_addr: SocketAddr::new(src_addr.ip(), rv_port),
+                                        room_name,
+                                        host_nickname,
+                                        peer_count,
+                                        max_peers,
+                                    };
+                                    discovered_lan.insert(room_id, (room, now));
+                                    publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx)
+                                        .await;
+                                }
+                            }
+                            LanDiscoveryPacket::Goodbye { room_id, rv_port } => {
+                                let should_remove = discovered_lan.get(&room_id).is_some_and(|(r, _)| {
+                                    r.host_addr.ip() == src_addr.ip()
+                                        && (rv_port == 0 || r.host_addr.port() == rv_port)
+                                });
+                                if should_remove {
+                                    discovered_lan.remove(&room_id);
+                                    publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx)
+                                        .await;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                _ = lan_tick.tick(), if lan_work_active => {
+                    let now = Instant::now();
+                    let before = discovered_lan.len();
+                    discovered_lan.retain(|_, (_, seen_at)| now.duration_since(*seen_at) <= LAN_ROOM_TTL);
+                    if discovered_lan.len() != before {
+                        publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx).await;
+                    }
+                    if let Some(sess) = session.as_ref() {
+                        if sess.embedded_rv.is_some() {
+                            broadcast_lan_announce(lan_tx_sock.as_ref(), sess).await;
+                        }
                     }
                 }
 
@@ -1356,16 +1570,24 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
             assigned_peer_id,
             peers,
         } => {
-            if sess.local_peer_id == 0 {
+            let prev_local_id = sess.local_peer_id;
+            if sess.local_peer_id != assigned_peer_id {
                 sess.local_peer_id = assigned_peer_id;
-                info!("Joined room as peer #{}", assigned_peer_id);
-                let _ = io
-                    .evt_tx
-                    .send(MeshEvent::JoinedRoom {
-                        local_peer_id: assigned_peer_id,
-                        invite_uri: sess.invite.to_uri(),
-                    })
-                    .await;
+                if prev_local_id == 0 {
+                    info!("Joined room as peer #{}", assigned_peer_id);
+                    let _ = io
+                        .evt_tx
+                        .send(MeshEvent::JoinedRoom {
+                            local_peer_id: assigned_peer_id,
+                            invite_uri: sess.invite.to_uri(),
+                        })
+                        .await;
+                } else {
+                    info!(
+                        "Reassigned local peer slot #{} -> #{} after coordinator handoff",
+                        prev_local_id, assigned_peer_id
+                    );
+                }
             }
 
             let now = Instant::now();
@@ -1378,7 +1600,30 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                 active_ids.push(rec.peer_id);
 
                 if let Some(existing) = sess.peers.get_mut(&rec.peer_id) {
-                    existing.record = rec;
+                    if existing.record.client_uuid == rec.client_uuid {
+                        existing.record = rec;
+                        continue;
+                    }
+                }
+
+                let existing_old_id = sess
+                    .peers
+                    .iter()
+                    .find(|(_, st)| st.record.client_uuid == rec.client_uuid)
+                    .map(|(&pid, _)| pid);
+
+                if let Some(old_id) = existing_old_id {
+                    if let Some(mut moved) = sess.peers.remove(&old_id) {
+                        moved.record = rec.clone();
+                        if sess.stream_subscribers.remove(&old_id) {
+                            sess.stream_subscribers.insert(rec.peer_id);
+                        }
+                        if sess.watched_peer_id == Some(old_id) {
+                            sess.watched_peer_id = Some(rec.peer_id);
+                        }
+                        io.audio_engine.remove_peer(old_id);
+                        sess.peers.insert(rec.peer_id, moved);
+                    }
                 } else {
                     info!("Discovered peer #{} ({})", rec.peer_id, rec.nickname);
                     sess.peers.insert(
@@ -1399,13 +1644,17 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                 }
             }
 
-            // Удаляем вышедших пиров
-            let stale: Vec<PeerId> = sess
-                .peers
-                .keys()
-                .copied()
-                .filter(|id| !active_ids.contains(id))
-                .collect();
+            let in_migration_grace = sess.migrating_until.is_some_and(|until| now < until);
+            let stale: Vec<PeerId> = if in_migration_grace {
+                Vec::new()
+            } else {
+                sess.migrating_until = None;
+                sess.peers
+                    .keys()
+                    .copied()
+                    .filter(|id| !active_ids.contains(id))
+                    .collect()
+            };
 
             let mut sub_changed = false;
             for id in stale {
@@ -1470,6 +1719,7 @@ struct MeshRxCtx<'a> {
     video_frame_slot: &'a Arc<Mutex<Option<DecodedVideoFrame>>>,
     video_notify: &'a Arc<Notify>,
     decode_handle: &'a VideoDecodeHandle,
+    lan_tx_sock: Option<&'a UdpSocket>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1653,6 +1903,43 @@ async fn handle_p2p_rx(
         P2pPayload::Pong { echo_timestamp_us } => {
             if let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) {
                 update_rtt(&mut peer.rtt_ms, echo_timestamp_us);
+            }
+        }
+        P2pPayload::LanHostMigrate { new_host_peer_id } => {
+            if sess.is_lan_room
+                && sess.embedded_rv.is_none()
+                && sess.local_peer_id != 0
+                && new_host_peer_id == sess.local_peer_id
+                && sess
+                    .migration_claimed_at
+                    .is_none_or(|t| t.elapsed() > Duration::from_secs(2))
+            {
+                promote_to_lan_host(socket, io.lan_tx_sock, sess, io.seal_buf, io.relay_buf).await;
+            }
+        }
+        P2pPayload::LanHostClaim { rv_port, room_name } => {
+            if sess.is_lan_room && sess.embedded_rv.is_none() && rv_port != 0 {
+                let candidate_ip = if !via_relay {
+                    Some(src_addr.ip())
+                } else {
+                    sess.peers
+                        .get(&header.sender_peer_id)
+                        .and_then(|p| p.active_addr.map(|a| a.ip()))
+                };
+                if let Some(host_ip) = candidate_ip {
+                    let next_rv = SocketAddr::new(host_ip, rv_port);
+                    sess.rendezvous_addr = next_rv;
+                    if !room_name.is_empty() {
+                        sess.lan_room_name = room_name;
+                    }
+                    sess.last_rv_rx = Instant::now();
+                    sess.migrating_until = Some(Instant::now() + LAN_MIGRATION_GRACE);
+                    info!(
+                        "LAN room coordinator migrated to peer #{} ({}) at {}",
+                        header.sender_peer_id, sender_nickname, next_rv
+                    );
+                    send_register(socket, sess).await;
+                }
             }
         }
         P2pPayload::AudioOpus { opus_data } => {
@@ -2271,5 +2558,338 @@ async fn send_stream_decoder_error(
     };
     if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
         send_sealed_to_peer(socket, sess, target_peer_id, seal_buf, relay_buf).await;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn init_session(
+    rv_addr: SocketAddr,
+    invite: InviteLink,
+    nickname: String,
+    client_uuid: ClientUuid,
+    bound_port: u16,
+    pending_local_avatar: Option<([u8; 32], Vec<u8>)>,
+    local_encoder_backend: String,
+    hevc_decode_supported: bool,
+    is_lan_room: bool,
+    lan_room_name: String,
+    embedded_rv: Option<EmbeddedRendezvousHandle>,
+    audio_engine: &AudioEngineHandle,
+    tr_tx: &mpsc::Sender<TransferEvent>,
+    tr_rx: &mut mpsc::Receiver<TransferEvent>,
+    evt_tx: &NotifyingEventTx,
+) -> ActiveSession {
+    audio_engine.clear_peers();
+    audio_engine.set_share_stream_audio(false);
+    let lan_addrs = discover_lan_ipv4_addrs(bound_port);
+    let cipher = RoomCipher::from_secret(&invite.secret);
+    let room_prefix = invite.room_prefix();
+
+    let mut transfer = SwarmChatManager::new();
+    transfer.set_initial_local_avatar(pending_local_avatar);
+    transfer.set_room_persistence(invite.room_id, app_data_root_dir());
+    transfer.load_room_from_disk(client_uuid, tr_tx).await;
+    forward_transfer_events(tr_rx, evt_tx).await;
+
+    ActiveSession {
+        rendezvous_addr: rv_addr,
+        invite,
+        cipher,
+        room_prefix,
+        local_uuid: client_uuid,
+        nickname,
+        local_peer_id: 0,
+        lan_addrs,
+        peers: HashMap::new(),
+        control_seq: 1,
+        transfer,
+        local_encoder_backend,
+        local_stream_config: None,
+        local_preview_enabled: false,
+        stream_subscribers: HashSet::new(),
+        next_video_frame_id: Arc::new(AtomicU32::new(1)),
+        watched_peer_id: None,
+        sent_decoder_error_to: None,
+        video_reassembler: FrameReassembler::new(),
+        hevc_decode_supported,
+        last_pli_sent: Instant::now() - Duration::from_secs(5),
+        is_lan_room,
+        lan_room_name,
+        embedded_rv,
+        last_rv_rx: Instant::now(),
+        migrating_until: None,
+        migration_claimed_at: None,
+    }
+}
+
+async fn teardown_session(
+    socket: &UdpSocket,
+    lan_tx_sock: Option<&UdpSocket>,
+    mut sess: ActiveSession,
+    seal_buf: &mut Vec<u8>,
+    relay_buf: &mut Vec<u8>,
+    migrate_if_active: bool,
+) {
+    let embedded = sess.embedded_rv.take();
+    if let Some(rv) = embedded {
+        if migrate_if_active && sess.local_peer_id != 0 {
+            let successor = sess
+                .peers
+                .iter()
+                .filter(|(_, p)| {
+                    matches!(
+                        p.status,
+                        PeerConnStatus::Connected | PeerConnStatus::Relayed
+                    )
+                })
+                .map(|(&pid, _)| pid)
+                .min();
+            if let Some(new_host_peer_id) = successor {
+                sess.control_seq = sess.control_seq.wrapping_add(1);
+                let hdr = P2pHeader {
+                    msg_type: P2pMsgType::LanHostMigrate,
+                    room_prefix: sess.room_prefix,
+                    sender_peer_id: sess.local_peer_id,
+                    seq_num: sess.control_seq,
+                };
+                let payload = P2pPayload::LanHostMigrate { new_host_peer_id };
+                if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
+                    let targets: Vec<PeerId> = sess.peers.keys().copied().collect();
+                    for pid in targets {
+                        send_sealed_to_peer(socket, &sess, pid, seal_buf, relay_buf).await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+        if let Some(tx) = lan_tx_sock {
+            let bye = LanDiscoveryPacket::Goodbye {
+                room_id: sess.invite.room_id,
+                rv_port: rv.port,
+            };
+            broadcast_lan_packet(tx, &bye).await;
+        }
+        send_leave(socket, &sess).await;
+        rv.stop().await;
+    } else {
+        send_leave(socket, &sess).await;
+    }
+}
+
+async fn promote_to_lan_host(
+    socket: &UdpSocket,
+    lan_tx_sock: Option<&UdpSocket>,
+    sess: &mut ActiveSession,
+    seal_buf: &mut Vec<u8>,
+    relay_buf: &mut Vec<u8>,
+) {
+    let rv = match start_embedded_rendezvous().await {
+        Ok(handle) => handle,
+        Err(err) => {
+            warn!("Failed to start embedded LAN host during migration: {err}");
+            return;
+        }
+    };
+    let new_port = rv.port;
+    sess.embedded_rv = Some(rv);
+    sess.rendezvous_addr = SocketAddr::from(([127, 0, 0, 1], new_port));
+    sess.last_rv_rx = Instant::now();
+    sess.migrating_until = Some(Instant::now() + LAN_MIGRATION_GRACE);
+    sess.migration_claimed_at = Some(Instant::now());
+
+    sess.control_seq = sess.control_seq.wrapping_add(1);
+    let hdr = P2pHeader {
+        msg_type: P2pMsgType::LanHostClaim,
+        room_prefix: sess.room_prefix,
+        sender_peer_id: sess.local_peer_id,
+        seq_num: sess.control_seq,
+    };
+    let payload = P2pPayload::LanHostClaim {
+        rv_port: new_port,
+        room_name: sess.lan_room_name.clone(),
+    };
+    if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
+        let peer_ids: Vec<PeerId> = sess.peers.keys().copied().collect();
+        for pid in peer_ids {
+            send_sealed_to_peer(socket, sess, pid, seal_buf, relay_buf).await;
+        }
+    }
+
+    send_register(socket, sess).await;
+    broadcast_lan_announce(lan_tx_sock, sess).await;
+    info!(
+        "Promoted peer #{} to LAN coordinator on port {}",
+        sess.local_peer_id, new_port
+    );
+}
+
+async fn broadcast_lan_announce(lan_tx_sock: Option<&UdpSocket>, sess: &ActiveSession) {
+    let Some(tx) = lan_tx_sock else {
+        return;
+    };
+    let Some(rv) = sess.embedded_rv.as_ref() else {
+        return;
+    };
+    let pkt = LanDiscoveryPacket::Announce {
+        room_id: sess.invite.room_id,
+        secret: sess.invite.secret,
+        rv_port: rv.port,
+        peer_count: (sess.peers.len() + 1).min(MAX_ROOM_PEERS) as u8,
+        max_peers: MAX_ROOM_PEERS as u8,
+        room_name: sess.lan_room_name.clone(),
+        host_nickname: sess.nickname.clone(),
+    };
+    broadcast_lan_packet(tx, &pkt).await;
+}
+
+async fn publish_lan_rooms(
+    map: &HashMap<RoomId, (DiscoveredLanRoom, Instant)>,
+    last_published: &mut Vec<DiscoveredLanRoom>,
+    evt_tx: &NotifyingEventTx,
+) {
+    let mut rooms: Vec<DiscoveredLanRoom> = map.values().map(|(r, _)| r.clone()).collect();
+    rooms.sort_by(|a, b| {
+        a.room_name
+            .cmp(&b.room_name)
+            .then_with(|| a.room_id.cmp(&b.room_id))
+    });
+    if rooms != *last_published {
+        *last_published = rooms.clone();
+        evt_tx.send(MeshEvent::LanRoomsUpdated(rooms)).await;
+    }
+}
+
+async fn recv_lan_opt(sock: Option<&UdpSocket>, buf: &mut [u8]) -> Option<(usize, SocketAddr)> {
+    match sock {
+        Some(s) => s.recv_from(buf).await.ok(),
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::net::transfer::ChatContentUi;
+    use squad_dsp::AudioEngineConfig;
+
+    #[tokio::test]
+    async fn test_lan_host_migration_preserves_room_and_chat() {
+        let rv = start_embedded_rendezvous().await.unwrap();
+        let rv_addr = format!("127.0.0.1:{}", rv.port);
+        let invite = InviteLink::generate();
+
+        let mk_node = |uuid_byte: u8| {
+            let (out_tx, out_rx) = mpsc::channel(64);
+            let audio = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx).unwrap();
+            let slot = Arc::new(Mutex::new(None));
+            let mesh_notify = Arc::new(Notify::new());
+            let video_notify = Arc::new(Notify::new());
+            let (cmd_tx, evt_rx) =
+                spawn_mesh_worker(audio.clone(), out_rx, slot, mesh_notify, video_notify);
+            (audio, cmd_tx, evt_rx, [uuid_byte; 16])
+        };
+
+        let (aud_a, tx_a, mut rx_a, uuid_a) = mk_node(0xA1);
+        let (aud_b, tx_b, mut rx_b, uuid_b) = mk_node(0xB2);
+        let (aud_c, tx_c, mut rx_c, uuid_c) = mk_node(0xC3);
+
+        // Give Peer A embedded server directly via JoinRoom? Even better, let's test BOTH:
+        // 1) A, B, C join LAN server; then drop A's server to trigger deterministic LAN host failover!
+        for (tx, nick, uuid) in [
+            (&tx_a, "AlphaHost", uuid_a),
+            (&tx_b, "BravoSurv", uuid_b),
+            (&tx_c, "CharlieSurv", uuid_c),
+        ] {
+            tx.send(MeshCommand::JoinRoom {
+                rendezvous_server: rv_addr.clone(),
+                invite: invite.clone(),
+                nickname: nick.to_string(),
+                client_uuid: uuid,
+                initial_volumes: HashMap::new(),
+                is_lan_room: true,
+                room_name: Some("Migration Test LAN".to_string()),
+            })
+            .await
+            .unwrap();
+        }
+
+        // Wait until B & C see A + each other Connected via LanDirect
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let mut b_ready = false;
+        let mut c_ready = false;
+        while Instant::now() < deadline && (!b_ready || !c_ready) {
+            while let Ok(ev) = rx_a.try_recv() {
+                let _ = ev;
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers
+                        .iter()
+                        .filter(|p| p.status == PeerConnStatus::Connected)
+                        .count()
+                        >= 2
+                    {
+                        b_ready = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_c.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers
+                        .iter()
+                        .filter(|p| p.status == PeerConnStatus::Connected)
+                        .count()
+                        >= 2
+                    {
+                        c_ready = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(
+            b_ready && c_ready,
+            "All three peers must reach direct Connected state before failover"
+        );
+
+        // Simulate Host A leaving & shutting down original embedded rendezvous server
+        tx_a.send(MeshCommand::LeaveRoom).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        rv.stop().await;
+
+        // Wait up to 11s for deterministic LAN_RV_LOST_TIMEOUT (7s) promotion between B and C
+        // and verify surviving chat works after host migration!
+        tokio::time::sleep(Duration::from_millis(8200)).await;
+        tx_b.send(MeshCommand::SendChatText {
+            text: "Survived LAN host migration!".to_string(),
+        })
+        .await
+        .unwrap();
+
+        let chat_deadline = Instant::now() + Duration::from_secs(3);
+        let mut c_received_chat = false;
+        while Instant::now() < chat_deadline && !c_received_chat {
+            while let Ok(ev) = rx_c.try_recv() {
+                if let MeshEvent::ChatItemReceived(item) = ev {
+                    if matches!(item.content, ChatContentUi::Text(ref t) if t == "Survived LAN host migration!")
+                    {
+                        c_received_chat = true;
+                    }
+                }
+            }
+            while rx_b.try_recv().is_ok() {}
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        assert!(
+            c_received_chat,
+            "Surviving peers must stay connected and exchange chat after LAN host failover"
+        );
+
+        let _ = tx_a.send(MeshCommand::Shutdown).await;
+        let _ = tx_b.send(MeshCommand::Shutdown).await;
+        let _ = tx_c.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        aud_c.shutdown();
     }
 }

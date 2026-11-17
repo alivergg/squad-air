@@ -10,6 +10,7 @@ path = "src/main.rs"
 [dependencies]
 squad-proto = { path = "../squad-proto" }
 squad-dsp = { path = "../squad-dsp" }
+squad-rendezvous = { path = "../squad-rendezvous" }
 tokio.workspace = true
 bytes.workspace = true
 anyhow.workspace = true

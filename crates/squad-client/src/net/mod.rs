@@ -1,7 +1,9 @@
+pub mod lan;
 pub mod mesh;
 pub mod nat;
 pub mod transfer;
 
+pub use lan::DiscoveredLanRoom;
 pub use mesh::{
     spawn_mesh_worker, DecodedVideoFrame, MeshCommand, MeshEvent, PeerConnStatus, PeerRouteKind,
     PeerUiSnapshot, RemoteStreamInfo,
