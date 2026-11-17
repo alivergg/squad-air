@@ -1,5 +1,10 @@
 use squad_dsp::{AudioEngineHandle, MicActivationMode, SoundCue};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, Ordering},
+    Arc, Mutex,
+};
+use std::time::Duration;
+use tokio::sync::Notify;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PhysicalInput {
@@ -14,37 +19,128 @@ enum PhysicalInput {
     Alt,
 }
 
-pub struct HotkeyController {
+#[derive(Clone, Copy, Default)]
+struct HotkeyBindings {
     toggle_mute: Option<PhysicalInput>,
     ptt: Option<PhysicalInput>,
     ptm: Option<PhysicalInput>,
-    prev_toggle_down: AtomicBool,
+    deafen: Option<PhysicalInput>,
+}
+
+struct HotkeyShared {
+    bindings: Mutex<(u64, HotkeyBindings)>,
+    generation: AtomicU64,
+    active: AtomicBool,
+    stop: AtomicBool,
+}
+
+pub struct HotkeyController {
+    shared: Arc<HotkeyShared>,
+    worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl HotkeyController {
-    pub fn new(toggle_key: &str, ptt_key: &str, ptm_key: &str) -> Self {
-        let mut controller = Self {
-            toggle_mute: None,
-            ptt: None,
-            ptm: None,
-            prev_toggle_down: AtomicBool::new(false),
+    pub fn new(
+        toggle_key: &str,
+        ptt_key: &str,
+        ptm_key: &str,
+        deafen_key: &str,
+        audio: AudioEngineHandle,
+        ui_notify: Arc<Notify>,
+    ) -> Self {
+        let initial = HotkeyBindings {
+            toggle_mute: parse_input(toggle_key),
+            ptt: parse_input(ptt_key),
+            ptm: parse_input(ptm_key),
+            deafen: parse_input(deafen_key),
         };
-        controller.rebind(toggle_key, ptt_key, ptm_key);
-        controller
+        let shared = Arc::new(HotkeyShared {
+            bindings: Mutex::new((1, initial)),
+            generation: AtomicU64::new(1),
+            active: AtomicBool::new(false),
+            stop: AtomicBool::new(false),
+        });
+        let worker_shared = Arc::clone(&shared);
+        let worker = std::thread::Builder::new()
+            .name("squad-hotkeys".into())
+            .spawn(move || {
+                run_hotkey_loop(worker_shared, audio, ui_notify);
+            })
+            .ok();
+
+        Self { shared, worker }
     }
 
-    pub fn rebind(&mut self, toggle_key: &str, ptt_key: &str, ptm_key: &str) {
-        self.toggle_mute = parse_input(toggle_key);
-        self.ptt = parse_input(ptt_key);
-        self.ptm = parse_input(ptm_key);
-        self.prev_toggle_down.store(false, Ordering::Relaxed);
+    pub fn rebind(&self, toggle_key: &str, ptt_key: &str, ptm_key: &str, deafen_key: &str) {
+        let next = HotkeyBindings {
+            toggle_mute: parse_input(toggle_key),
+            ptt: parse_input(ptt_key),
+            ptm: parse_input(ptm_key),
+            deafen: parse_input(deafen_key),
+        };
+        let next_gen = self.shared.generation.fetch_add(1, Ordering::AcqRel) + 1;
+        if let Ok(mut guard) = self.shared.bindings.lock() {
+            *guard = (next_gen, next);
+        }
+        if let Some(ref handle) = self.worker {
+            handle.thread().unpark();
+        }
     }
 
-    /// Samples hardware key/mouse states passively every UI tick without intercepting or blocking OS input.
-    pub fn poll_events(&self, audio: &AudioEngineHandle) {
-        let toggle_down = self.toggle_mute.is_some_and(is_input_pressed);
-        let was_toggle_down = self.prev_toggle_down.swap(toggle_down, Ordering::Relaxed);
-        if toggle_down && !was_toggle_down {
+    pub fn set_active(&self, active: bool) {
+        let prev = self.shared.active.swap(active, Ordering::AcqRel);
+        if active && !prev {
+            if let Some(ref handle) = self.worker {
+                handle.thread().unpark();
+            }
+        }
+    }
+
+    pub fn shutdown(&self) {
+        self.shared.stop.store(true, Ordering::Release);
+        if let Some(ref handle) = self.worker {
+            handle.thread().unpark();
+        }
+    }
+}
+
+impl Drop for HotkeyController {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn run_hotkey_loop(shared: Arc<HotkeyShared>, audio: AudioEngineHandle, ui_notify: Arc<Notify>) {
+    let mut local_gen = 0u64;
+    let mut bindings = HotkeyBindings::default();
+    let mut prev_toggle_down = false;
+    let mut prev_deafen_down = false;
+    let mut prev_held = false;
+
+    while !shared.stop.load(Ordering::Acquire) {
+        if !shared.active.load(Ordering::Acquire) {
+            if prev_held {
+                prev_held = false;
+                audio.set_hotkey_held(false);
+            }
+            prev_toggle_down = false;
+            prev_deafen_down = false;
+            std::thread::park_timeout(Duration::from_millis(250));
+            continue;
+        }
+
+        let cur_gen = shared.generation.load(Ordering::Acquire);
+        if cur_gen != local_gen {
+            if let Ok(guard) = shared.bindings.lock() {
+                local_gen = guard.0;
+                bindings = guard.1;
+                prev_toggle_down = false;
+                prev_deafen_down = false;
+            }
+        }
+
+        let toggle_down = bindings.toggle_mute.is_some_and(is_input_pressed);
+        if toggle_down && !prev_toggle_down {
             let new_muted = !audio.is_mic_muted();
             audio.set_mic_muted(new_muted);
             audio.play_cue(if new_muted {
@@ -52,15 +148,40 @@ impl HotkeyController {
             } else {
                 SoundCue::Unmute
             });
+            ui_notify.notify_one();
         }
+        prev_toggle_down = toggle_down;
+
+        let deafen_down = bindings.deafen.is_some_and(is_input_pressed);
+        if deafen_down && !prev_deafen_down {
+            let new_deaf = !audio.is_deafened();
+            audio.set_deafened(new_deaf);
+            audio.play_cue(if new_deaf {
+                SoundCue::Mute
+            } else {
+                SoundCue::Unmute
+            });
+            ui_notify.notify_one();
+        }
+        prev_deafen_down = deafen_down;
 
         let held = match audio.activation_mode() {
             MicActivationMode::ToggleMute => false,
-            MicActivationMode::PushToTalk => self.ptt.is_some_and(is_input_pressed),
-            MicActivationMode::PushToMute => self.ptm.is_some_and(is_input_pressed),
+            MicActivationMode::PushToTalk => bindings.ptt.is_some_and(is_input_pressed),
+            MicActivationMode::PushToMute => bindings.ptm.is_some_and(is_input_pressed),
         };
-        audio.set_hotkey_held(held);
+        if held != prev_held {
+            prev_held = held;
+            audio.set_hotkey_held(held);
+            ui_notify.notify_one();
+        }
+
+        std::thread::sleep(Duration::from_millis(20));
     }
+}
+
+pub fn is_supported_hotkey_name(raw: &str) -> bool {
+    parse_input(raw).is_some()
 }
 
 fn parse_input(raw: &str) -> Option<PhysicalInput> {
@@ -239,8 +360,8 @@ fn mac_keycode(norm: &str) -> Option<u16> {
         "backquote" | "`" | "tilde" => Some(0x32),
         "backspace" => Some(0x33),
         "escape" | "esc" => Some(0x35),
-        "metaright" | "superright" => Some(0x36),
-        "metaleft" | "superleft" => Some(0x37),
+        "metaright" | "superright" | "rwin" => Some(0x36),
+        "metaleft" | "superleft" | "lwin" => Some(0x37),
         "shiftleft" | "lshift" => Some(0x38),
         "capslock" => Some(0x39),
         "altleft" | "lalt" => Some(0x3A),
@@ -248,6 +369,16 @@ fn mac_keycode(norm: &str) -> Option<u16> {
         "shiftright" | "rshift" => Some(0x3C),
         "altright" | "ralt" => Some(0x3D),
         "controlright" | "rctrl" => Some(0x3E),
+        "insert" => Some(0x72),
+        "home" => Some(0x73),
+        "pageup" => Some(0x74),
+        "delete" => Some(0x75),
+        "end" => Some(0x77),
+        "pagedown" => Some(0x79),
+        "arrowleft" | "left" => Some(0x7B),
+        "arrowright" | "right" => Some(0x7C),
+        "arrowdown" | "down" => Some(0x7D),
+        "arrowup" | "up" => Some(0x7E),
         "f1" => Some(0x7A),
         "f2" => Some(0x78),
         "f3" => Some(0x63),
@@ -321,6 +452,18 @@ fn win_vkey(norm: &str) -> Option<i32> {
         "enter" | "return" => Some(0x0D),
         "escape" | "esc" => Some(0x1B),
         "backspace" => Some(0x08),
+        "insert" => Some(0x2D),
+        "delete" => Some(0x2E),
+        "home" => Some(0x24),
+        "end" => Some(0x23),
+        "pageup" => Some(0x21),
+        "pagedown" => Some(0x22),
+        "arrowleft" | "left" => Some(0x25),
+        "arrowup" | "up" => Some(0x26),
+        "arrowright" | "right" => Some(0x27),
+        "arrowdown" | "down" => Some(0x28),
+        "lwin" | "superleft" | "metaleft" => Some(0x5B),
+        "rwin" | "superright" | "metaright" => Some(0x5C),
         "backquote" | "`" | "tilde" => Some(0xC0),
         "minus" | "-" => Some(0xBD),
         "equal" | "=" => Some(0xBB),

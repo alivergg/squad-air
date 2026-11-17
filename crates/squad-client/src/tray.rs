@@ -1,4 +1,6 @@
 use squad_dsp::{AudioEngineHandle, SoundCue};
+use std::sync::{mpsc, Arc, Mutex};
+use tokio::sync::Notify;
 use tray_icon::{
     menu::{Menu, MenuEvent, MenuItem},
     Icon, TrayIcon, TrayIconBuilder,
@@ -12,13 +14,20 @@ pub enum TrayAction {
 
 pub struct SystemTray {
     _tray: Option<TrayIcon>,
+    menu_rx: Mutex<mpsc::Receiver<MenuEvent>>,
     show_item_id: Option<tray_icon::menu::MenuId>,
     mute_item_id: Option<tray_icon::menu::MenuId>,
     quit_item_id: Option<tray_icon::menu::MenuId>,
 }
 
 impl SystemTray {
-    pub fn new() -> Self {
+    pub fn new(tray_notify: Arc<Notify>) -> Self {
+        let (menu_tx, menu_rx) = mpsc::channel();
+        MenuEvent::set_event_handler(Some(move |event| {
+            let _ = menu_tx.send(event);
+            tray_notify.notify_one();
+        }));
+
         let menu = Menu::new();
         let show_item = MenuItem::new("Show Squad-Air", true, None);
         let mute_item = MenuItem::new("Squad-Air: Toggle Mic Mute", true, None);
@@ -44,6 +53,7 @@ impl SystemTray {
 
         Self {
             _tray: tray,
+            menu_rx: Mutex::new(menu_rx),
             show_item_id: Some(show_id),
             mute_item_id: Some(mute_id),
             quit_item_id: Some(quit_id),
@@ -51,7 +61,10 @@ impl SystemTray {
     }
 
     pub fn poll_action(&self, audio: &AudioEngineHandle) -> Option<TrayAction> {
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
+        let Ok(rx) = self.menu_rx.lock() else {
+            return None;
+        };
+        while let Ok(event) = rx.try_recv() {
             if Some(&event.id) == self.show_item_id.as_ref() {
                 return Some(TrayAction::ShowWindow);
             }
@@ -117,10 +130,7 @@ pub fn release_os_memory() {
     #[cfg(target_os = "macos")]
     {
         extern "C" {
-            fn malloc_zone_pressure_relief(
-                zone: *mut std::ffi::c_void,
-                goal: usize,
-            ) -> usize;
+            fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
         }
         unsafe {
             let _ = malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
@@ -132,8 +142,7 @@ pub fn release_os_memory() {
         #[link(name = "kernel32")]
         extern "system" {
             fn GetCurrentProcess() -> isize;
-            fn SetProcessWorkingSetSize(h_process: isize, min_size: usize, max_size: usize)
-                -> i32;
+            fn SetProcessWorkingSetSize(h_process: isize, min_size: usize, max_size: usize) -> i32;
         }
         unsafe {
             let _ = SetProcessWorkingSetSize(GetCurrentProcess(), usize::MAX, usize::MAX);

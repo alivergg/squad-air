@@ -1,7 +1,7 @@
 use anyhow::Result;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
-use squad_dsp::{MicActivationMode, NoiseSuppressionMode};
+use squad_dsp::{JitterProfile, MicActivationMode, NoiseSuppressionMode};
 use squad_proto::ClientUuid;
 use std::collections::HashMap;
 use std::fs;
@@ -38,6 +38,12 @@ pub struct AppConfig {
     pub hotkey_ptm: String,
     pub hotkey_ptt: String,
     pub hotkey_toggle_mute: String,
+    #[serde(default = "default_hotkey_deafen")]
+    pub hotkey_deafen: String,
+    #[serde(default)]
+    pub jitter_profile: JitterProfile,
+    #[serde(default = "default_opus_bitrate_bps")]
+    pub opus_bitrate_bps: i32,
     #[serde(default)]
     pub peer_volumes: HashMap<String, f32>,
     #[serde(default)]
@@ -72,6 +78,9 @@ impl Default for AppConfig {
             hotkey_ptm: "KeyV".to_string(),
             hotkey_ptt: "CapsLock".to_string(),
             hotkey_toggle_mute: "F9".to_string(),
+            hotkey_deafen: default_hotkey_deafen(),
+            jitter_profile: JitterProfile::default(),
+            opus_bitrate_bps: default_opus_bitrate_bps(),
             peer_volumes: HashMap::new(),
             saved_channels: Vec::new(),
             custom_avatar_hash: None,
@@ -177,6 +186,14 @@ fn default_vad_threshold_db() -> f32 {
     -45.0
 }
 
+fn default_hotkey_deafen() -> String {
+    "F10".to_string()
+}
+
+fn default_opus_bitrate_bps() -> i32 {
+    40_000
+}
+
 fn default_minimize_to_tray() -> bool {
     true
 }
@@ -215,15 +232,46 @@ mod tests {
         assert!(cfg.overlay_enabled);
         assert!(!cfg.overlay_speaking_only);
         assert!((cfg.overlay_opacity - 0.82).abs() < 1e-4);
+        assert_eq!(cfg.hotkey_deafen, "F10");
+        assert_eq!(cfg.opus_bitrate_bps, 40_000);
+        assert_eq!(
+            format!("{:?}", cfg.jitter_profile),
+            format!("{:?}", JitterProfile::default())
+        );
 
         cfg.overlay_enabled = false;
         cfg.overlay_speaking_only = true;
         cfg.overlay_opacity = 0.65;
+        cfg.hotkey_deafen = "F11".to_string();
+        cfg.opus_bitrate_bps = 64_000;
 
         let encoded = toml::to_string_pretty(&cfg).unwrap();
         let decoded: AppConfig = toml::from_str(&encoded).unwrap();
         assert!(!decoded.overlay_enabled);
         assert!(decoded.overlay_speaking_only);
         assert!((decoded.overlay_opacity - 0.65).abs() < 1e-4);
+        assert_eq!(decoded.hotkey_deafen, "F11");
+        assert_eq!(decoded.opus_bitrate_bps, 64_000);
+        assert_eq!(
+            format!("{:?}", decoded.jitter_profile),
+            format!("{:?}", cfg.jitter_profile)
+        );
+
+        let legacy_toml: String = encoded
+            .lines()
+            .filter(|line| {
+                !line.starts_with("hotkey_deafen =")
+                    && !line.starts_with("jitter_profile =")
+                    && !line.starts_with("opus_bitrate_bps =")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let legacy_decoded: AppConfig = toml::from_str(&legacy_toml).unwrap();
+        assert_eq!(legacy_decoded.hotkey_deafen, "F10");
+        assert_eq!(legacy_decoded.opus_bitrate_bps, 40_000);
+        assert_eq!(
+            format!("{:?}", legacy_decoded.jitter_profile),
+            format!("{:?}", JitterProfile::default())
+        );
     }
 }
