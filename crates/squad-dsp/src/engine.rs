@@ -604,7 +604,7 @@ fn build_audio_streams(
     let output = build_output_stream_half(host, output_device_name);
 
     info!(
-        "Squad-Air DSP worker active (Capture: {} Hz/{}ch, Playback: {} Hz/{}ch)",
+        "SquadAir DSP worker active (Capture: {} Hz/{}ch, Playback: {} Hz/{}ch)",
         input.sample_rate, input.channels, output.sample_rate, output.channels
     );
 

@@ -51,8 +51,8 @@ jobs:
         with:
           name: release-macos-windows
           path: |
-            dist/Squad-Air-Installer-macos-arm64.pkg
-            dist/Squad-Air-Setup-windows-x86_64.exe
+            dist/SquadAir-Installer-macos-arm64.pkg
+            dist/SquadAir-Setup-windows-x86_64.exe
             dist/squad-rendezvous-macos-arm64.tar.gz
 
   build-linux:

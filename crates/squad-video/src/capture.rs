@@ -476,6 +476,7 @@ mod macos_impl {
                     let owner = dict_string(dict, kCGWindowOwnerName).unwrap_or_default();
                     if owner.is_empty()
                         || owner.eq_ignore_ascii_case("squad-client")
+                        || owner.eq_ignore_ascii_case("SquadAir")
                         || owner.eq_ignore_ascii_case("Squad-Air")
                         || owner == "Window Server"
                         || owner == "Dock"
@@ -739,7 +740,7 @@ mod windows_impl {
         let title = String::from_utf16_lossy(&title_buf[..len as usize])
             .trim()
             .to_string();
-        if title.is_empty() || title.starts_with("Squad-Air") {
+        if title.is_empty() || title.starts_with("SquadAir") || title.starts_with("Squad-Air") {
             return BOOL(1);
         }
 

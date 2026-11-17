@@ -1,4 +1,4 @@
-# Squad-Air Optional DeepFilterNet3 ONNX Model
+# SquadAir Optional DeepFilterNet3 ONNX Model
 
 To enable the **DeepFilterNet3** neural noise suppressor option in Settings:
 1. Place the exported ONNX model at `./assets/models/deepfilternet3.onnx` (or inside your OS config folder `squad-air/models/deepfilternet3.onnx`).

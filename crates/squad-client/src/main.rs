@@ -16,11 +16,11 @@ const INFO_PLIST_STR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
     <key>CFBundleIdentifier</key>
     <string>com.squadair.client</string>
     <key>CFBundleName</key>
-    <string>Squad-Air</string>
+    <string>SquadAir</string>
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>NSMicrophoneUsageDescription</key>
-    <string>Squad-Air uses your microphone for end-to-end encrypted P2P voice chat.</string>
+    <string>SquadAir uses your microphone for end-to-end encrypted P2P voice chat.</string>
 </dict>
 </plist>
 "#;

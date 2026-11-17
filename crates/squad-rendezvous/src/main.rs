@@ -25,7 +25,7 @@ async fn main() -> Result<()> {
     let bind_addr = parse_bind_arg().unwrap_or_else(|| "0.0.0.0:3478".to_string());
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
     info!(
-        "Squad-Air Rendezvous server listening on {}",
+        "SquadAir Rendezvous server listening on {}",
         socket.local_addr()?
     );
 
@@ -90,7 +90,7 @@ pub async fn run_server(
                 handle_datagram(&socket, &state, &buf[..len], src_addr).await;
             }
             _ = shutdown_rx.changed() => {
-                info!("Shutting down Squad-Air Rendezvous server");
+                info!("Shutting down SquadAir Rendezvous server");
                 break;
             }
         }

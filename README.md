@@ -1,11 +1,11 @@
-# Squad-Air
+# SquadAir
 
 [![CI](https://img.shields.io/github/actions/workflow/status/squad-air/squad-air/ci.yml?branch=main&label=CI&style=flat-square)](.github/workflows/ci.yml)
 [![Rust](https://img.shields.io/badge/rust-edition%202021-orange?style=flat-square&logo=rust)](Cargo.toml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](Cargo.toml)
 [![Platforms](https://img.shields.io/badge/platforms-macOS%20ARM64%20%7C%20Windows%20x86__64%20%7C%20Linux%20x86__64-informational?style=flat-square)](#3-step-quick-start)
 
-**Squad-Air** is a lightweight, end-to-end encrypted P2P voice chat, screen sharing, and squad messaging desktop app built in Rust for low-latency gaming. Audio, video, and chat travel directly peer-to-peer over a single UDP socket — no central media server required.
+**SquadAir** is a lightweight, end-to-end encrypted P2P voice chat, screen sharing, and squad messaging desktop app built in Rust for low-latency gaming. Audio, video, and chat travel directly peer-to-peer over a single UDP socket — no central media server required.
 
 ---
 
@@ -27,12 +27,12 @@
 ## 3-Step Quick Start
 
 1. **Download & Install**
-   - **macOS (Apple Silicon):** Download `Squad-Air-Installer-macos-arm64.pkg` from Releases and run it. Installs/upgrades `/Applications/Squad-Air.app` in place and preserves `~/Library/Application Support/squad-air/config.toml`.
-   - **Windows (x86_64):** Download `Squad-Air-Setup-windows-x86_64.exe` from Releases and run it. Installs/upgrades `%LOCALAPPDATA%\Programs\Squad-Air\Squad-Air.exe` with no UAC elevation required and preserves `%APPDATA%\squad-air\config.toml`.
+   - **macOS (Apple Silicon):** Download `SquadAir-Installer-macos-arm64.pkg` from Releases and run it. Installs/upgrades `/Applications/SquadAir.app` in place and preserves `~/Library/Application Support/squad-air/config.toml`.
+   - **Windows (x86_64):** Download `SquadAir-Setup-windows-x86_64.exe` from Releases and run it. Installs/upgrades `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` with no UAC elevation required and preserves `%APPDATA%\squad-air\config.toml`.
    - **Linux (x86_64):** Download `squad-client-linux-x86_64.tar.gz` or [build from source](#build-from-source).
 
 2. **Create a Room & Share the Invite Link**
-   - Open Squad-Air, click **Create Room** to generate a cryptographic `squad://<room_id>#<secret>` link (legacy `voice://` links are also supported), and send it to your squad.
+   - Open SquadAir, click **Create Room** to generate a cryptographic `squad://<room_id>#<secret>` link (legacy `voice://` links are also supported), and send it to your squad.
    - To join a friend's room, paste their `squad://` link in the lobby and click **Join**.
 
 3. **Configure Voice & Play**
@@ -43,7 +43,7 @@
 
 ## Architecture & Latency Breakdown
 
-Squad-Air is organized as a 5-crate Rust workspace:
+SquadAir is organized as a 5-crate Rust workspace:
 
 | Crate | Role |
 | :--- | :--- |
@@ -88,7 +88,7 @@ Because `squad-rendezvous` only exchanges peer addresses during room join and ho
    sudo ufw allow 3478/udp
    ```
 
-3. In the Squad-Air client, open **Settings -> Voice Server** and enter `<your-server-ip>:3478`.
+3. In the SquadAir client, open **Settings -> Voice Server** and enter `<your-server-ip>:3478`.
 
 To inspect logs or customize the bind port:
 
@@ -112,7 +112,7 @@ Point every player's **Settings -> Voice Server** to `<host-lan-ip>:3478` (or `1
 
 To use **DeepFilterNet3** neural noise suppression in **Settings**:
 1. Place the exported ONNX model at `./assets/models/deepfilternet3.onnx` or inside your OS config directory under `squad-air/models/deepfilternet3.onnx` (see [`assets/models/README.md`](assets/models/README.md)).
-2. If the file is missing, Squad-Air automatically falls back to built-in **RNNoise**.
+2. If the file is missing, SquadAir automatically falls back to built-in **RNNoise**.
 
 ---
 
@@ -151,6 +151,6 @@ On a macOS host with `mingw-w64` and the `x86_64-pc-windows-gnu` Rust target ins
 ```
 
 This outputs both installers into `dist/`:
-- `dist/Squad-Air-Installer-macos-arm64.pkg`
-- `dist/Squad-Air-Setup-windows-x86_64.exe`
-- `dist/Squad-Air.app`
+- `dist/SquadAir-Installer-macos-arm64.pkg`
+- `dist/SquadAir-Setup-windows-x86_64.exe`
+- `dist/SquadAir.app`

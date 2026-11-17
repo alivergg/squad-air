@@ -359,7 +359,7 @@ impl SquadApp {
         };
 
         let audio = AudioEngineHandle::start(engine_cfg, audio_out_tx)
-            .expect("Failed to initialize Squad-Air DSP audio engine");
+            .expect("Failed to initialize SquadAir DSP audio engine");
         audio.set_stream_gain(config.stream_volume);
 
         let mesh_notify = Arc::new(Notify::new());
@@ -473,12 +473,12 @@ impl SquadApp {
 
     pub fn title(&self, window_id: iced::window::Id) -> String {
         if Some(window_id) == self.overlay_window_id {
-            return "Squad-Air Overlay".to_string();
+            return "SquadAir Overlay".to_string();
         }
         match self.screen {
-            Screen::Lobby => "Squad-Air".to_string(),
-            Screen::Room => "Squad-Air — Voice Room".to_string(),
-            Screen::Settings => "Squad-Air — Settings".to_string(),
+            Screen::Lobby => "SquadAir".to_string(),
+            Screen::Room => "SquadAir — Voice Room".to_string(),
+            Screen::Settings => "SquadAir — Settings".to_string(),
         }
     }
 

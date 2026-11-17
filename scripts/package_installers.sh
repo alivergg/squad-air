@@ -28,10 +28,10 @@ DIST_DIR="$ROOT_DIR/dist"
 STAGING_DIR="$ROOT_DIR/target/pkg-staging"
 MAC_ROOT="$STAGING_DIR/root"
 MAC_SCRIPTS="$STAGING_DIR/scripts"
-APP_BUNDLE="$MAC_ROOT/Squad-Air.app"
-DIST_APP="$DIST_DIR/Squad-Air.app"
-MAC_PKG="$DIST_DIR/Squad-Air-Installer-macos-arm64.pkg"
-WIN_SETUP="$DIST_DIR/Squad-Air-Setup-windows-x86_64.exe"
+APP_BUNDLE="$MAC_ROOT/SquadAir.app"
+DIST_APP="$DIST_DIR/SquadAir.app"
+MAC_PKG="$DIST_DIR/SquadAir-Installer-macos-arm64.pkg"
+WIN_SETUP="$DIST_DIR/SquadAir-Setup-windows-x86_64.exe"
 
 echo "==> [1/4] Building macOS release binary (v${VERSION})..."
 "$CARGO_BIN" build --release -p squad-client
@@ -54,9 +54,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <plist version="1.0">
 <dict>
 	<key>CFBundleName</key>
-	<string>Squad-Air</string>
+	<string>SquadAir</string>
 	<key>CFBundleDisplayName</key>
-	<string>Squad-Air</string>
+	<string>SquadAir</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.squadair.client</string>
 	<key>CFBundleExecutable</key>
@@ -74,7 +74,7 @@ cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 	<key>NSHighResolutionCapable</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>Squad-Air needs microphone access for encrypted squad voice chat.</string>
+	<string>SquadAir needs microphone access for encrypted squad voice chat.</string>
 </dict>
 </plist>
 EOF
@@ -94,7 +94,7 @@ cat > "$STAGING_DIR/component.plist" <<EOF
 		<key>BundleOverwriteAction</key>
 		<string>upgrade</string>
 		<key>RootRelativeBundlePath</key>
-		<string>Squad-Air.app</string>
+		<string>SquadAir.app</string>
 	</dict>
 </array>
 </plist>
@@ -109,9 +109,9 @@ chmod 755 "$MAC_SCRIPTS/preinstall"
 
 cat > "$MAC_SCRIPTS/postinstall" <<'EOF'
 #!/bin/sh
-if [ -d "/Applications/Squad-Air.app" ]; then
-    /usr/bin/xattr -cr "/Applications/Squad-Air.app" 2>/dev/null || true
-    /bin/chmod 755 "/Applications/Squad-Air.app/Contents/MacOS/squad-client" 2>/dev/null || true
+if [ -d "/Applications/SquadAir.app" ]; then
+    /usr/bin/xattr -cr "/Applications/SquadAir.app" 2>/dev/null || true
+    /bin/chmod 755 "/Applications/SquadAir.app/Contents/MacOS/squad-client" 2>/dev/null || true
 fi
 exit 0
 EOF

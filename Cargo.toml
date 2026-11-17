@@ -12,7 +12,7 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-authors = ["Squad-Air Contributors"]
+authors = ["SquadAir Contributors"]
 
 [workspace.dependencies]
 tokio = { version = "1.41", features = ["full"] }

@@ -31,7 +31,7 @@ pub const M3_WARNING: Color = rgb_u8(0xF0, 0xB2, 0x32);
 
 pub fn material_dark_theme() -> Theme {
     Theme::custom(
-        "Squad-Air Discord M3".to_string(),
+        "SquadAir Discord M3".to_string(),
         Palette {
             background: M3_BACKGROUND,
             text: M3_ON_SURFACE,

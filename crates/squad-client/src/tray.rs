@@ -29,9 +29,9 @@ impl SystemTray {
         }));
 
         let menu = Menu::new();
-        let show_item = MenuItem::new("Show Squad-Air", true, None);
-        let mute_item = MenuItem::new("Squad-Air: Toggle Mic Mute", true, None);
-        let quit_item = MenuItem::new("Quit Squad-Air", true, None);
+        let show_item = MenuItem::new("Show SquadAir", true, None);
+        let mute_item = MenuItem::new("SquadAir: Toggle Mic Mute", true, None);
+        let quit_item = MenuItem::new("Quit SquadAir", true, None);
 
         let show_id = show_item.id().clone();
         let mute_id = mute_item.id().clone();
@@ -44,7 +44,7 @@ impl SystemTray {
         let icon = load_custom_tray_icon().or_else(build_procedural_icon);
         let tray = icon.and_then(|ic| {
             TrayIconBuilder::new()
-                .with_tooltip("Squad-Air P2P Voice")
+                .with_tooltip("SquadAir P2P Voice")
                 .with_menu(Box::new(menu))
                 .with_icon(ic)
                 .build()

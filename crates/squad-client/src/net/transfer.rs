@@ -1618,7 +1618,7 @@ pub fn app_data_root_dir() -> PathBuf {
 pub fn downloads_root_dir() -> PathBuf {
     dirs::download_dir()
         .unwrap_or_else(|| PathBuf::from("."))
-        .join("Squad-Air")
+        .join("SquadAir")
 }
 
 fn room_history_path(root: &Path, room_id: &RoomId) -> PathBuf {

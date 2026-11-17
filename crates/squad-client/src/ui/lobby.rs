@@ -88,7 +88,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     let sidebar = container(
         column![
             column![
-                text("SQUAD-AIR").size(20).color(M3_PRIMARY),
+                text("SquadAir").size(20).color(M3_PRIMARY),
                 text("Private Voice & Screen Share")
                     .size(11)
                     .color(M3_ON_SURFACE_VARIANT),

@@ -1,6 +1,6 @@
 param(
     [switch]$SelfSign,
-    [string]$CertSubject = "CN=Squad-Air Open Source"
+    [string]$CertSubject = "CN=SquadAir Open Source"
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,7 +67,7 @@ if ($Iscc) {
     if ($LASTEXITCODE -ne 0) {
         throw "ISCC.exe failed with exit code $LASTEXITCODE"
     }
-    $SetupPath = Join-Path $RootDir "dist\Squad-Air-Setup-windows-x86_64.exe"
+    $SetupPath = Join-Path $RootDir "dist\SquadAir-Setup-windows-x86_64.exe"
 
     if ($SelfSign -and $SignTool -and $CertThumbprint -and (Test-Path $SetupPath)) {
         Write-Host "==> Signing $SetupPath..." -ForegroundColor Cyan

@@ -1,8 +1,8 @@
-#define MyAppName "Squad-Air"
+#define MyAppName "SquadAir"
 #define MyAppVersion "0.1.0"
-#define MyAppPublisher "Squad-Air Open Source"
+#define MyAppPublisher "SquadAir Open Source"
 #define MyAppURL "https://squad-air.local"
-#define MyAppExeName "Squad-Air.exe"
+#define MyAppExeName "SquadAir.exe"
 
 [Setup]
 AppId={{7A9E4E82-4D2E-4D1F-9B6A-5E3C2A8B1F90}
@@ -18,7 +18,7 @@ DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 OutputDir=..\dist
-OutputBaseFilename=Squad-Air-Setup-windows-x86_64
+OutputBaseFilename=SquadAir-Setup-windows-x86_64
 SetupIconFile=..\assets\icons\squad-air.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 WizardStyle=modern
@@ -29,10 +29,10 @@ CloseApplications=force
 RestartApplications=no
 VersionInfoVersion=0.1.0.0
 VersionInfoCompany={#MyAppPublisher}
-VersionInfoDescription=Squad-Air Encrypted P2P Voice & Screen Share Setup
+VersionInfoDescription=SquadAir Encrypted P2P Voice & Screen Share Setup
 VersionInfoProductName={#MyAppName}
 VersionInfoProductVersion=0.1.0.0
-VersionInfoCopyright=Copyright (c) 2026 Squad-Air Contributors
+VersionInfoCopyright=Copyright (c) 2026 SquadAir Contributors
 
 [Languages]
 Name: "english"; MessagesFile: "compiler:Default.isl"
@@ -44,8 +44,8 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Source: "..\target\release\squad-client.exe"; DestDir: "{app}"; DestName: "{#MyAppExeName}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "Squad-Air Encrypted P2P Voice & Screen Share"
-Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Comment: "Squad-Air Encrypted P2P Voice & Screen Share"
+Name: "{autoprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Comment: "SquadAir Encrypted P2P Voice & Screen Share"
+Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: desktopicon; Comment: "SquadAir Encrypted P2P Voice & Screen Share"
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(MyAppName, '&', '&&')}}"; Flags: nowait postinstall skipifsilent

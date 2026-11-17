@@ -19,6 +19,6 @@ description: Strict API rules for iced 0.13, ringbuf 0.4, nnnoiseless, and real-
    - NEVER deliver raw standalone binaries (`squad-client` / `squad-client.exe`) as final release artifacts.
    - ALWAYS package both platforms simultaneously by running `./scripts/package_installers.sh`.
    - The script compiles macOS ARM64 (`cargo build --release`) and Windows x86_64 (`cargo build --release --target x86_64-pc-windows-gnu`) and builds minimalist, upgrade-in-place installers in `dist/`:
-     - `dist/Squad-Air-Installer-macos-arm64.pkg` — upgrades `/Applications/Squad-Air.app` directly (preserving user settings).
-     - `dist/Squad-Air-Setup-windows-x86_64.exe` — upgrades `%LOCALAPPDATA%\Programs\Squad-Air\Squad-Air.exe` in place, preserves `config.toml`, and prompts to create a Desktop shortcut.
+     - `dist/SquadAir-Installer-macos-arm64.pkg` — upgrades `/Applications/SquadAir.app` directly (preserving user settings).
+     - `dist/SquadAir-Setup-windows-x86_64.exe` — upgrades `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` in place, preserves `config.toml`, and prompts to create a Desktop shortcut.
    - See [BUILD_AND_INSTALLERS.md](../../../BUILD_AND_INSTALLERS.md) for full packaging details.

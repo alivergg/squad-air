@@ -13,13 +13,13 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
-            VALUE "CompanyName",      "Squad-Air Open Source\0"
-            VALUE "FileDescription",  "Squad-Air Encrypted P2P Voice & Screen Share\0"
+            VALUE "CompanyName",      "SquadAir Open Source\0"
+            VALUE "FileDescription",  "SquadAir Encrypted P2P Voice & Screen Share\0"
             VALUE "FileVersion",      "0.1.0.0\0"
             VALUE "InternalName",     "squad-client.exe\0"
-            VALUE "LegalCopyright",   "Copyright (c) 2026 Squad-Air Contributors\0"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 SquadAir Contributors\0"
             VALUE "OriginalFilename", "squad-client.exe\0"
-            VALUE "ProductName",      "Squad-Air\0"
+            VALUE "ProductName",      "SquadAir\0"
             VALUE "ProductVersion",   "0.1.0.0\0"
         END
     END

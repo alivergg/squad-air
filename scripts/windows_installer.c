@@ -10,7 +10,7 @@
 #include <tlhelp32.h>
 #include <wchar.h>
 
-#define APP_NAME L"Squad-Air"
+#define APP_NAME L"SquadAir"
 #define APP_VERSION L"0.1.0"
 #define RESOURCE_PAYLOAD_ID 101
 #define IDC_INSTALL_BTN 1001
@@ -34,7 +34,7 @@ static void init_install_paths(void) {
         GetEnvironmentVariableW(L"LOCALAPPDATA", local_appdata, MAX_PATH);
     }
     swprintf(g_install_dir, MAX_PATH, L"%ls\\Programs\\%ls", local_appdata, APP_NAME);
-    swprintf(g_exe_path, MAX_PATH, L"%ls\\Squad-Air.exe", g_install_dir);
+    swprintf(g_exe_path, MAX_PATH, L"%ls\\SquadAir.exe", g_install_dir);
 
     DWORD attrs = GetFileAttributesW(g_exe_path);
     g_is_upgrade = (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
@@ -65,7 +65,8 @@ static void kill_running_instances(void) {
             if (pe.th32ProcessID == self_pid) {
                 continue;
             }
-            if (_wcsicmp(pe.szExeFile, L"Squad-Air.exe") == 0 ||
+            if (_wcsicmp(pe.szExeFile, L"SquadAir.exe") == 0 ||
+                _wcsicmp(pe.szExeFile, L"Squad-Air.exe") == 0 ||
                 _wcsicmp(pe.szExeFile, L"squad-client.exe") == 0) {
                 HANDLE hproc = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pe.th32ProcessID);
                 if (hproc) {
@@ -96,7 +97,7 @@ static BOOL extract_payload_atomically(void) {
     }
 
     wchar_t tmp_path[MAX_PATH] = {0};
-    swprintf(tmp_path, MAX_PATH, L"%ls\\Squad-Air.exe.tmp", g_install_dir);
+    swprintf(tmp_path, MAX_PATH, L"%ls\\SquadAir.exe.tmp", g_install_dir);
 
     HANDLE hf = CreateFileW(
         tmp_path,
@@ -153,7 +154,7 @@ static void create_shortcut(const wchar_t *lnk_path, const wchar_t *target_exe, 
 
     IShellLinkW_SetPath(psl, target_exe);
     IShellLinkW_SetWorkingDirectory(psl, work_dir);
-    IShellLinkW_SetDescription(psl, L"Squad-Air Encrypted P2P Voice & Screen Share");
+    IShellLinkW_SetDescription(psl, L"SquadAir Encrypted P2P Voice & Screen Share");
     IShellLinkW_SetIconLocation(psl, target_exe, 0);
 
     IPersistFile *ppf = NULL;
@@ -168,7 +169,7 @@ static void create_start_menu_shortcut(void) {
     wchar_t programs[MAX_PATH] = {0};
     if (SHGetSpecialFolderPathW(NULL, programs, CSIDL_PROGRAMS, TRUE)) {
         wchar_t lnk[MAX_PATH] = {0};
-        swprintf(lnk, MAX_PATH, L"%ls\\Squad-Air.lnk", programs);
+        swprintf(lnk, MAX_PATH, L"%ls\\SquadAir.lnk", programs);
         create_shortcut(lnk, g_exe_path, g_install_dir);
     }
 }
@@ -177,7 +178,7 @@ static void create_desktop_shortcut(void) {
     wchar_t desktop[MAX_PATH] = {0};
     if (SHGetSpecialFolderPathW(NULL, desktop, CSIDL_DESKTOPDIRECTORY, TRUE)) {
         wchar_t lnk[MAX_PATH] = {0};
-        swprintf(lnk, MAX_PATH, L"%ls\\Squad-Air.lnk", desktop);
+        swprintf(lnk, MAX_PATH, L"%ls\\SquadAir.lnk", desktop);
         create_shortcut(lnk, g_exe_path, g_install_dir);
     }
 }
@@ -201,8 +202,8 @@ static void write_uninstall_registry(void) {
                    (DWORD)((wcslen(APP_NAME) + 1) * sizeof(wchar_t)));
     RegSetValueExW(hkey, L"DisplayVersion", 0, REG_SZ, (const BYTE *)APP_VERSION,
                    (DWORD)((wcslen(APP_VERSION) + 1) * sizeof(wchar_t)));
-    RegSetValueExW(hkey, L"Publisher", 0, REG_SZ, (const BYTE *)L"Squad-Air Open Source",
-                   (DWORD)((wcslen(L"Squad-Air Open Source") + 1) * sizeof(wchar_t)));
+    RegSetValueExW(hkey, L"Publisher", 0, REG_SZ, (const BYTE *)L"SquadAir Open Source",
+                   (DWORD)((wcslen(L"SquadAir Open Source") + 1) * sizeof(wchar_t)));
     RegSetValueExW(hkey, L"InstallLocation", 0, REG_SZ, (const BYTE *)g_install_dir,
                    (DWORD)((wcslen(g_install_dir) + 1) * sizeof(wchar_t)));
     RegSetValueExW(hkey, L"DisplayIcon", 0, REG_SZ, (const BYTE *)g_exe_path,
@@ -225,8 +226,8 @@ static void run_installation(HWND hwnd) {
     if (!extract_payload_atomically()) {
         MessageBoxW(
             hwnd,
-            L"Failed to write Squad-Air.exe. Please close the running application manually and try again.",
-            L"Squad-Air Setup Error",
+            L"Failed to write SquadAir.exe. Please close the running application manually and try again.",
+            L"SquadAir Setup Error",
             MB_OK | MB_ICONERROR
         );
         EnableWindow(g_hwnd_install, TRUE);
@@ -238,13 +239,13 @@ static void run_installation(HWND hwnd) {
     write_uninstall_registry();
 
     const wchar_t *done_msg = g_is_upgrade
-        ? L"Squad-Air was successfully updated!\n\nCreate a Desktop shortcut?"
-        : L"Squad-Air was successfully installed!\n\nCreate a Desktop shortcut?";
+        ? L"SquadAir was successfully updated!\n\nCreate a Desktop shortcut?"
+        : L"SquadAir was successfully installed!\n\nCreate a Desktop shortcut?";
 
     int add_desktop = MessageBoxW(
         hwnd,
         done_msg,
-        L"Squad-Air Setup",
+        L"SquadAir Setup",
         MB_YESNO | MB_ICONQUESTION
     );
     if (add_desktop == IDYES) {
@@ -254,8 +255,8 @@ static void run_installation(HWND hwnd) {
 
     int launch_now = MessageBoxW(
         hwnd,
-        L"Launch Squad-Air now?",
-        L"Squad-Air Setup",
+        L"Launch SquadAir now?",
+        L"SquadAir Setup",
         MB_YESNO | MB_ICONINFORMATION
     );
     if (launch_now == IDYES) {
@@ -280,12 +281,12 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         );
 
         const wchar_t *header_text = g_is_upgrade
-            ? L"Update Squad-Air v" APP_VERSION
-            : L"Install Squad-Air v" APP_VERSION;
+            ? L"Update SquadAir v" APP_VERSION
+            : L"Install SquadAir v" APP_VERSION;
 
         const wchar_t *desc_text = g_is_upgrade
-            ? L"An existing Squad-Air installation was detected.\nYour application will be updated in place while keeping your settings and saved channels."
-            : L"Minimal one-click setup.\nInstall location: %LOCALAPPDATA%\\Programs\\Squad-Air";
+            ? L"An existing SquadAir installation was detected.\nYour application will be updated in place while keeping your settings and saved channels."
+            : L"Minimal one-click setup.\nInstall location: %LOCALAPPDATA%\\Programs\\SquadAir";
 
         const wchar_t *btn_text = g_is_upgrade ? L"Update" : L"Install";
 
@@ -366,7 +367,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
     g_hwnd_main = CreateWindowExW(
         WS_EX_DLGMODALFRAME,
         cls_name,
-        L"Squad-Air Setup",
+        L"SquadAir Setup",
         WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_MINIMIZEBOX,
         x, y, width, height,
         NULL, NULL, hInstance, NULL

@@ -1,4 +1,4 @@
-# Squad-Air Optional Notification Sound Cues
+# SquadAir Optional Notification Sound Cues
 
 Place standard 16-bit or 32-bit float `.wav` files (48,000 Hz recommended) in this directory (`./assets/sounds/`) or in your OS user configuration directory (`squad-air/sounds/`).
 
