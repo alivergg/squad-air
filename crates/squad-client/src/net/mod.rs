@@ -6,4 +6,6 @@ pub use mesh::{
     spawn_mesh_worker, DecodedVideoFrame, MeshCommand, MeshEvent, PeerConnStatus, PeerRouteKind,
     PeerUiSnapshot, RemoteStreamInfo,
 };
-pub use transfer::{downloads_root_dir, BlobTransferState, ChatContentUi, ChatItemUi};
+pub use transfer::{
+    downloads_root_dir, BlobTransferState, ChatContentUi, ChatItemUi, PeerEndpoint,
+};

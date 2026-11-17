@@ -704,3 +704,208 @@ async fn test_e2e_h265_decoder_error_triggers_auto_h264_fallback_and_full_1080p(
     assert_eq!(decoded.height, 1080);
     assert_eq!(decoded.rgba.len(), 1920 * 1080 * 4);
 }
+
+#[tokio::test]
+async fn test_e2e_relay_framing_opus_decode_and_handoff_dedup() {
+    use squad_dsp::{JitterBuffer, JitterProfile};
+    use squad_proto::{
+        encode_relay_datagram_into, is_relay_datagram, parse_relay_header, rewrite_relay_peer_id,
+        MAX_RELAY_UDP_PAYLOAD, RELAY_HEADER_LEN,
+    };
+
+    let invite = InviteLink::generate();
+    let cipher_a = RoomCipher::from_secret(&invite.secret);
+    let cipher_b = RoomCipher::from_secret(&invite.secret);
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_relay = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let addr_a = sock_a.local_addr().unwrap();
+    let addr_relay = sock_relay.local_addr().unwrap();
+    let addr_b = sock_b.local_addr().unwrap();
+
+    // Verify encrypted PunchSyn wrapped in a relay envelope with server peer-ID rewrite.
+    let mut inner_buf = Vec::new();
+    let mut relay_wire = Vec::with_capacity(MAX_RELAY_UDP_PAYLOAD);
+    let mut rx_relay = [0u8; MAX_RELAY_UDP_PAYLOAD + 64];
+    let mut rx_b = [0u8; MAX_RELAY_UDP_PAYLOAD + 64];
+
+    let syn_hdr = P2pHeader {
+        msg_type: P2pMsgType::PunchSyn,
+        room_prefix: invite.room_prefix(),
+        sender_peer_id: 1,
+        seq_num: 1,
+    };
+    let syn_payload = P2pPayload::PunchSyn {
+        client_uuid: [0xA1; 16],
+        timestamp_us: 999_001,
+    };
+    cipher_a
+        .seal_packet(&syn_hdr, &syn_payload, &mut inner_buf)
+        .unwrap();
+    encode_relay_datagram_into(&invite.room_id, 2, &inner_buf, &mut relay_wire).unwrap();
+    assert!(is_relay_datagram(&relay_wire));
+    sock_a.send_to(&relay_wire, addr_relay).await.unwrap();
+
+    let (len_r, from_r) =
+        tokio::time::timeout(Duration::from_secs(1), sock_relay.recv_from(&mut rx_relay))
+            .await
+            .unwrap()
+            .unwrap();
+    assert_eq!(from_r, addr_a);
+    assert!(is_relay_datagram(&rx_relay[..len_r]));
+    let (r_room, target_pid, _) = parse_relay_header(&rx_relay[..len_r]).unwrap();
+    assert_eq!(r_room, invite.room_id);
+    assert_eq!(target_pid, 2);
+    rewrite_relay_peer_id(&mut rx_relay[..len_r], 1);
+    sock_relay
+        .send_to(&rx_relay[..len_r], addr_b)
+        .await
+        .unwrap();
+
+    let (len_b, from_b) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_b))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(from_b, addr_relay);
+    assert!(is_relay_datagram(&rx_b[..len_b]));
+    let (b_room, relay_sender_pid, _) = parse_relay_header(&rx_b[..len_b]).unwrap();
+    assert_eq!(b_room, invite.room_id);
+    assert_eq!(relay_sender_pid, 1);
+    let (dec_syn_hdr, dec_syn) = cipher_b
+        .open_packet(&mut rx_b[RELAY_HEADER_LEN..len_b])
+        .unwrap();
+    assert_eq!(dec_syn_hdr.sender_peer_id, relay_sender_pid);
+    assert_eq!(dec_syn, syn_payload);
+
+    // Encode 5 active 10 ms Opus frames after warming up the encoder.
+    let mut encoder = OpusEncoder10ms::new(40_000).unwrap();
+    let mut pcm_in = [0.0f32; FRAME_SAMPLES];
+    for (i, sample) in pcm_in.iter_mut().enumerate() {
+        let t = i as f32 / 48_000.0;
+        *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.6;
+    }
+    let _ = encoder.encode_frame(&pcm_in).unwrap();
+    let _ = encoder.encode_frame(&pcm_in).unwrap();
+    let mut opus_frames = Vec::with_capacity(5);
+    for _ in 0..5 {
+        opus_frames.push(
+            encoder
+                .encode_frame(&pcm_in)
+                .unwrap()
+                .expect("non-DTX active sine frame"),
+        );
+    }
+
+    // Phase 1: Deliver seq 1..=3 via the UDP relay path.
+    let mut jb = JitterBuffer::with_profile(JitterProfile::Balanced);
+    for seq in 1..=3u64 {
+        let hdr = P2pHeader {
+            msg_type: P2pMsgType::AudioOpus,
+            room_prefix: invite.room_prefix(),
+            sender_peer_id: 1,
+            seq_num: seq,
+        };
+        let payload = P2pPayload::AudioOpus {
+            opus_data: opus_frames[(seq - 1) as usize].clone(),
+        };
+        cipher_a
+            .seal_packet(&hdr, &payload, &mut inner_buf)
+            .unwrap();
+        encode_relay_datagram_into(&invite.room_id, 2, &inner_buf, &mut relay_wire).unwrap();
+        sock_a.send_to(&relay_wire, addr_relay).await.unwrap();
+
+        let (len_r, _) =
+            tokio::time::timeout(Duration::from_secs(1), sock_relay.recv_from(&mut rx_relay))
+                .await
+                .unwrap()
+                .unwrap();
+        let (room, pid, _) = parse_relay_header(&rx_relay[..len_r]).unwrap();
+        assert_eq!(room, invite.room_id);
+        assert_eq!(pid, 2);
+        rewrite_relay_peer_id(&mut rx_relay[..len_r], 1);
+        sock_relay
+            .send_to(&rx_relay[..len_r], addr_b)
+            .await
+            .unwrap();
+
+        let (len_b, from_b) =
+            tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_b))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(from_b, addr_relay);
+        let (rx_room, sender_pid, _) = parse_relay_header(&rx_b[..len_b]).unwrap();
+        assert_eq!(rx_room, invite.room_id);
+        assert_eq!(sender_pid, 1);
+        let (dec_hdr, dec_payload) = cipher_b
+            .open_packet(&mut rx_b[RELAY_HEADER_LEN..len_b])
+            .unwrap();
+        assert_eq!(dec_hdr.sender_peer_id, 1);
+        let P2pPayload::AudioOpus { opus_data } = dec_payload else {
+            panic!("Expected AudioOpus over relay");
+        };
+        jb.push_packet(dec_hdr.seq_num, opus_data);
+    }
+
+    // Pop seq 1 so next_expected_seq advances to 2 before direct handoff.
+    let mut pcm_out = [0.0f32; FRAME_SAMPLES];
+    assert!(jb.pop_pcm_frame(&mut pcm_out));
+    let rms_1 = (pcm_out.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
+    assert!(rms_1 > 0.05, "Expected audible RMS for seq 1, got {rms_1}");
+
+    // Phase 2: Simulate relay-to-direct handoff with duplicate seq 1 (stale) and seq 3 (in-window),
+    // followed by direct seq 4 and seq 5 without relay encapsulation.
+    for seq in [1u64, 3, 4, 5] {
+        let hdr = P2pHeader {
+            msg_type: P2pMsgType::AudioOpus,
+            room_prefix: invite.room_prefix(),
+            sender_peer_id: 1,
+            seq_num: seq,
+        };
+        let payload = P2pPayload::AudioOpus {
+            opus_data: opus_frames[(seq - 1) as usize].clone(),
+        };
+        cipher_a
+            .seal_packet(&hdr, &payload, &mut inner_buf)
+            .unwrap();
+        sock_a.send_to(&inner_buf, addr_b).await.unwrap();
+
+        let (len_b, from_b) =
+            tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_b))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(from_b, addr_a);
+        assert!(!is_relay_datagram(&rx_b[..len_b]));
+        let (dec_hdr, dec_payload) = cipher_b.open_packet(&mut rx_b[..len_b]).unwrap();
+        assert_eq!(dec_hdr.sender_peer_id, 1);
+        let P2pPayload::AudioOpus { opus_data } = dec_payload else {
+            panic!("Expected direct AudioOpus during handoff");
+        };
+        jb.push_packet(dec_hdr.seq_num, opus_data);
+    }
+
+    // Remaining seq 2, 3, 4, 5 must each decode cleanly once with zero duplicate replay.
+    for expected_seq in 2..=5u64 {
+        assert!(
+            jb.pop_pcm_frame(&mut pcm_out),
+            "Expected decoded frame for seq {expected_seq}"
+        );
+        let rms = (pcm_out.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
+        assert!(
+            rms > 0.05,
+            "Expected audible RMS for seq {expected_seq}, got {rms}"
+        );
+    }
+
+    // Drain up to 3 PLC concealment frames, then verify no duplicate buffered packets remain.
+    for _ in 0..3 {
+        let _ = jb.pop_pcm_frame(&mut pcm_out);
+    }
+    assert!(
+        !jb.pop_pcm_frame(&mut pcm_out),
+        "Duplicate handoff packets must not replay after seq 5"
+    );
+    assert_eq!(jb.snapshot().loss_pct, 0.0);
+}

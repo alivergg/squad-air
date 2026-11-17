@@ -49,6 +49,22 @@ pub fn telemetry_badge<'a, Message: 'a>(peer: &PeerUiSnapshot) -> Element<'a, Me
         (PeerConnStatus::NatFailed, _) | (_, PeerRouteKind::NatFailed) => {
             ("NAT Failed".to_string(), M3_ERROR)
         }
+        (PeerConnStatus::Relayed, _) | (_, PeerRouteKind::Relayed) => {
+            let txt = if peer.loss_pct >= 0.5 {
+                format!(
+                    "Relay • {} ms • +{}ms buf • {:.1}%",
+                    peer.rtt_ms, peer.jitter_ms, peer.loss_pct
+                )
+            } else {
+                format!("Relay • {} ms • +{}ms buf", peer.rtt_ms, peer.jitter_ms)
+            };
+            let col = if peer.loss_pct >= 5.0 {
+                M3_ERROR
+            } else {
+                M3_WARNING
+            };
+            (txt, col)
+        }
         (PeerConnStatus::Connected, route) => {
             let prefix = match route {
                 PeerRouteKind::LanDirect => "LAN",

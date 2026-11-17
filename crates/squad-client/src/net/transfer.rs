@@ -1,6 +1,6 @@
 use squad_proto::{
-    ClientUuid, P2pHeader, P2pPayload, PeerId, RoomCipher, RoomId, BLOB_CHUNK_SIZE,
-    INLINE_IMAGE_MAX_BYTES,
+    encode_relay_datagram_into, ClientUuid, P2pHeader, P2pPayload, PeerId, RoomCipher, RoomId,
+    BLOB_CHUNK_SIZE, INLINE_IMAGE_MAX_BYTES, MAX_RELAY_UDP_PAYLOAD,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -83,6 +83,22 @@ pub enum TransferEvent {
     Error(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerEndpoint {
+    Direct(SocketAddr),
+    Relay {
+        server: SocketAddr,
+        room_id: RoomId,
+        peer_id: PeerId,
+    },
+}
+
+impl From<SocketAddr> for PeerEndpoint {
+    fn from(addr: SocketAddr) -> Self {
+        Self::Direct(addr)
+    }
+}
+
 pub struct TransferCtx<'a> {
     pub local_peer_id: PeerId,
     pub local_uuid: ClientUuid,
@@ -96,7 +112,7 @@ pub struct TransferCtx<'a> {
 }
 
 impl TransferCtx<'_> {
-    async fn send_p2p(&mut self, dst: SocketAddr, payload: &P2pPayload) {
+    async fn send_p2p(&mut self, dst: PeerEndpoint, payload: &P2pPayload) {
         if self.local_peer_id == 0 {
             return;
         }
@@ -112,7 +128,23 @@ impl TransferCtx<'_> {
             .seal_packet(&hdr, payload, self.seal_buf)
             .is_ok()
         {
-            let _ = self.socket.send_to(self.seal_buf, dst).await;
+            match dst {
+                PeerEndpoint::Direct(addr) => {
+                    let _ = self.socket.send_to(self.seal_buf, addr).await;
+                }
+                PeerEndpoint::Relay {
+                    server,
+                    room_id,
+                    peer_id,
+                } => {
+                    let mut relay_buf = Vec::with_capacity(MAX_RELAY_UDP_PAYLOAD);
+                    if encode_relay_datagram_into(&room_id, peer_id, self.seal_buf, &mut relay_buf)
+                        .is_ok()
+                    {
+                        let _ = self.socket.send_to(&relay_buf, server).await;
+                    }
+                }
+            }
         }
     }
 }
@@ -427,7 +459,7 @@ impl SwarmChatManager {
     pub async fn set_local_avatar(
         &mut self,
         avatar: Option<([u8; 32], Vec<u8>)>,
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         self.set_initial_local_avatar(avatar);
@@ -437,7 +469,11 @@ impl SwarmChatManager {
         }
     }
 
-    pub async fn announce_avatar_to_peer(&self, peer_addr: SocketAddr, ctx: &mut TransferCtx<'_>) {
+    pub async fn announce_avatar_to_peer(
+        &self,
+        peer_addr: PeerEndpoint,
+        ctx: &mut TransferCtx<'_>,
+    ) {
         if self.local_avatar.is_some() {
             let pkt = self.build_avatar_announce_payload();
             ctx.send_p2p(peer_addr, &pkt).await;
@@ -519,7 +555,7 @@ impl SwarmChatManager {
     pub async fn send_chat_text(
         &mut self,
         text: String,
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let trimmed = text.trim();
@@ -566,7 +602,7 @@ impl SwarmChatManager {
         &mut self,
         filename: String,
         bytes: Vec<u8>,
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         if bytes.is_empty() || bytes.len() >= INLINE_IMAGE_MAX_BYTES {
@@ -649,7 +685,7 @@ impl SwarmChatManager {
     pub async fn offer_file(
         &mut self,
         path: PathBuf,
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let meta = match fs::metadata(&path) {
@@ -799,14 +835,14 @@ impl SwarmChatManager {
             .await;
     }
 
-    pub async fn announce_haves_to_peer(&self, peer_addr: SocketAddr, ctx: &mut TransferCtx<'_>) {
+    pub async fn announce_haves_to_peer(&self, peer_addr: PeerEndpoint, ctx: &mut TransferCtx<'_>) {
         for &blob_id in self.local_blobs.keys() {
             ctx.send_p2p(peer_addr, &P2pPayload::BlobHave { blob_id })
                 .await;
         }
     }
 
-    pub async fn send_history_sync_req(&self, peer_addr: SocketAddr, ctx: &mut TransferCtx<'_>) {
+    pub async fn send_history_sync_req(&self, peer_addr: PeerEndpoint, ctx: &mut TransferCtx<'_>) {
         ctx.send_p2p(peer_addr, &P2pPayload::HistorySyncReq).await;
     }
 
@@ -816,9 +852,9 @@ impl SwarmChatManager {
         sender_peer_id: PeerId,
         sender_uuid: ClientUuid,
         sender_nickname: &str,
-        sender_addr: SocketAddr,
+        sender_addr: PeerEndpoint,
         payload: P2pPayload,
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         match payload {
@@ -1147,7 +1183,7 @@ impl SwarmChatManager {
         blob_id: [u8; 16],
         chunk_index: u32,
         data: &[u8],
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let Some(blob) = self.remote_blobs.get_mut(&blob_id) else {
@@ -1309,7 +1345,7 @@ impl SwarmChatManager {
     /// and every 40 ms runs reliable retransmissions and Swarm chunk requests.
     pub async fn tick_10ms(
         &mut self,
-        peer_addrs: &HashMap<PeerId, SocketAddr>,
+        peer_addrs: &HashMap<PeerId, PeerEndpoint>,
         peer_uuids: &HashMap<PeerId, ClientUuid>,
         expected_room_uuids: &[ClientUuid],
         ctx: &mut TransferCtx<'_>,
@@ -1409,7 +1445,7 @@ impl SwarmChatManager {
             idx += 1;
         }
 
-        let mut reqs: Vec<(SocketAddr, P2pPayload)> = Vec::new();
+        let mut reqs: Vec<(PeerEndpoint, P2pPayload)> = Vec::new();
         for blob in self.remote_blobs.values_mut() {
             if blob.completed {
                 continue;
@@ -1417,7 +1453,7 @@ impl SwarmChatManager {
             let Some(dl) = blob.download.as_mut() else {
                 continue;
             };
-            let mut active_seeders: Vec<(PeerId, SocketAddr)> = blob
+            let mut active_seeders: Vec<(PeerId, PeerEndpoint)> = blob
                 .seeders
                 .iter()
                 .filter_map(|&pid| peer_addrs.get(&pid).map(|&addr| (pid, addr)))
@@ -1483,7 +1519,7 @@ impl SwarmChatManager {
         &mut self,
         msg_id: u64,
         payload: &P2pPayload,
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let now = Instant::now();
@@ -1503,7 +1539,7 @@ impl SwarmChatManager {
     async fn broadcast_have(
         &self,
         blob_id: [u8; 16],
-        connected_peers: &[(PeerId, SocketAddr)],
+        connected_peers: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let pkt = P2pPayload::BlobHave { blob_id };
@@ -2143,7 +2179,7 @@ mod tests {
     async fn pump_socket(
         mgr: &mut SwarmChatManager,
         peer_nicknames: &HashMap<PeerId, String>,
-        connected_list: &[(PeerId, SocketAddr)],
+        connected_list: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let mut rx_buf = [0u8; MAX_UDP_PAYLOAD + 64];
@@ -2164,7 +2200,7 @@ mod tests {
                     hdr.sender_peer_id,
                     sender_uuid,
                     nick,
-                    src,
+                    PeerEndpoint::Direct(src),
                     payload,
                     connected_list,
                     ctx,
@@ -2207,8 +2243,8 @@ mod tests {
         nicks.insert(2, "Bravo".to_string());
         nicks.insert(3, "Charlie".to_string());
 
-        let ab_list = vec![(2, addr_b)];
-        let ba_list = vec![(1, addr_a)];
+        let ab_list = vec![(2, PeerEndpoint::Direct(addr_b))];
+        let ba_list = vec![(1, PeerEndpoint::Direct(addr_a))];
 
         {
             let mut ctx_a = TransferCtx {
@@ -2233,9 +2269,9 @@ mod tests {
 
         let expected_inline: Vec<u8> = (0..18_500u32).map(|i| (i % 251) as u8).collect();
         let mut ab_map = HashMap::new();
-        ab_map.insert(2, addr_b);
+        ab_map.insert(2, PeerEndpoint::Direct(addr_b));
         let mut ba_map = HashMap::new();
-        ba_map.insert(1, addr_a);
+        ba_map.insert(1, PeerEndpoint::Direct(addr_a));
         let mut uuids = HashMap::new();
         uuids.insert(1u16, [0x11; 16]);
         uuids.insert(2u16, [0x22; 16]);
@@ -2318,17 +2354,25 @@ mod tests {
                 seal_buf: &mut seal_c,
                 evt_tx: &tx_c,
             };
-            mgr_c.send_history_sync_req(addr_b, &mut ctx_c).await;
+            mgr_c
+                .send_history_sync_req(PeerEndpoint::Direct(addr_b), &mut ctx_c)
+                .await;
         }
 
-        let bc_list = vec![(1, addr_a), (3, addr_c)];
-        let cb_list = vec![(1, addr_a), (2, addr_b)];
+        let bc_list = vec![
+            (1, PeerEndpoint::Direct(addr_a)),
+            (3, PeerEndpoint::Direct(addr_c)),
+        ];
+        let cb_list = vec![
+            (1, PeerEndpoint::Direct(addr_a)),
+            (2, PeerEndpoint::Direct(addr_b)),
+        ];
         let mut bc_map = HashMap::new();
-        bc_map.insert(1, addr_a);
-        bc_map.insert(3, addr_c);
+        bc_map.insert(1, PeerEndpoint::Direct(addr_a));
+        bc_map.insert(3, PeerEndpoint::Direct(addr_c));
         let mut cb_map = HashMap::new();
-        cb_map.insert(1, addr_a);
-        cb_map.insert(2, addr_b);
+        cb_map.insert(1, PeerEndpoint::Direct(addr_a));
+        cb_map.insert(2, PeerEndpoint::Direct(addr_b));
 
         let mut c_got_text = false;
         let mut c_got_img = false;
@@ -2514,7 +2558,7 @@ mod tests {
         mgr: &mut SwarmChatManager,
         peer_nicknames: &HashMap<PeerId, String>,
         peer_uuids: &HashMap<PeerId, ClientUuid>,
-        connected_list: &[(PeerId, SocketAddr)],
+        connected_list: &[(PeerId, PeerEndpoint)],
         ctx: &mut TransferCtx<'_>,
     ) {
         let mut rx_buf = [0u8; MAX_UDP_PAYLOAD + 64];
@@ -2534,7 +2578,7 @@ mod tests {
                     hdr.sender_peer_id,
                     sender_uuid,
                     nick,
-                    src,
+                    PeerEndpoint::Direct(src),
                     payload,
                     connected_list,
                     ctx,
@@ -2582,12 +2626,12 @@ mod tests {
         let mut seal_a = Vec::with_capacity(MAX_UDP_PAYLOAD);
         let mut seal_b = Vec::with_capacity(MAX_UDP_PAYLOAD);
 
-        let ab_list = vec![(2, addr_b)];
-        let ba_list = vec![(1, addr_a)];
+        let ab_list = vec![(2, PeerEndpoint::Direct(addr_b))];
+        let ba_list = vec![(1, PeerEndpoint::Direct(addr_a))];
         let mut ab_map = HashMap::new();
-        ab_map.insert(2, addr_b);
+        ab_map.insert(2, PeerEndpoint::Direct(addr_b));
         let mut ba_map = HashMap::new();
-        ba_map.insert(1, addr_a);
+        ba_map.insert(1, PeerEndpoint::Direct(addr_a));
 
         let mut nicks = HashMap::new();
         nicks.insert(1, "Alpha".to_string());
@@ -2765,12 +2809,12 @@ mod tests {
         let mut seal_a = Vec::with_capacity(MAX_UDP_PAYLOAD);
         let mut seal_b = Vec::with_capacity(MAX_UDP_PAYLOAD);
 
-        let ab_list = vec![(2, addr_b)];
-        let ba_list = vec![(1, addr_a)];
+        let ab_list = vec![(2, PeerEndpoint::Direct(addr_b))];
+        let ba_list = vec![(1, PeerEndpoint::Direct(addr_a))];
         let mut ab_map = HashMap::new();
-        ab_map.insert(2, addr_b);
+        ab_map.insert(2, PeerEndpoint::Direct(addr_b));
         let mut ba_map = HashMap::new();
-        ba_map.insert(1, addr_a);
+        ba_map.insert(1, PeerEndpoint::Direct(addr_a));
 
         let mut nicks = HashMap::new();
         nicks.insert(1, "Alpha".to_string());
@@ -2949,12 +2993,12 @@ mod tests {
         let addr_a2 = sock_a2.local_addr().unwrap();
         let mut mgr_a2 = SwarmChatManager::new();
         let (tx_a2, mut rx_a2) = mpsc::channel(64);
-        let a2_b_list = vec![(2, addr_b)];
-        let b_a2_list = vec![(9, addr_a2)];
+        let a2_b_list = vec![(2, PeerEndpoint::Direct(addr_b))];
+        let b_a2_list = vec![(9, PeerEndpoint::Direct(addr_a2))];
         let mut a2_b_map = HashMap::new();
-        a2_b_map.insert(2, addr_b);
+        a2_b_map.insert(2, PeerEndpoint::Direct(addr_b));
         let mut b_a2_map = HashMap::new();
-        b_a2_map.insert(9, addr_a2);
+        b_a2_map.insert(9, PeerEndpoint::Direct(addr_a2));
 
         {
             let mut ctx_a2 = TransferCtx {
@@ -2968,7 +3012,9 @@ mod tests {
                 seal_buf: &mut seal_a,
                 evt_tx: &tx_a2,
             };
-            mgr_a2.send_history_sync_req(addr_b, &mut ctx_a2).await;
+            mgr_a2
+                .send_history_sync_req(PeerEndpoint::Direct(addr_b), &mut ctx_a2)
+                .await;
             mgr_a2
                 .send_chat_text("Rejoined under slot 9".to_string(), &a2_b_list, &mut ctx_a2)
                 .await;
