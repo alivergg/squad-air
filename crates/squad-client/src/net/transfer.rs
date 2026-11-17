@@ -107,7 +107,11 @@ impl TransferCtx<'_> {
             sender_peer_id: self.local_peer_id,
             seq_num: *self.control_seq,
         };
-        if self.cipher.seal_packet(&hdr, payload, self.seal_buf).is_ok() {
+        if self
+            .cipher
+            .seal_packet(&hdr, payload, self.seal_buf)
+            .is_ok()
+        {
             let _ = self.socket.send_to(self.seal_buf, dst).await;
         }
     }
@@ -241,6 +245,17 @@ impl SwarmChatManager {
     pub fn set_room_persistence(&mut self, room_id: RoomId, data_root: PathBuf) {
         self.room_id = Some(room_id);
         self.data_root = Some(data_root);
+    }
+
+    pub fn has_pending_work(&self) -> bool {
+        !self.outbound_chunks.is_empty()
+            || !self.pending_deliveries.is_empty()
+            || !self.pending_reliable.is_empty()
+            || self.history_sync_attempts_left > 0
+            || self
+                .remote_blobs
+                .values()
+                .any(|b| !b.completed && b.download.is_some())
     }
 
     pub fn trim_memory(&mut self) {
@@ -401,8 +416,10 @@ impl SwarmChatManager {
 
     pub fn set_initial_local_avatar(&mut self, avatar: Option<([u8; 32], Vec<u8>)>) {
         if let Some((hash, ref bytes)) = avatar {
-            self.local_blobs
-                .insert(avatar_blob_id(&hash), LocalBlobSource::Memory(bytes.clone()));
+            self.local_blobs.insert(
+                avatar_blob_id(&hash),
+                LocalBlobSource::Memory(bytes.clone()),
+            );
         }
         self.local_avatar = avatar;
     }
@@ -420,11 +437,7 @@ impl SwarmChatManager {
         }
     }
 
-    pub async fn announce_avatar_to_peer(
-        &self,
-        peer_addr: SocketAddr,
-        ctx: &mut TransferCtx<'_>,
-    ) {
+    pub async fn announce_avatar_to_peer(&self, peer_addr: SocketAddr, ctx: &mut TransferCtx<'_>) {
         if self.local_avatar.is_some() {
             let pkt = self.build_avatar_announce_payload();
             ctx.send_p2p(peer_addr, &pkt).await;
@@ -786,22 +799,14 @@ impl SwarmChatManager {
             .await;
     }
 
-    pub async fn announce_haves_to_peer(
-        &self,
-        peer_addr: SocketAddr,
-        ctx: &mut TransferCtx<'_>,
-    ) {
+    pub async fn announce_haves_to_peer(&self, peer_addr: SocketAddr, ctx: &mut TransferCtx<'_>) {
         for &blob_id in self.local_blobs.keys() {
             ctx.send_p2p(peer_addr, &P2pPayload::BlobHave { blob_id })
                 .await;
         }
     }
 
-    pub async fn send_history_sync_req(
-        &self,
-        peer_addr: SocketAddr,
-        ctx: &mut TransferCtx<'_>,
-    ) {
+    pub async fn send_history_sync_req(&self, peer_addr: SocketAddr, ctx: &mut TransferCtx<'_>) {
         ctx.send_p2p(peer_addr, &P2pPayload::HistorySyncReq).await;
     }
 
@@ -1095,7 +1100,8 @@ impl SwarmChatManager {
                             completed: false,
                         },
                     );
-                    self.avatar_targets.insert(blob_id, (sender_uuid, avatar_hash));
+                    self.avatar_targets
+                        .insert(blob_id, (sender_uuid, avatar_hash));
                 }
             }
             P2pPayload::BlobChunkReq {
@@ -1314,8 +1320,7 @@ impl SwarmChatManager {
 
         let mut sent_chunks = 0;
         while sent_chunks < QOS_MAX_CHUNKS_PER_TICK {
-            let Some(key @ (target_peer, blob_id, chunk_index)) =
-                self.outbound_chunks.pop_front()
+            let Some(key @ (target_peer, blob_id, chunk_index)) = self.outbound_chunks.pop_front()
             else {
                 break;
             };
@@ -1359,9 +1364,7 @@ impl SwarmChatManager {
                 let payload = self.pending_deliveries[idx].payload.clone();
                 let acked_by = &self.pending_deliveries[idx].acked_by;
                 for (&pid, &dst) in peer_addrs {
-                    let already_acked = peer_uuids
-                        .get(&pid)
-                        .is_some_and(|u| acked_by.contains(u));
+                    let already_acked = peer_uuids.get(&pid).is_some_and(|u| acked_by.contains(u));
                     if !already_acked {
                         ctx.send_p2p(dst, &payload).await;
                     }
@@ -1644,7 +1647,11 @@ fn save_cached_inline_image(root: &Path, blob_id: &[u8; 16], bytes: &[u8]) -> Re
     fs::write(path, bytes).map_err(|e| e.to_string())
 }
 
-fn load_cached_inline_image(root: &Path, blob_id: &[u8; 16], blake3_root: &[u8; 32]) -> Option<Vec<u8>> {
+fn load_cached_inline_image(
+    root: &Path,
+    blob_id: &[u8; 16],
+    blake3_root: &[u8; 32],
+) -> Option<Vec<u8>> {
     let bytes = fs::read(inline_cache_path(root, blob_id)).ok()?;
     if bytes.is_empty() || bytes.len() >= INLINE_IMAGE_MAX_BYTES {
         return None;
@@ -1656,7 +1663,10 @@ fn load_cached_inline_image(root: &Path, blob_id: &[u8; 16], blake3_root: &[u8; 
     }
 }
 
-fn write_downloaded_blobs_index(root: &Path, records: &[DownloadedBlobRecord]) -> Result<(), String> {
+fn write_downloaded_blobs_index(
+    root: &Path,
+    records: &[DownloadedBlobRecord],
+) -> Result<(), String> {
     let path = downloaded_blobs_index_path(root);
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
@@ -2138,8 +2148,7 @@ mod tests {
     ) {
         let mut rx_buf = [0u8; MAX_UDP_PAYLOAD + 64];
         while let Ok(Ok((len, src))) =
-            tokio::time::timeout(Duration::from_millis(5), ctx.socket.recv_from(&mut rx_buf))
-                .await
+            tokio::time::timeout(Duration::from_millis(5), ctx.socket.recv_from(&mut rx_buf)).await
         {
             if let Ok((hdr, payload)) = ctx.cipher.open_packet(&mut rx_buf[..len]) {
                 let nick = peer_nicknames
@@ -2249,7 +2258,9 @@ mod tests {
                     evt_tx: &tx_b,
                 };
                 pump_socket(&mut mgr_b, &nicks, &ba_list, &mut ctx_b).await;
-                mgr_b.tick_10ms(&ba_map, &uuids, &[[0x11; 16]], &mut ctx_b).await;
+                mgr_b
+                    .tick_10ms(&ba_map, &uuids, &[[0x11; 16]], &mut ctx_b)
+                    .await;
             }
             {
                 let mut ctx_a = TransferCtx {
@@ -2264,7 +2275,9 @@ mod tests {
                     evt_tx: &tx_a,
                 };
                 pump_socket(&mut mgr_a, &nicks, &ab_list, &mut ctx_a).await;
-                mgr_a.tick_10ms(&ab_map, &uuids, &[[0x22; 16]], &mut ctx_a).await;
+                mgr_a
+                    .tick_10ms(&ab_map, &uuids, &[[0x22; 16]], &mut ctx_a)
+                    .await;
             }
 
             while let Ok(ev) = rx_b.try_recv() {
@@ -2398,7 +2411,9 @@ mod tests {
                 seal_buf: &mut seal_a,
                 evt_tx: &tx_a,
             };
-            mgr_a.offer_file(tmp_src.clone(), &ab_list, &mut ctx_a).await;
+            mgr_a
+                .offer_file(tmp_src.clone(), &ab_list, &mut ctx_a)
+                .await;
         }
 
         let mut offered_blob_id = None;
@@ -2504,8 +2519,7 @@ mod tests {
     ) {
         let mut rx_buf = [0u8; MAX_UDP_PAYLOAD + 64];
         while let Ok(Ok((len, src))) =
-            tokio::time::timeout(Duration::from_millis(5), ctx.socket.recv_from(&mut rx_buf))
-                .await
+            tokio::time::timeout(Duration::from_millis(5), ctx.socket.recv_from(&mut rx_buf)).await
         {
             if let Ok((hdr, payload)) = ctx.cipher.open_packet(&mut rx_buf[..len]) {
                 let nick = peer_nicknames
@@ -2596,7 +2610,11 @@ mod tests {
                 evt_tx: &tx_a,
             };
             mgr_a
-                .set_local_avatar(Some((avatar_hash, jpeg_bytes.clone())), &ab_list, &mut ctx_a)
+                .set_local_avatar(
+                    Some((avatar_hash, jpeg_bytes.clone())),
+                    &ab_list,
+                    &mut ctx_a,
+                )
                 .await;
         }
 
@@ -2615,8 +2633,7 @@ mod tests {
                     seal_buf: &mut seal_b,
                     evt_tx: &tx_b,
                 };
-                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b)
-                    .await;
+                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b).await;
                 mgr_b
                     .tick_10ms(&ba_map, &peer_uuids, &[uuid_a], &mut ctx_b)
                     .await;
@@ -2633,8 +2650,7 @@ mod tests {
                     seal_buf: &mut seal_a,
                     evt_tx: &tx_a,
                 };
-                pump_socket_with_uuids(&mut mgr_a, &nicks, &peer_uuids, &ab_list, &mut ctx_a)
-                    .await;
+                pump_socket_with_uuids(&mut mgr_a, &nicks, &peer_uuids, &ab_list, &mut ctx_a).await;
                 mgr_a
                     .tick_10ms(&ab_map, &peer_uuids, &[uuid_b], &mut ctx_a)
                     .await;
@@ -2803,8 +2819,7 @@ mod tests {
                     seal_buf: &mut seal_b,
                     evt_tx: &tx_b,
                 };
-                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b)
-                    .await;
+                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b).await;
             }
             while let Ok(ev) = rx_b.try_recv() {
                 if let TransferEvent::ChatItemReceived(item) = ev {
@@ -2851,8 +2866,7 @@ mod tests {
                     seal_buf: &mut seal_b,
                     evt_tx: &tx_b,
                 };
-                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b)
-                    .await;
+                pump_socket_with_uuids(&mut mgr_b, &nicks, &peer_uuids, &ba_list, &mut ctx_b).await;
                 mgr_b
                     .tick_10ms(&ba_map, &peer_uuids, &[uuid_a], &mut ctx_b)
                     .await;
@@ -2869,8 +2883,7 @@ mod tests {
                     seal_buf: &mut seal_a,
                     evt_tx: &tx_a,
                 };
-                pump_socket_with_uuids(&mut mgr_a, &nicks, &peer_uuids, &ab_list, &mut ctx_a)
-                    .await;
+                pump_socket_with_uuids(&mut mgr_a, &nicks, &peer_uuids, &ab_list, &mut ctx_a).await;
                 mgr_a
                     .tick_10ms(&ab_map, &peer_uuids, &[uuid_b], &mut ctx_a)
                     .await;
@@ -2906,7 +2919,11 @@ mod tests {
                 restored_items.push(item);
             }
         }
-        assert_eq!(restored_items.len(), 30, "History must cap cleanly at 30 messages");
+        assert_eq!(
+            restored_items.len(),
+            30,
+            "History must cap cleanly at 30 messages"
+        );
         assert!(
             mgr_b_reloaded.local_blobs.contains_key(&bid),
             "Reloaded manager must auto-seed previously downloaded blobs"
@@ -3013,8 +3030,12 @@ mod tests {
                 }
             }
             if new_msg_from_slot9.is_some()
-                && synced_for_alpha.iter().any(|i| !i.is_self && i.sender_uuid == uuid_b)
-                && synced_for_alpha.iter().any(|i| i.is_self && i.sender_uuid == uuid_a)
+                && synced_for_alpha
+                    .iter()
+                    .any(|i| !i.is_self && i.sender_uuid == uuid_b)
+                && synced_for_alpha
+                    .iter()
+                    .any(|i| i.is_self && i.sender_uuid == uuid_a)
             {
                 break;
             }
@@ -3026,11 +3047,15 @@ mod tests {
         assert!(!slot9_item.is_self);
 
         assert!(
-            synced_for_alpha.iter().any(|i| !i.is_self && i.sender_uuid == uuid_b && i.sender_nickname == "Bravo"),
+            synced_for_alpha
+                .iter()
+                .any(|i| !i.is_self && i.sender_uuid == uuid_b && i.sender_nickname == "Bravo"),
             "Synced history on rejoin must identify Bravo accurately"
         );
         assert!(
-            synced_for_alpha.iter().any(|i| i.is_self && i.sender_uuid == uuid_a && i.sender_nickname == "Alpha"),
+            synced_for_alpha
+                .iter()
+                .any(|i| i.is_self && i.sender_uuid == uuid_a && i.sender_nickname == "Alpha"),
             "Synced history on rejoin must restore Alpha's own historical authorship"
         );
 
