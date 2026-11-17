@@ -18,6 +18,9 @@ pub const MAX_STREAM_ERROR_BYTES: usize = 64;
 pub const MAX_VIDEO_FRAG_BYTES: usize = 1100;
 pub const VIDEO_FLAG_KEYFRAME: u8 = 0x01;
 pub const VIDEO_FLAG_XOR_FEC: u8 = 0x02;
+pub const OPCODE_RELAY: u8 = 0x05;
+pub const RELAY_HEADER_LEN: usize = 22;
+pub const MAX_RELAY_UDP_PAYLOAD: usize = MAX_UDP_PAYLOAD + RELAY_HEADER_LEN;
 
 pub type RoomId = [u8; 16];
 pub type ClientUuid = [u8; 16];
@@ -349,6 +352,70 @@ impl SignalingPacket {
             }
             other => Err(ProtoError::UnknownOpcode(other)),
         }
+    }
+}
+
+#[inline]
+pub fn is_relay_datagram(datagram: &[u8]) -> bool {
+    datagram.len() >= RELAY_HEADER_LEN + P2P_HEADER_LEN
+        && datagram[0..2] == MAGIC
+        && datagram[2] == PROTO_VERSION
+        && datagram[3] == OPCODE_RELAY
+}
+
+/// Wraps an already-sealed P2P datagram into a 22-byte relay envelope:
+/// `[MAGIC(2), PROTO_VERSION(1), OPCODE_RELAY(1), room_id(16), peer_id(2)]`.
+pub fn encode_relay_datagram_into(
+    room_id: &RoomId,
+    peer_id: PeerId,
+    inner_p2p: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ProtoError> {
+    if inner_p2p.len() < P2P_HEADER_LEN {
+        return Err(ProtoError::PacketTooShort {
+            expected: P2P_HEADER_LEN,
+            actual: inner_p2p.len(),
+        });
+    }
+    if inner_p2p.len() > MAX_UDP_PAYLOAD {
+        return Err(ProtoError::PacketTooLarge(
+            RELAY_HEADER_LEN + inner_p2p.len(),
+        ));
+    }
+    out.clear();
+    out.reserve(RELAY_HEADER_LEN + inner_p2p.len());
+    out.extend_from_slice(&MAGIC);
+    out.push(PROTO_VERSION);
+    out.push(OPCODE_RELAY);
+    out.extend_from_slice(room_id);
+    out.extend_from_slice(&peer_id.to_be_bytes());
+    out.extend_from_slice(inner_p2p);
+    Ok(())
+}
+
+pub fn parse_relay_header(datagram: &[u8]) -> Result<(RoomId, PeerId, &[u8]), ProtoError> {
+    if datagram.len() < RELAY_HEADER_LEN + P2P_HEADER_LEN {
+        return Err(ProtoError::PacketTooShort {
+            expected: RELAY_HEADER_LEN + P2P_HEADER_LEN,
+            actual: datagram.len(),
+        });
+    }
+    if datagram.len() > MAX_RELAY_UDP_PAYLOAD {
+        return Err(ProtoError::PacketTooLarge(datagram.len()));
+    }
+    if datagram[0..2] != MAGIC || datagram[2] != PROTO_VERSION || datagram[3] != OPCODE_RELAY {
+        return Err(ProtoError::InvalidHeader);
+    }
+    let mut room_id = [0u8; 16];
+    room_id.copy_from_slice(&datagram[4..20]);
+    let peer_id = u16::from_be_bytes([datagram[20], datagram[21]]);
+    Ok((room_id, peer_id, &datagram[RELAY_HEADER_LEN..]))
+}
+
+#[inline]
+pub fn rewrite_relay_peer_id(datagram: &mut [u8], new_peer_id: PeerId) {
+    if datagram.len() >= RELAY_HEADER_LEN {
+        datagram[20..22].copy_from_slice(&new_peer_id.to_be_bytes());
     }
 }
 
@@ -1325,5 +1392,44 @@ mod tests {
             assert_eq!(hdr.msg_type, payload.msg_type());
             assert_eq!(opened, decoded_body);
         }
+    }
+
+    #[test]
+    fn test_relay_datagram_roundtrip_rewrite_and_bounds() {
+        let secret = [0x22u8; 32];
+        let cipher = crate::crypto::RoomCipher::from_secret(&secret);
+        let room_id = [0xABu8; 16];
+        let room_prefix = [0xAB, 0xAB, 0xAB, 0xAB];
+        let hdr = P2pHeader {
+            msg_type: P2pMsgType::AudioOpus,
+            room_prefix,
+            sender_peer_id: 1,
+            seq_num: 42,
+        };
+        let payload = P2pPayload::AudioOpus {
+            opus_data: vec![1, 2, 3, 4, 5],
+        };
+        let mut inner = Vec::new();
+        cipher.seal_packet(&hdr, &payload, &mut inner).unwrap();
+
+        let mut wire = Vec::new();
+        encode_relay_datagram_into(&room_id, 7, &inner, &mut wire).unwrap();
+        assert!(is_relay_datagram(&wire));
+
+        let (parsed_room, target_pid, parsed_inner) = parse_relay_header(&wire).unwrap();
+        assert_eq!(parsed_room, room_id);
+        assert_eq!(target_pid, 7);
+        assert_eq!(parsed_inner, inner.as_slice());
+
+        rewrite_relay_peer_id(&mut wire, 1);
+        let (parsed_room2, sender_pid, _) = parse_relay_header(&wire).unwrap();
+        assert_eq!(parsed_room2, room_id);
+        assert_eq!(sender_pid, 1);
+
+        let oversized = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        assert!(matches!(
+            encode_relay_datagram_into(&room_id, 2, &oversized, &mut wire),
+            Err(ProtoError::PacketTooLarge(_))
+        ));
     }
 }
