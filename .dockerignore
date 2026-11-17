@@ -1,0 +1,16 @@
+target/
+dist/
+.git/
+.github/
+.DS_Store
+.agent/
+.agents/
+installer/
+scripts/
+assets/videos/
+assets/sounds/*.wav
+assets/models/*.onnx
+*.md
+*.pdb
+*.rs.bk
+.env

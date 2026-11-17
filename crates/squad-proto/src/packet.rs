@@ -839,7 +839,8 @@ impl P2pPayload {
                 let filename = std::str::from_utf8(&body[off + 35..name_end])
                     .map_err(|_| ProtoError::InvalidUtf8)?
                     .to_string();
-                let total_size = u64::from_be_bytes(body[name_end..name_end + 8].try_into().unwrap());
+                let total_size =
+                    u64::from_be_bytes(body[name_end..name_end + 8].try_into().unwrap());
                 let chunk_size =
                     u16::from_be_bytes(body[name_end + 8..name_end + 10].try_into().unwrap());
                 let total_chunks =
@@ -1090,10 +1091,7 @@ mod tests {
         };
 
         let mut packets = vec![
-            (
-                1u64,
-                P2pPayload::ChatAck { msg_id: 9001 },
-            ),
+            (1u64, P2pPayload::ChatAck { msg_id: 9001 }),
             (2, P2pPayload::HistorySyncReq),
             (
                 3,
@@ -1128,7 +1126,12 @@ mod tests {
                     data: vec![0x5Au8; BLOB_CHUNK_SIZE],
                 },
             ),
-            (6, P2pPayload::BlobHave { blob_id: [0x11; 16] }),
+            (
+                6,
+                P2pPayload::BlobHave {
+                    blob_id: [0x11; 16],
+                },
+            ),
             (
                 7,
                 P2pPayload::AvatarAnnounce {

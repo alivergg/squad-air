@@ -205,11 +205,7 @@ impl RendezvousState {
     }
 
     /// Evicts expired peers (`now - last_seen > ttl`) and returns broadcast updates for affected rooms.
-    pub fn evict_expired(
-        &self,
-        now: Instant,
-        ttl: Duration,
-    ) -> Vec<(SocketAddr, SignalingPacket)> {
+    pub fn evict_expired(&self, now: Instant, ttl: Duration) -> Vec<(SocketAddr, SignalingPacket)> {
         let mut updates = Vec::new();
         let mut empty_rooms = Vec::new();
 

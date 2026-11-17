@@ -24,7 +24,10 @@ async fn main() -> Result<()> {
 
     let bind_addr = parse_bind_arg().unwrap_or_else(|| "0.0.0.0:3478".to_string());
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
-    info!("Squad-Air Rendezvous server listening on {}", socket.local_addr()?);
+    info!(
+        "Squad-Air Rendezvous server listening on {}",
+        socket.local_addr()?
+    );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     tokio::spawn(async move {
