@@ -2,6 +2,10 @@ use crate::aec::EchoCanceller;
 use crate::codec::OpusEncoder10ms;
 use crate::cues::{SoundCue, SoundCueBank};
 use crate::denoise::{NoiseSuppressionMode, NoiseSuppressor};
+use crate::hotplug::{
+    select_device_with_meta, send_hotplug_cmd, spawn_hotplug_watcher, ActiveTopologySnapshot,
+    ResolvedDeviceMeta, SilenceRetryGuard, WatcherSignal,
+};
 use crate::jitter::JitterProfile;
 use crate::mixer::AudioMixer;
 use crate::resampler::{CaptureResampler, PlaybackResampler};
@@ -19,7 +23,7 @@ use squad_proto::PeerId;
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering},
     mpsc::{self, Receiver, SyncSender},
-    Arc,
+    Arc, Mutex,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -116,6 +120,11 @@ enum EngineCmd {
         input_device_name: Option<String>,
         output_device_name: Option<String>,
     },
+    HotplugSwap {
+        rebuild_input: bool,
+        rebuild_output: bool,
+        devices_changed: bool,
+    },
     SetStreamsActive(bool),
     PlayCue(SoundCue),
     Shutdown,
@@ -137,6 +146,8 @@ struct SharedAtomics {
     jitter_target_ms: AtomicU32,
     local_speaking: AtomicBool,
     df3_available: AtomicBool,
+    devices_dirty: AtomicBool,
+    device_list_gen: AtomicU32,
 }
 
 #[derive(Clone)]
@@ -144,6 +155,7 @@ pub struct AudioEngineHandle {
     cmd_tx: SyncSender<EngineCmd>,
     atomics: Arc<SharedAtomics>,
     peer_stats: Arc<DashMap<PeerId, PeerAudioStats>>,
+    hotplug_thread: Arc<Mutex<Option<thread::Thread>>>,
 }
 
 impl AudioEngineHandle {
@@ -175,7 +187,49 @@ impl AudioEngineHandle {
             jitter_target_ms: AtomicU32::new(config.jitter_profile.target_ms()),
             local_speaking: AtomicBool::new(false),
             df3_available: AtomicBool::new(df3_avail),
+            devices_dirty: AtomicBool::new(false),
+            device_list_gen: AtomicU32::new(1),
         });
+
+        let topology_snap = Arc::new(Mutex::new(ActiveTopologySnapshot {
+            preferred_input: config.input_device_name.clone(),
+            preferred_output: config.output_device_name.clone(),
+            ..Default::default()
+        }));
+
+        let watcher_atomics_run = Arc::clone(&atomics);
+        let watcher_atomics_active = Arc::clone(&atomics);
+        let watcher_snap = Arc::clone(&topology_snap);
+        let watcher_cmd_tx = cmd_tx.clone();
+        let watcher_handle = spawn_hotplug_watcher(
+            move || watcher_atomics_run.running.load(Ordering::Acquire),
+            move || {
+                watcher_atomics_active
+                    .streams_active
+                    .load(Ordering::Acquire)
+            },
+            watcher_snap,
+            move |signal| match signal {
+                WatcherSignal::HotplugSwap {
+                    rebuild_input,
+                    rebuild_output,
+                    devices_changed,
+                } => {
+                    send_hotplug_cmd(
+                        &watcher_cmd_tx,
+                        EngineCmd::HotplugSwap {
+                            rebuild_input,
+                            rebuild_output,
+                            devices_changed,
+                        },
+                    );
+                }
+            },
+            negotiate_device_format,
+        );
+        let hotplug_thread = Arc::new(Mutex::new(
+            watcher_handle.as_ref().map(|h| h.thread().clone()),
+        ));
 
         let atomics_worker = Arc::clone(&atomics);
         let stats_worker = Arc::clone(&peer_stats);
@@ -190,6 +244,7 @@ impl AudioEngineHandle {
                     outbound_tx,
                     atomics_worker,
                     stats_worker,
+                    topology_snap,
                 );
             })
             .context("failed to spawn squad-dsp-worker thread")?;
@@ -198,6 +253,7 @@ impl AudioEngineHandle {
             cmd_tx,
             atomics,
             peer_stats,
+            hotplug_thread,
         })
     }
 
@@ -355,7 +411,8 @@ impl AudioEngineHandle {
     }
 
     pub fn shutdown(&self) {
-        self.atomics.running.store(false, Ordering::Relaxed);
+        self.atomics.running.store(false, Ordering::Release);
+        self.unpark_hotplug_watcher();
         let _ = self.cmd_tx.try_send(EngineCmd::Shutdown);
     }
 
@@ -374,6 +431,25 @@ impl AudioEngineHandle {
         let prev = self.atomics.streams_active.swap(active, Ordering::AcqRel);
         if prev != active {
             let _ = self.cmd_tx.try_send(EngineCmd::SetStreamsActive(active));
+            if active {
+                self.unpark_hotplug_watcher();
+            }
+        }
+    }
+
+    pub fn take_devices_dirty(&self) -> bool {
+        self.atomics.devices_dirty.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn device_list_gen(&self) -> u32 {
+        self.atomics.device_list_gen.load(Ordering::Acquire)
+    }
+
+    fn unpark_hotplug_watcher(&self) {
+        if let Ok(guard) = self.hotplug_thread.lock() {
+            if let Some(ref th) = *guard {
+                th.unpark();
+            }
         }
     }
 
@@ -393,6 +469,8 @@ struct AudioStreams {
     play_resampler: PlaybackResampler,
     input_stream_failed: Arc<AtomicBool>,
     output_stream_failed: Arc<AtomicBool>,
+    input_meta: ResolvedDeviceMeta,
+    output_meta: ResolvedDeviceMeta,
 }
 
 fn pick_48k_f32_channels<I>(ranges: I, preferred_channels: Option<u16>) -> Option<usize>
@@ -457,6 +535,7 @@ struct InputStreamHalf {
     failed: Arc<AtomicBool>,
     sample_rate: u32,
     channels: usize,
+    meta: ResolvedDeviceMeta,
 }
 
 struct OutputStreamHalf {
@@ -466,10 +545,12 @@ struct OutputStreamHalf {
     failed: Arc<AtomicBool>,
     sample_rate: u32,
     channels: usize,
+    meta: ResolvedDeviceMeta,
 }
 
 fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -> InputStreamHalf {
-    let in_device = select_device(host, input_device_name, true);
+    let (in_device, resolved_name, using_fallback) =
+        select_device_with_meta(host, input_device_name, true);
     let (in_rate, in_channels) = in_device
         .as_ref()
         .map(|d| negotiate_device_format(d, true))
@@ -524,6 +605,12 @@ fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -
         failed,
         sample_rate: in_rate,
         channels: in_channels,
+        meta: ResolvedDeviceMeta {
+            resolved_name,
+            sample_rate: in_rate,
+            channels: in_channels,
+            using_fallback,
+        },
     }
 }
 
@@ -531,7 +618,8 @@ fn build_output_stream_half(
     host: &cpal::Host,
     output_device_name: Option<&str>,
 ) -> OutputStreamHalf {
-    let out_device = select_device(host, output_device_name, false);
+    let (out_device, resolved_name, using_fallback) =
+        select_device_with_meta(host, output_device_name, false);
     let (out_rate, out_channels) = out_device
         .as_ref()
         .map(|d| negotiate_device_format(d, false))
@@ -592,6 +680,12 @@ fn build_output_stream_half(
         failed,
         sample_rate: out_rate,
         channels: out_channels,
+        meta: ResolvedDeviceMeta {
+            resolved_name,
+            sample_rate: out_rate,
+            channels: out_channels,
+            using_fallback,
+        },
     }
 }
 
@@ -604,8 +698,23 @@ fn build_audio_streams(
     let output = build_output_stream_half(host, output_device_name);
 
     info!(
-        "SquadAir DSP worker active (Capture: {} Hz/{}ch, Playback: {} Hz/{}ch)",
-        input.sample_rate, input.channels, output.sample_rate, output.channels
+        "SquadAir DSP worker active (In: {:?} {} Hz/{}ch{}, Out: {:?} {} Hz/{}ch{})",
+        input.meta.resolved_name,
+        input.sample_rate,
+        input.channels,
+        if input.meta.using_fallback {
+            " fallback"
+        } else {
+            ""
+        },
+        output.meta.resolved_name,
+        output.sample_rate,
+        output.channels,
+        if output.meta.using_fallback {
+            " fallback"
+        } else {
+            ""
+        },
     );
 
     AudioStreams {
@@ -617,6 +726,8 @@ fn build_audio_streams(
         play_resampler: output.play_resampler,
         input_stream_failed: input.failed,
         output_stream_failed: output.failed,
+        input_meta: input.meta,
+        output_meta: output.meta,
     }
 }
 
@@ -631,7 +742,7 @@ fn build_loopback_stream(
     _output_device_name: Option<&str>,
 ) -> Option<LoopbackStream> {
     #[cfg(target_os = "windows")]
-    let target_dev = select_device(host, _output_device_name, false);
+    let target_dev = select_device_with_meta(host, _output_device_name, false).0;
 
     #[cfg(not(target_os = "windows"))]
     let target_dev = host.input_devices().ok().and_then(|mut iter| {
@@ -699,6 +810,102 @@ struct WorkerAudioCtx<'a> {
     silent_capture_ticks: &'a mut u32,
     silent_out_frames: &'a mut u8,
     last_hotplug_attempt: &'a mut Instant,
+    error_backoff: &'a mut Duration,
+    silence_guard: &'a mut SilenceRetryGuard,
+    topology_snap: &'a Arc<Mutex<ActiveTopologySnapshot>>,
+}
+
+fn sync_topology_snapshot(
+    topology_snap: &Arc<Mutex<ActiveTopologySnapshot>>,
+    preferred_input: &Option<String>,
+    preferred_output: &Option<String>,
+    streams: Option<&AudioStreams>,
+) {
+    if let Ok(mut guard) = topology_snap.lock() {
+        guard.preferred_input = preferred_input.clone();
+        guard.preferred_output = preferred_output.clone();
+        if let Some(active) = streams {
+            guard.active_input = active.input_meta.clone();
+            guard.active_output = active.output_meta.clone();
+            guard.input_stream_ok = active._input_stream.is_some()
+                && !active.input_stream_failed.load(Ordering::Relaxed);
+            guard.output_stream_ok = active._output_stream.is_some()
+                && !active.output_stream_failed.load(Ordering::Relaxed);
+        } else {
+            guard.active_input = ResolvedDeviceMeta::default();
+            guard.active_output = ResolvedDeviceMeta::default();
+            guard.input_stream_ok = false;
+            guard.output_stream_ok = false;
+        }
+    }
+}
+
+fn rebuild_input_half(
+    host: &cpal::Host,
+    active: &mut AudioStreams,
+    preferred_input: Option<&str>,
+    silent_capture_ticks: &mut u32,
+) -> bool {
+    drop(active._input_stream.take());
+    let input = build_input_stream_half(host, preferred_input);
+    let ok = input.stream.is_some();
+    if ok {
+        info!(
+            "Hot-plug recovered audio input: {:?} ({} Hz/{}ch{})",
+            input.meta.resolved_name,
+            input.sample_rate,
+            input.channels,
+            if input.meta.using_fallback {
+                " fallback"
+            } else {
+                ""
+            }
+        );
+    }
+    active._input_stream = input.stream;
+    active.cap_cons = input.cap_cons;
+    active.cap_resampler = input.cap_resampler;
+    active.input_stream_failed = input.failed;
+    active.input_meta = input.meta;
+    *silent_capture_ticks = 0;
+    ok
+}
+
+fn rebuild_output_half(
+    host: &cpal::Host,
+    active: &mut AudioStreams,
+    preferred_output: Option<&str>,
+    stream_loopback: &mut Option<LoopbackStream>,
+    share_stream_audio: bool,
+    silent_out_frames: &mut u8,
+) -> bool {
+    drop(stream_loopback.take());
+    drop(active._output_stream.take());
+    let output = build_output_stream_half(host, preferred_output);
+    let ok = output.stream.is_some();
+    if ok {
+        info!(
+            "Hot-plug recovered audio output: {:?} ({} Hz/{}ch{})",
+            output.meta.resolved_name,
+            output.sample_rate,
+            output.channels,
+            if output.meta.using_fallback {
+                " fallback"
+            } else {
+                ""
+            }
+        );
+    }
+    active._output_stream = output.stream;
+    active.play_prod = output.play_prod;
+    active.play_resampler = output.play_resampler;
+    active.output_stream_failed = output.failed;
+    active.output_meta = output.meta;
+    *silent_out_frames = 0;
+    if share_stream_audio {
+        *stream_loopback = build_loopback_stream(host, preferred_output);
+    }
+    ok
 }
 
 fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
@@ -744,7 +951,10 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
             *ctx.silent_capture_ticks = 0;
             *ctx.silent_out_frames = 0;
             *ctx.last_hotplug_attempt = Instant::now();
+            *ctx.error_backoff = Duration::from_secs(1);
+            ctx.silence_guard.on_topology_changed();
             if ctx.streams.is_some() {
+                drop(ctx.stream_loopback.take());
                 drop(ctx.streams.take());
                 *ctx.streams = Some(build_audio_streams(
                     ctx.host,
@@ -752,9 +962,55 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
                     output_device_name.as_deref(),
                 ));
                 if ctx.atomics.stream_audio_sharing.load(Ordering::Relaxed) {
-                    drop(ctx.stream_loopback.take());
                     *ctx.stream_loopback =
                         build_loopback_stream(ctx.host, ctx.current_output_dev.as_deref());
+                }
+            }
+            sync_topology_snapshot(
+                ctx.topology_snap,
+                ctx.current_input_dev,
+                ctx.current_output_dev,
+                ctx.streams.as_ref(),
+            );
+        }
+        EngineCmd::HotplugSwap {
+            rebuild_input,
+            rebuild_output,
+            devices_changed,
+        } => {
+            *ctx.error_backoff = Duration::from_secs(1);
+            ctx.silence_guard.on_topology_changed();
+            if devices_changed {
+                ctx.atomics.devices_dirty.store(true, Ordering::Release);
+                ctx.atomics.device_list_gen.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(active) = ctx.streams.as_mut() {
+                if rebuild_input {
+                    rebuild_input_half(
+                        ctx.host,
+                        active,
+                        ctx.current_input_dev.as_deref(),
+                        ctx.silent_capture_ticks,
+                    );
+                }
+                if rebuild_output {
+                    rebuild_output_half(
+                        ctx.host,
+                        active,
+                        ctx.current_output_dev.as_deref(),
+                        ctx.stream_loopback,
+                        ctx.atomics.stream_audio_sharing.load(Ordering::Relaxed),
+                        ctx.silent_out_frames,
+                    );
+                }
+                if rebuild_input || rebuild_output {
+                    *ctx.last_hotplug_attempt = Instant::now();
+                    sync_topology_snapshot(
+                        ctx.topology_snap,
+                        ctx.current_input_dev,
+                        ctx.current_output_dev,
+                        Some(active),
+                    );
                 }
             }
         }
@@ -776,6 +1032,7 @@ fn run_audio_worker(
     outbound_tx: tokio::sync::mpsc::Sender<OutboundAudioFrame>,
     atomics: Arc<SharedAtomics>,
     peer_stats: Arc<DashMap<PeerId, PeerAudioStats>>,
+    topology_snap: Arc<Mutex<ActiveTopologySnapshot>>,
 ) {
     let host = cpal::default_host();
     let mut streams: Option<AudioStreams> = None;
@@ -784,6 +1041,8 @@ fn run_audio_worker(
     let mut silent_capture_ticks: u32 = 0;
     let mut silent_out_frames: u8 = 0;
     let mut last_hotplug_attempt = Instant::now();
+    let mut error_backoff = Duration::from_secs(1);
+    let mut silence_guard = SilenceRetryGuard::new(2);
     let mut stream_loopback: Option<LoopbackStream> = None;
     let mut stream_encoder = OpusEncoder10ms::new(64_000).expect("Stream Opus encoder init");
     let mut stream_seq_num: u64 = 1;
@@ -829,6 +1088,9 @@ fn run_audio_worker(
                         silent_capture_ticks: &mut silent_capture_ticks,
                         silent_out_frames: &mut silent_out_frames,
                         last_hotplug_attempt: &mut last_hotplug_attempt,
+                        error_backoff: &mut error_backoff,
+                        silence_guard: &mut silence_guard,
+                        topology_snap: &topology_snap,
                     };
                     if !handle_engine_cmd(cmd, &mut ctx) {
                         return;
@@ -853,6 +1115,9 @@ fn run_audio_worker(
                 silent_capture_ticks: &mut silent_capture_ticks,
                 silent_out_frames: &mut silent_out_frames,
                 last_hotplug_attempt: &mut last_hotplug_attempt,
+                error_backoff: &mut error_backoff,
+                silence_guard: &mut silence_guard,
+                topology_snap: &topology_snap,
             };
             if !handle_engine_cmd(cmd, &mut ctx) {
                 return;
@@ -864,6 +1129,12 @@ fn run_audio_worker(
             if streams.is_some() {
                 drop(stream_loopback.take());
                 drop(streams.take());
+                sync_topology_snapshot(
+                    &topology_snap,
+                    &current_input_dev,
+                    &current_output_dev,
+                    None,
+                );
                 atomics.local_speaking.store(false, Ordering::Relaxed);
                 atomics
                     .mic_level_db_bits
@@ -876,11 +1147,20 @@ fn run_audio_worker(
             silent_capture_ticks = 0;
             silent_out_frames = 0;
             last_hotplug_attempt = Instant::now();
-            streams = Some(build_audio_streams(
+            error_backoff = Duration::from_secs(1);
+            silence_guard.on_topology_changed();
+            let built = build_audio_streams(
                 &host,
                 current_input_dev.as_deref(),
                 current_output_dev.as_deref(),
-            ));
+            );
+            sync_topology_snapshot(
+                &topology_snap,
+                &current_input_dev,
+                &current_output_dev,
+                Some(&built),
+            );
+            streams = Some(built);
             if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
                 stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
             }
@@ -891,46 +1171,53 @@ fn run_audio_worker(
             continue;
         };
 
-        let need_input = active.input_stream_failed.load(Ordering::Relaxed)
-            || active._input_stream.is_none()
-            || silent_capture_ticks >= 150;
-        let need_output =
-            active.output_stream_failed.load(Ordering::Relaxed) || active._output_stream.is_none();
+        let in_failed = active.input_stream_failed.load(Ordering::Relaxed);
+        let out_failed = active.output_stream_failed.load(Ordering::Relaxed);
+        let in_stalled = active._input_stream.is_some() && silent_capture_ticks >= 150;
 
-        if (need_input || need_output) && last_hotplug_attempt.elapsed() >= Duration::from_secs(1) {
-            last_hotplug_attempt = Instant::now();
-            if need_input {
-                drop(active._input_stream.take());
-                let input = build_input_stream_half(&host, current_input_dev.as_deref());
-                if input.stream.is_some() {
-                    info!(
-                        "Hot-plug recovered audio input stream ({} Hz/{}ch)",
-                        input.sample_rate, input.channels
-                    );
-                }
-                active._input_stream = input.stream;
-                active.cap_cons = input.cap_cons;
-                active.cap_resampler = input.cap_resampler;
-                active.input_stream_failed = input.failed;
+        if (in_failed || out_failed || in_stalled)
+            && last_hotplug_attempt.elapsed() >= error_backoff
+        {
+            let mut did_rebuild = false;
+            let mut any_recovered = false;
+
+            if in_failed || (in_stalled && silence_guard.try_consume_rebuild()) {
+                did_rebuild = true;
+                any_recovered |= rebuild_input_half(
+                    &host,
+                    active,
+                    current_input_dev.as_deref(),
+                    &mut silent_capture_ticks,
+                );
+            } else if in_stalled {
                 silent_capture_ticks = 0;
             }
-            if need_output {
-                drop(active._output_stream.take());
-                let output = build_output_stream_half(&host, current_output_dev.as_deref());
-                if output.stream.is_some() {
-                    info!(
-                        "Hot-plug recovered audio output stream ({} Hz/{}ch)",
-                        output.sample_rate, output.channels
-                    );
-                }
-                active._output_stream = output.stream;
-                active.play_prod = output.play_prod;
-                active.play_resampler = output.play_resampler;
-                active.output_stream_failed = output.failed;
-                if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
-                    drop(stream_loopback.take());
-                    stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
-                }
+
+            if out_failed {
+                did_rebuild = true;
+                any_recovered |= rebuild_output_half(
+                    &host,
+                    active,
+                    current_output_dev.as_deref(),
+                    &mut stream_loopback,
+                    atomics.stream_audio_sharing.load(Ordering::Relaxed),
+                    &mut silent_out_frames,
+                );
+            }
+
+            if did_rebuild {
+                last_hotplug_attempt = Instant::now();
+                error_backoff = if any_recovered {
+                    Duration::from_secs(1)
+                } else {
+                    (error_backoff * 2).min(Duration::from_secs(8))
+                };
+                sync_topology_snapshot(
+                    &topology_snap,
+                    &current_input_dev,
+                    &current_output_dev,
+                    Some(active),
+                );
             }
         }
 
@@ -1096,6 +1383,7 @@ fn run_audio_worker(
 
         if got_capture_samples {
             silent_capture_ticks = 0;
+            silence_guard.on_audio_received();
         } else {
             silent_capture_ticks = silent_capture_ticks.saturating_add(1);
         }
@@ -1131,30 +1419,6 @@ fn run_audio_worker(
         } else if now.duration_since(next_tick) > Duration::from_millis(50) {
             next_tick = now;
         }
-    }
-}
-
-fn select_device(
-    host: &cpal::Host,
-    preferred_name: Option<&str>,
-    is_input: bool,
-) -> Option<cpal::Device> {
-    if let Some(target) = preferred_name {
-        let devices = if is_input {
-            host.input_devices().ok()
-        } else {
-            host.output_devices().ok()
-        };
-        if let Some(mut iter) = devices {
-            if let Some(found) = iter.find(|d| d.name().map(|n| n == target).unwrap_or(false)) {
-                return Some(found);
-            }
-        }
-    }
-    if is_input {
-        host.default_input_device()
-    } else {
-        host.default_output_device()
     }
 }
 

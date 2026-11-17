@@ -3,6 +3,7 @@ pub mod codec;
 pub mod cues;
 pub mod denoise;
 pub mod engine;
+mod hotplug;
 pub mod jitter;
 pub mod mixer;
 pub mod resampler;
