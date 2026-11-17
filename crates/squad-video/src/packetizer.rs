@@ -121,7 +121,11 @@ impl PendingVideoFrame {
     }
 }
 
-pub fn fragment_frame(frame_id: u32, is_keyframe: bool, annex_b_bytes: &[u8]) -> Vec<VideoPacketOut> {
+pub fn fragment_frame(
+    frame_id: u32,
+    is_keyframe: bool,
+    annex_b_bytes: &[u8],
+) -> Vec<VideoPacketOut> {
     if annex_b_bytes.is_empty() {
         return Vec::new();
     }

@@ -1,9 +1,5 @@
 use crate::capture::{RawRgbaFrame, VideoCodec};
-use flate2::{
-    read::DeflateDecoder,
-    write::DeflateEncoder,
-    Compression,
-};
+use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageFormat};
 use std::fmt;
 use std::io::{Cursor, Read, Write};
@@ -28,6 +24,7 @@ const P_MODE_DEFLATE_TILES: u8 = 0x01;
 const P_MODE_JPEG_TILES: u8 = 0x02;
 
 const P_TILE_SIZE: usize = 64;
+const TILE_SAD_NOISE_FLOOR: u64 = 96;
 const MAX_IDR_PAYLOAD_BYTES: usize = 160 * 1024;
 const FLAT_IDR_DEFLATE_LIMIT: usize = 48 * 1024;
 
@@ -136,6 +133,7 @@ pub struct H264Encoder {
     gop_len: u64,
     frame_index: u64,
     force_idr: bool,
+    last_idr_quality: u8,
     width: u32,
     height: u32,
     ref_rgba: Vec<u8>,
@@ -158,6 +156,7 @@ impl H264Encoder {
             gop_len: u64::from(clamped_fps) * 2,
             frame_index: 0,
             force_idr: true,
+            last_idr_quality: 68,
             width: 0,
             height: 0,
             ref_rgba: Vec::new(),
@@ -186,8 +185,9 @@ impl H264Encoder {
         let width = frame.width.max(2);
         let height = frame.height.max(2);
         let expected_rgba_len = (width as usize) * (height as usize) * 4;
-        let dims_changed =
-            width != self.width || height != self.height || self.ref_rgba.len() != expected_rgba_len;
+        let dims_changed = width != self.width
+            || height != self.height
+            || self.ref_rgba.len() != expected_rgba_len;
 
         let mut is_keyframe =
             self.force_idr || dims_changed || self.frame_index.is_multiple_of(self.gop_len);
@@ -258,14 +258,13 @@ impl H264Encoder {
         }
     }
 
-    fn idr_qualities(&self) -> &'static [u8] {
-        match (self.codec, self.bitrate_bps) {
-            (VideoCodec::H265, b) if b >= 12_000_000 => &[86, 76, 66, 54, 42, 30],
-            (VideoCodec::H265, b) if b >= 8_000_000 => &[80, 70, 58, 46, 36, 26],
-            (VideoCodec::H265, _) => &[74, 62, 50, 40, 30, 22],
-            (VideoCodec::H264, b) if b >= 12_000_000 => &[82, 72, 62, 50, 38, 28],
-            (VideoCodec::H264, b) if b >= 8_000_000 => &[76, 66, 54, 44, 34, 24],
-            (VideoCodec::H264, _) => &[70, 58, 48, 38, 28, 20],
+    fn max_idr_quality(&self) -> u8 {
+        if self.bitrate_bps >= 12_000_000 {
+            82
+        } else if self.bitrate_bps >= 8_000_000 {
+            78
+        } else {
+            72
         }
     }
 
@@ -348,28 +347,36 @@ impl H264Encoder {
             soften_chroma_spikes(&mut self.scratch_rgb, w as usize, h as usize);
         }
 
+        let max_q = self.max_idr_quality();
+        let q1 = self.last_idr_quality.min(max_q);
         let mut best_jpeg = Vec::new();
-        for &q in self.idr_qualities() {
-            best_jpeg.clear();
-            let mut enc = JpegEncoder::new_with_quality(&mut best_jpeg, q);
-            if enc
-                .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
-                .is_ok()
-                && best_jpeg.len() < MAX_IDR_PAYLOAD_BYTES
-            {
-                break;
-            }
-        }
+        let enc_ok = JpegEncoder::new_with_quality(&mut best_jpeg, q1)
+            .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
+            .is_ok();
 
-        if best_jpeg.len() >= MAX_IDR_PAYLOAD_BYTES {
-            let mut fallback = Vec::new();
-            let mut enc = JpegEncoder::new_with_quality(&mut fallback, 15);
-            if enc
-                .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
-                .is_ok()
-                && !fallback.is_empty()
-            {
-                best_jpeg = fallback;
+        if enc_ok && best_jpeg.len() < 110 * 1024 {
+            self.last_idr_quality = (q1 + 4).min(max_q);
+        } else if !enc_ok || best_jpeg.len() >= MAX_IDR_PAYLOAD_BYTES {
+            let q2 = q1.saturating_sub(14).max(30);
+            self.last_idr_quality = q2;
+            best_jpeg.clear();
+            let _ = JpegEncoder::new_with_quality(&mut best_jpeg, q2).encode(
+                &self.scratch_rgb,
+                w,
+                h,
+                ExtendedColorType::Rgb8,
+            );
+
+            if best_jpeg.is_empty() || best_jpeg.len() >= MAX_IDR_PAYLOAD_BYTES {
+                let mut fallback = Vec::new();
+                if JpegEncoder::new_with_quality(&mut fallback, 18)
+                    .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
+                    .is_ok()
+                    && !fallback.is_empty()
+                {
+                    best_jpeg = fallback;
+                    self.last_idr_quality = 24;
+                }
             }
         }
 
@@ -405,14 +412,19 @@ impl H264Encoder {
                     let row_end = (y * w + x1) * 4;
                     let cur = &frame.rgba[row_start..row_end];
                     let prev = &self.ref_rgba[row_start..row_end];
-                    for (c, p) in cur.as_chunks::<4>().0.iter().zip(prev.as_chunks::<4>().0.iter()) {
+                    for (c, p) in cur
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .zip(prev.as_chunks::<4>().0.iter())
+                    {
                         sad += u64::from(c[0].abs_diff(p[0]))
                             + u64::from(c[1].abs_diff(p[1]))
                             + u64::from(c[2].abs_diff(p[2]));
                     }
                 }
 
-                if sad > 0 {
+                if sad >= TILE_SAD_NOISE_FLOOR {
                     changed.push((sad, (ty * tiles_x + tx) as u16));
                 }
             }
@@ -422,7 +434,7 @@ impl H264Encoder {
             return Some(vec![0x00, 0x00, P_MODE_JPEG_TILES]);
         }
 
-        if changed.len() * 100 > total_tiles * 65 {
+        if changed.len() * 100 > total_tiles * 80 {
             return None;
         }
 
@@ -433,26 +445,19 @@ impl H264Encoder {
         let mut best_encoded = vec![0x00, 0x00, P_MODE_JPEG_TILES];
         let mut best_count = 0usize;
 
-        let max_k = changed.len().min(96);
-        let mut low = 1usize;
-        let mut high = max_k;
-
-        while low <= high {
-            let mid = (low + high) / 2;
-            let candidate = self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..mid], quality);
-            if candidate.len() <= budget {
-                best_encoded = candidate;
-                best_count = mid;
-                low = mid + 1;
-            } else {
-                if mid == 1 {
-                    break;
-                }
-                high = mid - 1;
-            }
+        let mut count = changed.len().min((budget / 420).clamp(16, 96));
+        let mut candidate =
+            self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..count], quality);
+        if candidate.len() > budget && count > 1 {
+            count = ((count * budget * 9) / (candidate.len().max(1) * 10)).max(1);
+            candidate =
+                self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..count], quality);
         }
 
-        if best_count == 0 && !changed.is_empty() {
+        if candidate.len() <= budget {
+            best_encoded = candidate;
+            best_count = count;
+        } else if !changed.is_empty() {
             let single = self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..1], 55);
             if !single.is_empty() {
                 best_encoded = single;
@@ -532,13 +537,11 @@ impl H264Encoder {
 
         let mut use_deflate = false;
         let mut chosen = jpeg_buf;
-        if self.codec == VideoCodec::H265 || !jpeg_ok {
+        if !jpeg_ok {
             dpcm_row_sub_rgb(&self.scratch_strip, P_TILE_SIZE, &mut self.scratch_dpcm);
             if let Some(def_buf) = deflate_fast(&self.scratch_dpcm) {
-                if !jpeg_ok || def_buf.len() < chosen.len() {
-                    chosen = def_buf;
-                    use_deflate = true;
-                }
+                chosen = def_buf;
+                use_deflate = true;
             }
         }
 
@@ -704,8 +707,11 @@ impl H264Decoder {
                     return false;
                 };
                 if img.width() != self.width || img.height() != self.height {
-                    let resized =
-                        img.resize_exact(self.width, self.height, image::imageops::FilterType::Triangle);
+                    let resized = img.resize_exact(
+                        self.width,
+                        self.height,
+                        image::imageops::FilterType::Triangle,
+                    );
                     self.frame_rgba = resized.to_rgba8().into_raw();
                 } else {
                     self.frame_rgba = img.to_rgba8().into_raw();
@@ -764,7 +770,8 @@ impl H264Decoder {
                 dpcm_row_unsub_rgb(&dpcm[..expected], strip_w)
             }
             P_MODE_JPEG_TILES => {
-                let Ok(img) = image::load_from_memory_with_format(compressed, ImageFormat::Jpeg) else {
+                let Ok(img) = image::load_from_memory_with_format(compressed, ImageFormat::Jpeg)
+                else {
                     return false;
                 };
                 let rgb = img.to_rgb8();
@@ -825,14 +832,20 @@ fn soften_chroma_spikes(rgb: &mut [u8], w: usize, h: usize) {
             .unwrap_or(0);
             if max_spread > 12 {
                 let avg_rg_diff = (i32::from(rgb[p00]) - i32::from(rgb[p00 + 1])
-                    + i32::from(rgb[p10]) - i32::from(rgb[p10 + 1])
-                    + i32::from(rgb[p01]) - i32::from(rgb[p01 + 1])
-                    + i32::from(rgb[p11]) - i32::from(rgb[p11 + 1]))
+                    + i32::from(rgb[p10])
+                    - i32::from(rgb[p10 + 1])
+                    + i32::from(rgb[p01])
+                    - i32::from(rgb[p01 + 1])
+                    + i32::from(rgb[p11])
+                    - i32::from(rgb[p11 + 1]))
                     >> 2;
                 let avg_bg_diff = (i32::from(rgb[p00 + 2]) - i32::from(rgb[p00 + 1])
-                    + i32::from(rgb[p10 + 2]) - i32::from(rgb[p10 + 1])
-                    + i32::from(rgb[p01 + 2]) - i32::from(rgb[p01 + 1])
-                    + i32::from(rgb[p11 + 2]) - i32::from(rgb[p11 + 1]))
+                    + i32::from(rgb[p10 + 2])
+                    - i32::from(rgb[p10 + 1])
+                    + i32::from(rgb[p01 + 2])
+                    - i32::from(rgb[p01 + 1])
+                    + i32::from(rgb[p11 + 2])
+                    - i32::from(rgb[p11 + 1]))
                     >> 2;
                 for idx in [p00, p10, p01, p11] {
                     let g = i32::from(rgb[idx + 1]);
@@ -862,7 +875,10 @@ fn inflate_bounded(input: &[u8], expected_len: usize) -> Result<Vec<u8>, ()> {
 fn dpcm_row_sub_rgb(rgb: &[u8], width: usize, out: &mut Vec<u8>) {
     out.resize(rgb.len(), 0);
     let row_bytes = width * 3;
-    for (src_row, dst_row) in rgb.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes)) {
+    for (src_row, dst_row) in rgb
+        .chunks_exact(row_bytes)
+        .zip(out.chunks_exact_mut(row_bytes))
+    {
         let mut prev = [0u8; 3];
         for (s, d) in src_row
             .as_chunks::<3>()
@@ -881,7 +897,10 @@ fn dpcm_row_sub_rgb(rgb: &[u8], width: usize, out: &mut Vec<u8>) {
 fn dpcm_row_unsub_rgb(dpcm: &[u8], width: usize) -> Vec<u8> {
     let mut out = vec![0u8; dpcm.len()];
     let row_bytes = width * 3;
-    for (src_row, dst_row) in dpcm.chunks_exact(row_bytes).zip(out.chunks_exact_mut(row_bytes)) {
+    for (src_row, dst_row) in dpcm
+        .chunks_exact(row_bytes)
+        .zip(out.chunks_exact_mut(row_bytes))
+    {
         let mut prev = [0u8; 3];
         for (s, d) in src_row
             .as_chunks::<3>()
@@ -1117,11 +1136,17 @@ mod tests {
                 rgba[idx + 3] = 255;
             }
         }
-        let frame = RawRgbaFrame { width: w, height: h, rgba };
+        let frame = RawRgbaFrame {
+            width: w,
+            height: h,
+            rgba,
+        };
         let mut enc = H264Encoder::new(60, 8_000_000);
         let mut dec = H264Decoder::new();
         let encoded = enc.encode(&frame);
-        let decoded = dec.decode(&encoded.annex_b).expect("gray frame must decode");
+        let decoded = dec
+            .decode(&encoded.annex_b)
+            .expect("gray frame must decode");
 
         for px in decoded.rgba.as_chunks::<4>().0 {
             assert_eq!(px[0], px[1], "neutral gray must not shift green/magenta");

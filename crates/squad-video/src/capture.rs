@@ -328,7 +328,7 @@ mod macos_impl {
     const K_CF_NUMBER_SINT64_TYPE: isize = 4;
     const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
     const K_CG_IMAGE_BYTE_ORDER_32_BIG: u32 = 4 << 12;
-    const K_CG_INTERPOLATION_HIGH: i32 = 3;
+    const K_CG_INTERPOLATION_LOW: i32 = 1;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -377,10 +377,8 @@ mod macos_impl {
             window_id: u32,
             image_option: u32,
         ) -> CGImageRef;
-        fn CGRectMakeWithDictionaryRepresentation(
-            dict: CFDictionaryRef,
-            rect: *mut CGRect,
-        ) -> bool;
+        fn CGRectMakeWithDictionaryRepresentation(dict: CFDictionaryRef, rect: *mut CGRect)
+            -> bool;
 
         fn CGColorSpaceCreateDeviceRGB() -> CGColorSpaceRef;
         fn CGColorSpaceRelease(space: CGColorSpaceRef);
@@ -415,11 +413,7 @@ mod macos_impl {
             buffer_size: isize,
             encoding: u32,
         ) -> bool;
-        fn CFNumberGetValue(
-            number: CFNumberRef,
-            the_type: isize,
-            value_ptr: *mut c_void,
-        ) -> bool;
+        fn CFNumberGetValue(number: CFNumberRef, the_type: isize, value_ptr: *mut c_void) -> bool;
         fn CFRelease(cf: CFTypeRef);
     }
 
@@ -523,11 +517,7 @@ mod macos_impl {
         out
     }
 
-    pub fn capture_target(
-        target: &CaptureTarget,
-        out_w: u32,
-        out_h: u32,
-    ) -> Option<RawRgbaFrame> {
+    pub fn capture_target(target: &CaptureTarget, out_w: u32, out_h: u32) -> Option<RawRgbaFrame> {
         unsafe {
             let cg_image = match target {
                 CaptureTarget::Monitor { id, .. } => CGDisplayCreateImage(*id as CGDirectDisplayID),
@@ -535,8 +525,7 @@ mod macos_impl {
                     CGRectNull,
                     K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW,
                     *id as u32,
-                    K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING
-                        | K_CG_WINDOW_IMAGE_NOMINAL_RESOLUTION,
+                    K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING | K_CG_WINDOW_IMAGE_NOMINAL_RESOLUTION,
                 ),
             };
             if cg_image.is_null() {
@@ -551,8 +540,7 @@ mod macos_impl {
                 return None;
             }
 
-            let bitmap_info =
-                K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | K_CG_IMAGE_BYTE_ORDER_32_BIG;
+            let bitmap_info = K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | K_CG_IMAGE_BYTE_ORDER_32_BIG;
             let ctx = CGBitmapContextCreate(
                 rgba.as_mut_ptr() as *mut c_void,
                 out_w as usize,
@@ -576,7 +564,7 @@ mod macos_impl {
                     height: out_h as f64,
                 },
             };
-            CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_HIGH);
+            CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_LOW);
             CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
             CGContextFillRect(ctx, draw_rect);
             CGContextDrawImage(ctx, draw_rect, cg_image);
@@ -601,8 +589,12 @@ mod macos_impl {
             return None;
         }
         let mut buf: [c_char; 512] = [0; 512];
-        if CFStringGetCString(val, buf.as_mut_ptr(), buf.len() as isize, K_CF_STRING_ENCODING_UTF8)
-        {
+        if CFStringGetCString(
+            val,
+            buf.as_mut_ptr(),
+            buf.len() as isize,
+            K_CF_STRING_ENCODING_UTF8,
+        ) {
             Some(CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned())
         } else {
             None
@@ -655,8 +647,8 @@ mod windows_impl {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC,
         DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW, ReleaseDC, SelectObject,
-        SetBrushOrgEx, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        CAPTUREBLT, DIB_RGB_COLORS, HALFTONE, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
+        SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLORONCOLOR,
+        DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
     };
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -801,11 +793,7 @@ mod windows_impl {
             .map(str::to_string)
     }
 
-    pub fn capture_target(
-        target: &CaptureTarget,
-        out_w: u32,
-        out_h: u32,
-    ) -> Option<RawRgbaFrame> {
+    pub fn capture_target(target: &CaptureTarget, out_w: u32, out_h: u32) -> Option<RawRgbaFrame> {
         unsafe {
             match target {
                 CaptureTarget::Monitor { id, .. } => {
@@ -827,7 +815,8 @@ mod windows_impl {
                     if screen_dc.is_invalid() {
                         return None;
                     }
-                    let frame = copy_scaled_dc(screen_dc, r.left, r.top, src_w, src_h, out_w, out_h);
+                    let frame =
+                        copy_scaled_dc(screen_dc, r.left, r.top, src_w, src_h, out_w, out_h);
                     let _ = ReleaseDC(HWND::default(), screen_dc);
                     frame
                 }
@@ -911,21 +900,9 @@ mod windows_impl {
         }
 
         let old = SelectObject(mem_dc, dib);
-        let _ = SetStretchBltMode(mem_dc, HALFTONE);
-        let _ = SetBrushOrgEx(mem_dc, 0, 0, None);
+        let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
         let ok = if src_w == out_w as i32 && src_h == out_h as i32 {
-            BitBlt(
-                mem_dc,
-                0,
-                0,
-                src_w,
-                src_h,
-                src_dc,
-                src_x,
-                src_y,
-                SRCCOPY | CAPTUREBLT,
-            )
-            .is_ok()
+            BitBlt(mem_dc, 0, 0, src_w, src_h, src_dc, src_x, src_y, SRCCOPY).is_ok()
         } else {
             StretchBlt(
                 mem_dc,
@@ -938,7 +915,7 @@ mod windows_impl {
                 src_y,
                 src_w,
                 src_h,
-                SRCCOPY | CAPTUREBLT,
+                SRCCOPY,
             )
             .as_bool()
         };
