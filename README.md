@@ -12,9 +12,10 @@
 ## Key Features
 
 - **10 ms Opus Voice Pipeline:** 48 kHz mono Opus encoding (`audiopus`) in strict 10 ms (480-sample) frames with selectable bitrates (**24 / 40 / 64 / 96 kbps**), Discontinuous Transmission (DTX) silence gating, in-band Forward Error Correction (FEC), Packet Loss Concealment (PLC), and selectable jitter buffer latency profiles (**LAN 10 ms**, **Low 20 ms**, **Balanced 30 ms**, **Wi-Fi 50 ms**).
-- **Direct LAN / P2P Encrypted Mesh:** Concurrent WAN and local IPv4 (`if-addrs`) UDP hole punching connects up to 10 peers per room (`MAX_ROOM_PEERS = 10`) directly over UDP, with live **LAN / P2P** route, RTT, buffer, and packet-loss telemetry badges on each peer card. All P2P payloads are encrypted with **ChaCha20-Poly1305** AEAD using keys derived via **BLAKE3** from the invite secret.
+- **Direct LAN / P2P Encrypted Mesh + UDP Relay Fallback:** Concurrent WAN and local IPv4 (`if-addrs`) UDP hole punching connects up to 10 peers per room (`MAX_ROOM_PEERS = 10`) directly over UDP, with live **LAN / P2P / Relay** route, RTT, buffer, and packet-loss telemetry badges on each peer card. Peers behind strict Symmetric NAT automatically fall back to a zero-amplification **UDP Relay** via `squad-rendezvous` and upgrade back to direct P2P seamlessly without dropping voice. All payloads are encrypted with **ChaCha20-Poly1305** AEAD using keys derived via **BLAKE3** from the invite secret.
+- **Zero-Config LAN Rooms & Host Migration:** Click **Host LAN Room** in the lobby to launch an embedded `squad-rendezvous` host inside the client and broadcast the room over UDP LAN discovery (**LAN Rooms Nearby**) — no internet or separate server binary required. If the host leaves, another peer automatically promotes its embedded coordinator and preserves the room.
 - **Studio-Grade Voice DSP (`squad-dsp`):**
-  - Lock-free `cpal` audio I/O connected to a dedicated real-time DSP thread via `ringbuf` SPSC ring buffers and `rubato` resampling.
+  - Lock-free `cpal` audio I/O connected to a dedicated real-time DSP thread via `ringbuf` SPSC ring buffers and `rubato` resampling, with automatic **CoreAudio / WASAPI hot-plug recovery** (OS default switches, unplug fallback, preferred-device replug recovery, Bluetooth HFP profile transitions, and live Settings dropdown updates).
   - Selectable noise suppression: **Off**, built-in **RNNoise** (`nnnoiseless`), or optional **DeepFilterNet3** ONNX (`tract-onnx`).
   - Toggleable **WebRTC AEC3** acoustic echo cancellation (`aec3`), **Hear Yourself** mic loopback test in Settings, adjustable input gain & VAD threshold, comfort-calibrated voice mixing with a smooth soft peak limiter, per-peer volume sliders (`0%–200%`), and optional WAV audio cues.
 - **Hardware-Accelerated Screen Sharing (`squad-video`):** Capture displays or application windows at **720p / 1080p / Native** and **30 / 60 FPS** in **H.264** or **H.265 (HEVC)** with hardware backend detection (**Apple VideoToolbox** on macOS; **NVIDIA NVENC**, **AMD AMF / VCN**, **Intel QSV**, and **Windows MFT** on Windows), packet fragmentation, and XOR FEC.
@@ -32,8 +33,8 @@
    - **Linux (x86_64):** Download `squad-client-linux-x86_64.tar.gz` or [build from source](#build-from-source).
 
 2. **Create a Room & Share the Invite Link**
-   - Open SquadAir, click **Create Room** to generate a cryptographic `squad://<room_id>#<secret>` link (legacy `voice://` links are also supported), and send it to your squad.
-   - To join a friend's room, paste their `squad://` link in the lobby and click **Join**.
+   - Open SquadAir, click **Create Room** to generate a cryptographic `squad://<room_id>#<secret>` link (legacy `voice://` links are also supported), and send it to your squad — or click **Host LAN Room** to auto-announce a zero-config local room.
+   - To join a friend's room, paste their `squad://` link in the lobby or pick a room under **LAN Rooms Nearby** and click **Join**.
 
 3. **Configure Voice & Play**
    - Open **Settings** to pick your microphone/headset, run **Hear Yourself** mic loopback, choose **RNNoise** or **DeepFilterNet3**, select your jitter latency profile (**10–50 ms**) & Opus bitrate, click-to-bind **Push-to-Talk / Push-to-Mute / Toggle Mute / Toggle Deafen** (including `Mouse4` / `Mouse5`), and enable the click-through **In-Game Overlay**.
@@ -98,7 +99,15 @@ docker compose logs -f squad-rendezvous
 
 ### Option B: Pure LAN Mode (No Internet Required)
 
-Run `squad-rendezvous` on any machine on your local network:
+**1-Click Embedded Host (Recommended):**
+
+1. Click **Host LAN Room** in the Lobby — the client starts an embedded `squad-rendezvous` coordinator locally and announces the room across your subnet.
+2. Friends on the same network see the room in **LAN Rooms Nearby** and click **Join** (or join via its `squad://` invite link).
+3. If the host leaves, another connected peer automatically takes over hosting the embedded rendezvous coordinator without closing the room.
+
+**Manual Dedicated Binary (Optional):**
+
+You can also run `squad-rendezvous` standalone on any machine on your local network:
 
 ```bash
 squad-rendezvous --bind 0.0.0.0:3478
