@@ -209,7 +209,7 @@ impl Recipe for AppWorkerRecipe {
     fn stream(self: Box<Self>, _input: EventStream) -> BoxStream<'static, Self::Output> {
         let sync = self.0;
         Box::pin(stream::channel(64, |mut output| async move {
-            let mut last_audio_snapshot: Option<(bool, bool, bool, i32)> = None;
+            let mut last_audio_snapshot: Option<(bool, bool, bool, i32, u32)> = None;
             let mut last_video_sent = std::time::Instant::now() - Duration::from_millis(20);
             let mut poll_interval = tokio::time::interval(Duration::from_millis(66));
             poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -266,10 +266,11 @@ impl Recipe for AppWorkerRecipe {
     }
 }
 
-fn sample_audio_ui_snapshot(sync: &UiSyncState) -> (bool, bool, bool, i32) {
+fn sample_audio_ui_snapshot(sync: &UiSyncState) -> (bool, bool, bool, i32, u32) {
     let speaking = sync.audio.is_local_speaking();
     let muted = sync.audio.is_mic_muted();
     let deafened = sync.audio.is_deafened();
+    let dev_gen = sync.audio.device_list_gen();
     let in_tray = sync.in_tray.load(Ordering::Acquire);
     let db_bucket = if in_tray || muted || deafened {
         -60
@@ -281,7 +282,7 @@ fn sample_audio_ui_snapshot(sync: &UiSyncState) -> (bool, bool, bool, i32) {
             db.round() as i32
         }
     };
-    (speaking, muted, deafened, db_bucket)
+    (speaking, muted, deafened, db_bucket, dev_gen)
 }
 
 fn main_window_settings() -> iced::window::Settings {
@@ -516,7 +517,13 @@ impl SquadApp {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::AudioStateChanged => Task::none(),
+            Message::AudioStateChanged => {
+                if self.screen == Screen::Settings && self.audio.take_devices_dirty() {
+                    self.input_devices = list_input_devices();
+                    self.output_devices = list_output_devices();
+                }
+                Task::none()
+            }
             Message::ClearCopiedFlash => {
                 if let Some((_, ts)) = self.copied_msg_id {
                     if ts.elapsed() >= Duration::from_secs(2) {
@@ -936,6 +943,10 @@ impl SquadApp {
                     self.screen = Screen::Settings;
                     self.audio.set_streams_active(true);
                     self.audio.set_monitoring_in_settings(true);
+                    if self.audio.take_devices_dirty() {
+                        self.input_devices = list_input_devices();
+                        self.output_devices = list_output_devices();
+                    }
                     self.ui_sync.in_settings.store(true, Ordering::Release);
                     self.ui_sync.audio_ui_notify.notify_one();
                 }
@@ -1060,6 +1071,7 @@ impl SquadApp {
                 Task::none()
             }
             Message::RefreshAudioDevices => {
+                let _ = self.audio.take_devices_dirty();
                 self.input_devices = list_input_devices();
                 self.output_devices = list_output_devices();
                 Task::none()
