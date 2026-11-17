@@ -21,6 +21,10 @@ pub const VIDEO_FLAG_XOR_FEC: u8 = 0x02;
 pub const OPCODE_RELAY: u8 = 0x05;
 pub const RELAY_HEADER_LEN: usize = 22;
 pub const MAX_RELAY_UDP_PAYLOAD: usize = MAX_UDP_PAYLOAD + RELAY_HEADER_LEN;
+pub const LAN_DISCOVERY_PORT: u16 = 3479;
+pub const OPCODE_LAN_ANNOUNCE: u8 = 0x06;
+pub const OPCODE_LAN_GOODBYE: u8 = 0x07;
+pub const MAX_LAN_ROOM_NAME_LEN: usize = 48;
 
 pub type RoomId = [u8; 16];
 pub type ClientUuid = [u8; 16];
@@ -419,6 +423,138 @@ pub fn rewrite_relay_peer_id(datagram: &mut [u8], new_peer_id: PeerId) {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LanDiscoveryPacket {
+    /// `0x06` UDP broadcast advertising an open zero-config LAN room.
+    Announce {
+        room_id: RoomId,
+        secret: [u8; 32],
+        rv_port: u16,
+        peer_count: u8,
+        max_peers: u8,
+        room_name: String,
+        host_nickname: String,
+    },
+    /// `0x07` UDP broadcast announcing that a LAN room closed or migrated.
+    Goodbye { room_id: RoomId, rv_port: u16 },
+}
+
+impl LanDiscoveryPacket {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
+        let mut buf = Vec::with_capacity(160);
+        buf.extend_from_slice(&MAGIC);
+        buf.push(PROTO_VERSION);
+
+        match self {
+            LanDiscoveryPacket::Announce {
+                room_id,
+                secret,
+                rv_port,
+                peer_count,
+                max_peers,
+                room_name,
+                host_nickname,
+            } => {
+                buf.push(OPCODE_LAN_ANNOUNCE);
+                buf.extend_from_slice(room_id);
+                buf.extend_from_slice(secret);
+                buf.extend_from_slice(&rv_port.to_be_bytes());
+                buf.push(*peer_count);
+                buf.push(*max_peers);
+
+                let name_bytes = truncate_utf8(room_name, MAX_LAN_ROOM_NAME_LEN);
+                buf.push(name_bytes.len() as u8);
+                buf.extend_from_slice(name_bytes);
+
+                let nick_bytes = truncate_utf8(host_nickname, MAX_NICKNAME_LEN);
+                buf.push(nick_bytes.len() as u8);
+                buf.extend_from_slice(nick_bytes);
+            }
+            LanDiscoveryPacket::Goodbye { room_id, rv_port } => {
+                buf.push(OPCODE_LAN_GOODBYE);
+                buf.extend_from_slice(room_id);
+                buf.extend_from_slice(&rv_port.to_be_bytes());
+            }
+        }
+
+        if buf.len() > MAX_UDP_PAYLOAD {
+            return Err(ProtoError::PacketTooLarge(buf.len()));
+        }
+        Ok(buf)
+    }
+
+    pub fn decode(data: &[u8]) -> Result<Self, ProtoError> {
+        if data.len() < 4 {
+            return Err(ProtoError::PacketTooShort {
+                expected: 4,
+                actual: data.len(),
+            });
+        }
+        if data[0..2] != MAGIC || data[2] != PROTO_VERSION {
+            return Err(ProtoError::InvalidHeader);
+        }
+
+        let opcode = data[3];
+        let mut cursor = 4usize;
+
+        match opcode {
+            OPCODE_LAN_ANNOUNCE => {
+                need_bytes(data, cursor, 16 + 32 + 2 + 1 + 1 + 1)?;
+                let mut room_id = [0u8; 16];
+                room_id.copy_from_slice(&data[cursor..cursor + 16]);
+                cursor += 16;
+
+                let mut secret = [0u8; 32];
+                secret.copy_from_slice(&data[cursor..cursor + 32]);
+                cursor += 32;
+
+                let rv_port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
+                let peer_count = data[cursor + 2];
+                let max_peers = data[cursor + 3];
+                let name_len = data[cursor + 4] as usize;
+                cursor += 5;
+
+                if name_len > MAX_LAN_ROOM_NAME_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, name_len + 1)?;
+                let room_name = std::str::from_utf8(&data[cursor..cursor + name_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?
+                    .to_string();
+                cursor += name_len;
+
+                let nick_len = data[cursor] as usize;
+                cursor += 1;
+                if nick_len > MAX_NICKNAME_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, nick_len)?;
+                let host_nickname = std::str::from_utf8(&data[cursor..cursor + nick_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?
+                    .to_string();
+
+                Ok(LanDiscoveryPacket::Announce {
+                    room_id,
+                    secret,
+                    rv_port,
+                    peer_count,
+                    max_peers,
+                    room_name,
+                    host_nickname,
+                })
+            }
+            OPCODE_LAN_GOODBYE => {
+                need_bytes(data, cursor, 18)?;
+                let mut room_id = [0u8; 16];
+                room_id.copy_from_slice(&data[cursor..cursor + 16]);
+                let rv_port = u16::from_be_bytes([data[cursor + 16], data[cursor + 17]]);
+                Ok(LanDiscoveryPacket::Goodbye { room_id, rv_port })
+            }
+            other => Err(ProtoError::UnknownOpcode(other)),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]
 pub enum P2pMsgType {
@@ -426,6 +562,8 @@ pub enum P2pMsgType {
     PunchAck = 0x11,
     Ping = 0x12,
     Pong = 0x13,
+    LanHostMigrate = 0x14,
+    LanHostClaim = 0x15,
     AudioOpus = 0x20,
     AudioDtxKeepalive = 0x21,
     ChatText = 0x30,
@@ -451,6 +589,8 @@ impl P2pMsgType {
             0x11 => Ok(Self::PunchAck),
             0x12 => Ok(Self::Ping),
             0x13 => Ok(Self::Pong),
+            0x14 => Ok(Self::LanHostMigrate),
+            0x15 => Ok(Self::LanHostClaim),
             0x20 => Ok(Self::AudioOpus),
             0x21 => Ok(Self::AudioDtxKeepalive),
             0x30 => Ok(Self::ChatText),
@@ -537,6 +677,13 @@ pub enum P2pPayload {
     Pong {
         echo_timestamp_us: u64,
     },
+    LanHostMigrate {
+        new_host_peer_id: PeerId,
+    },
+    LanHostClaim {
+        rv_port: u16,
+        room_name: String,
+    },
     AudioOpus {
         opus_data: Vec<u8>,
     },
@@ -621,6 +768,8 @@ impl P2pPayload {
             P2pPayload::PunchAck { .. } => P2pMsgType::PunchAck,
             P2pPayload::Ping { .. } => P2pMsgType::Ping,
             P2pPayload::Pong { .. } => P2pMsgType::Pong,
+            P2pPayload::LanHostMigrate { .. } => P2pMsgType::LanHostMigrate,
+            P2pPayload::LanHostClaim { .. } => P2pMsgType::LanHostClaim,
             P2pPayload::AudioOpus { .. } => P2pMsgType::AudioOpus,
             P2pPayload::AudioDtxKeepalive => P2pMsgType::AudioDtxKeepalive,
             P2pPayload::ChatText { .. } => P2pMsgType::ChatText,
@@ -661,6 +810,15 @@ impl P2pPayload {
             }
             P2pPayload::Pong { echo_timestamp_us } => {
                 out.extend_from_slice(&echo_timestamp_us.to_be_bytes());
+            }
+            P2pPayload::LanHostMigrate { new_host_peer_id } => {
+                out.extend_from_slice(&new_host_peer_id.to_be_bytes());
+            }
+            P2pPayload::LanHostClaim { rv_port, room_name } => {
+                let name_bytes = truncate_utf8(room_name, MAX_LAN_ROOM_NAME_LEN);
+                out.extend_from_slice(&rv_port.to_be_bytes());
+                out.push(name_bytes.len() as u8);
+                out.extend_from_slice(name_bytes);
             }
             P2pPayload::AudioOpus { opus_data } => {
                 if opus_data.len() > 1024 {
@@ -851,6 +1009,24 @@ impl P2pPayload {
                 need_bytes(body, 0, 8)?;
                 let echo_timestamp_us = u64::from_be_bytes(body[0..8].try_into().unwrap());
                 Ok(P2pPayload::Pong { echo_timestamp_us })
+            }
+            P2pMsgType::LanHostMigrate => {
+                need_bytes(body, 0, 2)?;
+                let new_host_peer_id = u16::from_be_bytes([body[0], body[1]]);
+                Ok(P2pPayload::LanHostMigrate { new_host_peer_id })
+            }
+            P2pMsgType::LanHostClaim => {
+                need_bytes(body, 0, 3)?;
+                let rv_port = u16::from_be_bytes([body[0], body[1]]);
+                let name_len = body[2] as usize;
+                if name_len > MAX_LAN_ROOM_NAME_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(body, 3, name_len)?;
+                let room_name = std::str::from_utf8(&body[3..3 + name_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?
+                    .to_string();
+                Ok(P2pPayload::LanHostClaim { rv_port, room_name })
             }
             P2pMsgType::AudioOpus => {
                 need_bytes(body, 0, 2)?;
@@ -1431,5 +1607,53 @@ mod tests {
             encode_relay_datagram_into(&room_id, 2, &oversized, &mut wire),
             Err(ProtoError::PacketTooLarge(_))
         ));
+    }
+
+    #[test]
+    fn test_lan_discovery_packets_and_host_migration_roundtrip() {
+        let announce = LanDiscoveryPacket::Announce {
+            room_id: [0x33; 16],
+            secret: [0x44; 32],
+            rv_port: 3478,
+            peer_count: 3,
+            max_peers: 10,
+            room_name: "CS2 LAN Stack".to_string(),
+            host_nickname: "Aliver".to_string(),
+        };
+        let encoded = announce.encode().unwrap();
+        assert_eq!(LanDiscoveryPacket::decode(&encoded).unwrap(), announce);
+
+        let bye = LanDiscoveryPacket::Goodbye {
+            room_id: [0x33; 16],
+            rv_port: 3478,
+        };
+        let bye_bytes = bye.encode().unwrap();
+        assert_eq!(LanDiscoveryPacket::decode(&bye_bytes).unwrap(), bye);
+
+        let cipher = crate::crypto::RoomCipher::from_secret(&[0x55; 32]);
+        for (i, payload) in [
+            P2pPayload::LanHostMigrate {
+                new_host_peer_id: 2,
+            },
+            P2pPayload::LanHostClaim {
+                rv_port: 44123,
+                room_name: "CS2 LAN Stack".to_string(),
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let hdr = P2pHeader {
+                msg_type: payload.msg_type(),
+                room_prefix: [0x33; 4],
+                sender_peer_id: 1,
+                seq_num: (i + 1) as u64,
+            };
+            let mut sealed = Vec::new();
+            cipher.seal_packet(&hdr, &payload, &mut sealed).unwrap();
+            let (dec_hdr, dec_payload) = cipher.open_packet(&mut sealed).unwrap();
+            assert_eq!(dec_hdr.msg_type, payload.msg_type());
+            assert_eq!(dec_payload, payload);
+        }
     }
 }
