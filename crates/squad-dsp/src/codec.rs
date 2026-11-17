@@ -54,6 +54,12 @@ impl OpusEncoder10ms {
         Ok(Some(self.scratch_out[..encoded_len].to_vec()))
     }
 
+    pub fn set_bitrate(&mut self, bitrate_bps: i32) -> Result<(), OpusCodecError> {
+        self.encoder
+            .set_bitrate(Bitrate::BitsPerSecond(bitrate_bps.clamp(12_000, 128_000)))?;
+        Ok(())
+    }
+
     pub fn encode_speech_frame(
         &mut self,
         pcm_480: &[f32; FRAME_SAMPLES],
@@ -100,5 +106,26 @@ impl OpusDecoder10ms {
             let _ = self.decoder.decode_float(None, signals, false)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_opus_encoder_set_bitrate() {
+        let mut encoder = OpusEncoder10ms::new(40_000).unwrap();
+        assert!(encoder.set_bitrate(24_000).is_ok());
+        assert!(encoder.set_bitrate(64_000).is_ok());
+        assert!(encoder.set_bitrate(1_000).is_ok());
+        assert!(encoder.set_bitrate(500_000).is_ok());
+
+        let mut pcm = [0.0f32; FRAME_SAMPLES];
+        for (i, sample) in pcm.iter_mut().enumerate() {
+            let t = i as f32 / 48_000.0;
+            *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.4;
+        }
+        assert!(encoder.encode_speech_frame(&pcm).is_ok());
     }
 }

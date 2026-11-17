@@ -2,10 +2,63 @@ use crate::codec::OpusDecoder10ms;
 use crate::FRAME_SAMPLES;
 use std::collections::BTreeMap;
 
-const TARGET_BUFFER_FRAMES: usize = 3; // 30 ms (leaves 20 ms steady jitter cushion)
-const MAX_BUFFER_FRAMES: usize = 10; // 100 ms max burst tolerance
 const MAX_PLC_CONSECUTIVE: u32 = 3; // 30 ms max PLC before fade-out
 const SPEAKING_RMS_THRESHOLD: f32 = 0.0055; // ~ -45 dBFS
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum JitterProfile {
+    LanUltraLow,
+    LowLatency,
+    #[default]
+    Balanced,
+    StableWifi,
+}
+
+impl JitterProfile {
+    pub const ALL: [JitterProfile; 4] = [
+        Self::LanUltraLow,
+        Self::LowLatency,
+        Self::Balanced,
+        Self::StableWifi,
+    ];
+
+    pub fn target_frames(self) -> usize {
+        match self {
+            Self::LanUltraLow => 1,
+            Self::LowLatency => 2,
+            Self::Balanced => 3,
+            Self::StableWifi => 5,
+        }
+    }
+
+    pub fn max_frames(self) -> usize {
+        match self {
+            Self::LanUltraLow => 6,
+            Self::LowLatency => 8,
+            Self::Balanced => 10,
+            Self::StableWifi => 12,
+        }
+    }
+
+    pub fn target_ms(self) -> u32 {
+        (self.target_frames() as u32) * 10
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::LanUltraLow => "LAN / Ultra-Low (10 ms)",
+            Self::LowLatency => "Low Latency (20 ms)",
+            Self::Balanced => "Balanced (30 ms)",
+            Self::StableWifi => "Unstable Wi-Fi (50 ms)",
+        }
+    }
+}
+
+impl std::fmt::Display for JitterProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct JitterSnapshot {
@@ -18,6 +71,8 @@ pub struct JitterBuffer {
     packets: BTreeMap<u64, Vec<u8>>,
     next_expected_seq: Option<u64>,
     primed: bool,
+    target_frames: usize,
+    max_frames: usize,
     consecutive_missing: u32,
     received_window: u32,
     lost_window: u32,
@@ -27,16 +82,38 @@ pub struct JitterBuffer {
 
 impl JitterBuffer {
     pub fn new() -> Self {
+        Self::with_profile(JitterProfile::Balanced)
+    }
+
+    pub fn with_profile(profile: JitterProfile) -> Self {
         Self {
             decoder: OpusDecoder10ms::new().expect("OpusDecoder10ms init"),
             packets: BTreeMap::new(),
             next_expected_seq: None,
             primed: false,
+            target_frames: profile.target_frames(),
+            max_frames: profile.max_frames(),
             consecutive_missing: 0,
             received_window: 0,
             lost_window: 0,
             loss_pct_ewma: 0.0,
             speaking_hold_frames: 0,
+        }
+    }
+
+    pub fn set_profile(&mut self, profile: JitterProfile) {
+        self.target_frames = profile.target_frames();
+        self.max_frames = profile.max_frames();
+
+        while self.packets.len() > self.max_frames {
+            if let Some((&oldest_seq, _)) = self.packets.iter().next() {
+                self.packets.remove(&oldest_seq);
+                self.next_expected_seq = Some(oldest_seq + 1);
+            }
+        }
+
+        if self.packets.len() >= self.target_frames {
+            self.primed = true;
         }
     }
 
@@ -57,14 +134,14 @@ impl JitterBuffer {
         self.packets.insert(seq_num, opus_payload);
 
         // Ограничиваем верхний предел буфера, чтобы задержка никогда не копилась
-        while self.packets.len() > MAX_BUFFER_FRAMES {
+        while self.packets.len() > self.max_frames {
             if let Some((&oldest_seq, _)) = self.packets.iter().next() {
                 self.packets.remove(&oldest_seq);
                 self.next_expected_seq = Some(oldest_seq + 1);
             }
         }
 
-        if self.packets.len() >= TARGET_BUFFER_FRAMES {
+        if self.packets.len() >= self.target_frames {
             self.primed = true;
         }
     }
@@ -209,6 +286,52 @@ mod tests {
         assert!(jb.pop_pcm_frame(&mut out));
         assert_eq!(jb.next_expected_seq, Some(5));
         let rms = (out.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
-        assert!(rms > 0.05, "Expected decoded audio for late seq 4, got rms={rms}");
+        assert!(
+            rms > 0.05,
+            "Expected decoded audio for late seq 4, got rms={rms}"
+        );
+    }
+
+    #[test]
+    fn test_jitter_profile_lan_ultra_low_vs_balanced() {
+        let mut encoder = OpusEncoder10ms::new(40_000).unwrap();
+        let mut pcm = [0.0f32; FRAME_SAMPLES];
+        for (i, sample) in pcm.iter_mut().enumerate() {
+            let t = i as f32 / 48_000.0;
+            *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+        }
+        let pkt1 = encoder.encode_speech_frame(&pcm).unwrap();
+        let pkt2 = encoder.encode_speech_frame(&pcm).unwrap();
+        let pkt3 = encoder.encode_speech_frame(&pcm).unwrap();
+
+        let mut jb_lan = JitterBuffer::with_profile(JitterProfile::LanUltraLow);
+        let mut out = [0.0f32; FRAME_SAMPLES];
+        jb_lan.push_packet(1, pkt1.clone());
+        assert!(
+            jb_lan.pop_pcm_frame(&mut out),
+            "LanUltraLow (10 ms) must prime after 1 packet"
+        );
+
+        let mut jb_bal = JitterBuffer::with_profile(JitterProfile::Balanced);
+        jb_bal.push_packet(1, pkt1);
+        assert!(
+            !jb_bal.pop_pcm_frame(&mut out),
+            "Balanced (30 ms) must not prime after 1 packet"
+        );
+        jb_bal.push_packet(2, pkt2);
+        assert!(
+            !jb_bal.pop_pcm_frame(&mut out),
+            "Balanced (30 ms) must not prime after 2 packets"
+        );
+        jb_bal.push_packet(3, pkt3);
+        assert!(
+            jb_bal.pop_pcm_frame(&mut out),
+            "Balanced (30 ms) must prime after 3 packets"
+        );
+
+        assert_eq!(JitterProfile::LanUltraLow.target_ms(), 10);
+        assert_eq!(JitterProfile::LowLatency.target_ms(), 20);
+        assert_eq!(JitterProfile::Balanced.target_ms(), 30);
+        assert_eq!(JitterProfile::StableWifi.target_ms(), 50);
     }
 }

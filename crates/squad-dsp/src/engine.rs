@@ -2,6 +2,7 @@ use crate::aec::EchoCanceller;
 use crate::codec::OpusEncoder10ms;
 use crate::cues::{SoundCue, SoundCueBank};
 use crate::denoise::{NoiseSuppressionMode, NoiseSuppressor};
+use crate::jitter::JitterProfile;
 use crate::mixer::AudioMixer;
 use crate::resampler::{CaptureResampler, PlaybackResampler};
 use crate::{FRAME_SAMPLES, SAMPLE_RATE};
@@ -65,6 +66,7 @@ pub struct AudioEngineConfig {
     pub input_gain: f32,
     pub vad_threshold_db: f32,
     pub bitrate_bps: i32,
+    pub jitter_profile: JitterProfile,
 }
 
 impl Default for AudioEngineConfig {
@@ -78,6 +80,7 @@ impl Default for AudioEngineConfig {
             input_gain: 1.0,
             vad_threshold_db: -45.0,
             bitrate_bps: 40_000,
+            jitter_profile: JitterProfile::default(),
         }
     }
 }
@@ -106,16 +109,23 @@ enum EngineCmd {
     ClearPeers,
     SetAec(bool),
     SetNsMode(NoiseSuppressionMode),
+    SetOpusBitrate(i32),
+    SetJitterProfile(JitterProfile),
+    ClearLoopback,
     SetAudioDevices {
         input_device_name: Option<String>,
         output_device_name: Option<String>,
     },
+    SetStreamsActive(bool),
     PlayCue(SoundCue),
     Shutdown,
 }
 
 struct SharedAtomics {
     running: AtomicBool,
+    streams_active: AtomicBool,
+    monitoring_in_settings: AtomicBool,
+    mic_loopback: AtomicBool,
     mic_muted: AtomicBool,
     deafened: AtomicBool,
     hotkey_active: AtomicBool,
@@ -124,6 +134,7 @@ struct SharedAtomics {
     input_gain_bits: AtomicU32,
     vad_threshold_db_bits: AtomicU32,
     mic_level_db_bits: AtomicU32,
+    jitter_target_ms: AtomicU32,
     local_speaking: AtomicBool,
     df3_available: AtomicBool,
 }
@@ -148,6 +159,9 @@ impl AudioEngineHandle {
 
         let atomics = Arc::new(SharedAtomics {
             running: AtomicBool::new(true),
+            streams_active: AtomicBool::new(false),
+            monitoring_in_settings: AtomicBool::new(false),
+            mic_loopback: AtomicBool::new(false),
             mic_muted: AtomicBool::new(false),
             deafened: AtomicBool::new(false),
             hotkey_active: AtomicBool::new(false),
@@ -158,6 +172,7 @@ impl AudioEngineHandle {
                 config.vad_threshold_db.clamp(-60.0, 0.0).to_bits(),
             ),
             mic_level_db_bits: AtomicU32::new((-60.0f32).to_bits()),
+            jitter_target_ms: AtomicU32::new(config.jitter_profile.target_ms()),
             local_speaking: AtomicBool::new(false),
             df3_available: AtomicBool::new(df3_avail),
         });
@@ -168,7 +183,14 @@ impl AudioEngineHandle {
         thread::Builder::new()
             .name("squad-dsp-worker".into())
             .spawn(move || {
-                run_audio_worker(config, suppressor, cmd_rx, outbound_tx, atomics_worker, stats_worker);
+                run_audio_worker(
+                    config,
+                    suppressor,
+                    cmd_rx,
+                    outbound_tx,
+                    atomics_worker,
+                    stats_worker,
+                );
             })
             .context("failed to spawn squad-dsp-worker thread")?;
 
@@ -207,7 +229,9 @@ impl AudioEngineHandle {
         self.atomics
             .stream_audio_sharing
             .store(enabled, Ordering::Relaxed);
-        let _ = self.cmd_tx.try_send(EngineCmd::SetShareStreamAudio(enabled));
+        let _ = self
+            .cmd_tx
+            .try_send(EngineCmd::SetShareStreamAudio(enabled));
     }
 
     pub fn set_peer_gain(&self, peer_id: PeerId, gain: f32) {
@@ -232,6 +256,32 @@ impl AudioEngineHandle {
 
     pub fn set_ns_mode(&self, mode: NoiseSuppressionMode) {
         let _ = self.cmd_tx.try_send(EngineCmd::SetNsMode(mode));
+    }
+
+    pub fn set_opus_bitrate(&self, bitrate_bps: i32) {
+        let _ = self.cmd_tx.try_send(EngineCmd::SetOpusBitrate(bitrate_bps));
+    }
+
+    pub fn set_jitter_profile(&self, profile: JitterProfile) {
+        self.atomics
+            .jitter_target_ms
+            .store(profile.target_ms(), Ordering::Relaxed);
+        let _ = self.cmd_tx.try_send(EngineCmd::SetJitterProfile(profile));
+    }
+
+    pub fn jitter_target_ms(&self) -> u32 {
+        self.atomics.jitter_target_ms.load(Ordering::Relaxed)
+    }
+
+    pub fn set_mic_loopback(&self, enabled: bool) {
+        self.atomics.mic_loopback.store(enabled, Ordering::Relaxed);
+        if !enabled {
+            let _ = self.cmd_tx.try_send(EngineCmd::ClearLoopback);
+        }
+    }
+
+    pub fn is_mic_loopback(&self) -> bool {
+        self.atomics.mic_loopback.load(Ordering::Relaxed)
     }
 
     pub fn play_cue(&self, cue: SoundCue) {
@@ -319,6 +369,19 @@ impl AudioEngineHandle {
             output_device_name,
         });
     }
+
+    pub fn set_streams_active(&self, active: bool) {
+        let prev = self.atomics.streams_active.swap(active, Ordering::AcqRel);
+        if prev != active {
+            let _ = self.cmd_tx.try_send(EngineCmd::SetStreamsActive(active));
+        }
+    }
+
+    pub fn set_monitoring_in_settings(&self, enabled: bool) {
+        self.atomics
+            .monitoring_in_settings
+            .store(enabled, Ordering::Relaxed);
+    }
 }
 
 struct AudioStreams {
@@ -405,10 +468,7 @@ struct OutputStreamHalf {
     channels: usize,
 }
 
-fn build_input_stream_half(
-    host: &cpal::Host,
-    input_device_name: Option<&str>,
-) -> InputStreamHalf {
+fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -> InputStreamHalf {
     let in_device = select_device(host, input_device_name, true);
     let (in_rate, in_channels) = in_device
         .as_ref()
@@ -625,6 +685,90 @@ fn build_loopback_stream(
     })
 }
 
+struct WorkerAudioCtx<'a> {
+    host: &'a cpal::Host,
+    atomics: &'a SharedAtomics,
+    suppressor: &'a mut NoiseSuppressor,
+    aec: &'a mut EchoCanceller,
+    encoder: &'a mut OpusEncoder10ms,
+    mixer: &'a mut AudioMixer,
+    streams: &'a mut Option<AudioStreams>,
+    stream_loopback: &'a mut Option<LoopbackStream>,
+    current_input_dev: &'a mut Option<String>,
+    current_output_dev: &'a mut Option<String>,
+    silent_capture_ticks: &'a mut u32,
+    silent_out_frames: &'a mut u8,
+    last_hotplug_attempt: &'a mut Instant,
+}
+
+fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
+    match cmd {
+        EngineCmd::PushRemoteOpus {
+            peer_id,
+            seq_num,
+            opus_data,
+        } => ctx.mixer.push_peer_opus(peer_id, seq_num, opus_data),
+        EngineCmd::PushRemoteStreamOpus {
+            peer_id,
+            seq_num,
+            opus_data,
+        } => ctx.mixer.push_stream_opus(peer_id, seq_num, opus_data),
+        EngineCmd::SetPeerGain { peer_id, gain } => ctx.mixer.set_peer_gain(peer_id, gain),
+        EngineCmd::SetStreamGain(gain) => ctx.mixer.set_stream_gain(gain),
+        EngineCmd::ClearStreamAudio => ctx.mixer.clear_stream_audio(),
+        EngineCmd::SetShareStreamAudio(enabled) => {
+            if enabled && ctx.streams.is_some() {
+                *ctx.stream_loopback =
+                    build_loopback_stream(ctx.host, ctx.current_output_dev.as_deref());
+            } else {
+                drop(ctx.stream_loopback.take());
+            }
+        }
+        EngineCmd::RemovePeer { peer_id } => ctx.mixer.remove_peer(peer_id),
+        EngineCmd::ClearPeers => ctx.mixer.clear_peers(),
+        EngineCmd::SetAec(enabled) => ctx.aec.set_enabled(enabled),
+        EngineCmd::SetNsMode(mode) => ctx.suppressor.set_mode(mode),
+        EngineCmd::SetOpusBitrate(bitrate_bps) => {
+            if let Err(e) = ctx.encoder.set_bitrate(bitrate_bps) {
+                warn!("Opus set_bitrate error: {e}");
+            }
+        }
+        EngineCmd::SetJitterProfile(profile) => ctx.mixer.set_jitter_profile(profile),
+        EngineCmd::ClearLoopback => ctx.mixer.clear_loopback(),
+        EngineCmd::SetAudioDevices {
+            input_device_name,
+            output_device_name,
+        } => {
+            *ctx.current_input_dev = input_device_name.clone();
+            *ctx.current_output_dev = output_device_name.clone();
+            *ctx.silent_capture_ticks = 0;
+            *ctx.silent_out_frames = 0;
+            *ctx.last_hotplug_attempt = Instant::now();
+            if ctx.streams.is_some() {
+                drop(ctx.streams.take());
+                *ctx.streams = Some(build_audio_streams(
+                    ctx.host,
+                    input_device_name.as_deref(),
+                    output_device_name.as_deref(),
+                ));
+                if ctx.atomics.stream_audio_sharing.load(Ordering::Relaxed) {
+                    drop(ctx.stream_loopback.take());
+                    *ctx.stream_loopback =
+                        build_loopback_stream(ctx.host, ctx.current_output_dev.as_deref());
+                }
+            }
+        }
+        EngineCmd::SetStreamsActive(active) => {
+            if !active {
+                drop(ctx.stream_loopback.take());
+            }
+        }
+        EngineCmd::PlayCue(cue) => ctx.mixer.trigger_cue(cue),
+        EngineCmd::Shutdown => return false,
+    }
+    true
+}
+
 fn run_audio_worker(
     config: AudioEngineConfig,
     mut suppressor: NoiseSuppressor,
@@ -634,25 +778,21 @@ fn run_audio_worker(
     peer_stats: Arc<DashMap<PeerId, PeerAudioStats>>,
 ) {
     let host = cpal::default_host();
-    let mut streams = Some(build_audio_streams(
-        &host,
-        config.input_device_name.as_deref(),
-        config.output_device_name.as_deref(),
-    ));
+    let mut streams: Option<AudioStreams> = None;
     let mut current_input_dev = config.input_device_name.clone();
     let mut current_output_dev = config.output_device_name.clone();
     let mut silent_capture_ticks: u32 = 0;
+    let mut silent_out_frames: u8 = 0;
     let mut last_hotplug_attempt = Instant::now();
     let mut stream_loopback: Option<LoopbackStream> = None;
-    let mut stream_encoder =
-        OpusEncoder10ms::new(64_000).expect("Stream Opus encoder init");
+    let mut stream_encoder = OpusEncoder10ms::new(64_000).expect("Stream Opus encoder init");
     let mut stream_seq_num: u64 = 1;
     let mut stream_frame_48k = [0.0f32; FRAME_SAMPLES];
 
     let mut aec = EchoCanceller::new(config.aec_enabled);
     let mut encoder = OpusEncoder10ms::new(config.bitrate_bps).expect("Opus encoder init");
     let cue_bank = SoundCueBank::load_optional();
-    let mut mixer = AudioMixer::new(cue_bank);
+    let mut mixer = AudioMixer::new(cue_bank, config.jitter_profile);
 
     let mut raw_in_buf = [0.0f32; 960];
     let mut frame_48k = [0.0f32; FRAME_SAMPLES];
@@ -669,58 +809,82 @@ fn run_audio_worker(
     let tick_duration = Duration::from_millis(10);
 
     while atomics.running.load(Ordering::Relaxed) {
-        // 1. Дренируем управляющие команды без блокировки
-        while let Ok(cmd) = cmd_rx.try_recv() {
-            match cmd {
-                EngineCmd::PushRemoteOpus {
-                    peer_id,
-                    seq_num,
-                    opus_data,
-                } => mixer.push_peer_opus(peer_id, seq_num, opus_data),
-                EngineCmd::PushRemoteStreamOpus {
-                    peer_id,
-                    seq_num,
-                    opus_data,
-                } => mixer.push_stream_opus(peer_id, seq_num, opus_data),
-                EngineCmd::SetPeerGain { peer_id, gain } => mixer.set_peer_gain(peer_id, gain),
-                EngineCmd::SetStreamGain(gain) => mixer.set_stream_gain(gain),
-                EngineCmd::ClearStreamAudio => mixer.clear_stream_audio(),
-                EngineCmd::SetShareStreamAudio(enabled) => {
-                    if enabled {
-                        stream_loopback =
-                            build_loopback_stream(&host, current_output_dev.as_deref());
-                    } else {
-                        drop(stream_loopback.take());
+        if streams.is_none()
+            && !atomics.streams_active.load(Ordering::Relaxed)
+            && !mixer.has_active_cues()
+        {
+            match cmd_rx.recv() {
+                Ok(cmd) => {
+                    let mut ctx = WorkerAudioCtx {
+                        host: &host,
+                        atomics: &atomics,
+                        suppressor: &mut suppressor,
+                        aec: &mut aec,
+                        encoder: &mut encoder,
+                        mixer: &mut mixer,
+                        streams: &mut streams,
+                        stream_loopback: &mut stream_loopback,
+                        current_input_dev: &mut current_input_dev,
+                        current_output_dev: &mut current_output_dev,
+                        silent_capture_ticks: &mut silent_capture_ticks,
+                        silent_out_frames: &mut silent_out_frames,
+                        last_hotplug_attempt: &mut last_hotplug_attempt,
+                    };
+                    if !handle_engine_cmd(cmd, &mut ctx) {
+                        return;
                     }
                 }
-                EngineCmd::RemovePeer { peer_id } => mixer.remove_peer(peer_id),
-                EngineCmd::ClearPeers => mixer.clear_peers(),
-                EngineCmd::SetAec(enabled) => aec.set_enabled(enabled),
-                EngineCmd::SetNsMode(mode) => suppressor.set_mode(mode),
-                EngineCmd::SetAudioDevices {
-                    input_device_name,
-                    output_device_name,
-                } => {
-                    current_input_dev = input_device_name.clone();
-                    current_output_dev = output_device_name.clone();
-                    silent_capture_ticks = 0;
-                    last_hotplug_attempt = Instant::now();
-                    // Drop existing streams first so OS backends can re-acquire the device cleanly.
-                    drop(streams.take());
-                    streams = Some(build_audio_streams(
-                        &host,
-                        input_device_name.as_deref(),
-                        output_device_name.as_deref(),
-                    ));
-                    if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
-                        drop(stream_loopback.take());
-                        stream_loopback =
-                            build_loopback_stream(&host, current_output_dev.as_deref());
-                    }
-                }
-                EngineCmd::PlayCue(cue) => mixer.trigger_cue(cue),
-                EngineCmd::Shutdown => return,
+                Err(_) => return,
             }
+        }
+
+        while let Ok(cmd) = cmd_rx.try_recv() {
+            let mut ctx = WorkerAudioCtx {
+                host: &host,
+                atomics: &atomics,
+                suppressor: &mut suppressor,
+                aec: &mut aec,
+                encoder: &mut encoder,
+                mixer: &mut mixer,
+                streams: &mut streams,
+                stream_loopback: &mut stream_loopback,
+                current_input_dev: &mut current_input_dev,
+                current_output_dev: &mut current_output_dev,
+                silent_capture_ticks: &mut silent_capture_ticks,
+                silent_out_frames: &mut silent_out_frames,
+                last_hotplug_attempt: &mut last_hotplug_attempt,
+            };
+            if !handle_engine_cmd(cmd, &mut ctx) {
+                return;
+            }
+        }
+
+        let should_run = atomics.streams_active.load(Ordering::Relaxed) || mixer.has_active_cues();
+        if !should_run {
+            if streams.is_some() {
+                drop(stream_loopback.take());
+                drop(streams.take());
+                atomics.local_speaking.store(false, Ordering::Relaxed);
+                atomics
+                    .mic_level_db_bits
+                    .store((-60.0f32).to_bits(), Ordering::Relaxed);
+            }
+            continue;
+        }
+
+        if streams.is_none() {
+            silent_capture_ticks = 0;
+            silent_out_frames = 0;
+            last_hotplug_attempt = Instant::now();
+            streams = Some(build_audio_streams(
+                &host,
+                current_input_dev.as_deref(),
+                current_output_dev.as_deref(),
+            ));
+            if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
+                stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
+            }
+            next_tick = Instant::now();
         }
 
         let Some(active) = streams.as_mut() else {
@@ -770,26 +934,32 @@ fn run_audio_worker(
             }
         }
 
-        // 2. Сводим выходной 10-мс кадр всех участников комнаты и пушим референс в AEC3
         let deafened = atomics.deafened.load(Ordering::Relaxed);
-        mixer.mix_frame(deafened, &mut mixed_48k);
-        aec.feed_render_frame(&mixed_48k);
+        let has_audio = mixer.mix_frame(deafened, &mut mixed_48k);
+        if has_audio || silent_out_frames < 4 {
+            if has_audio {
+                silent_out_frames = 0;
+            } else {
+                silent_out_frames = silent_out_frames.saturating_add(1);
+            }
+            aec.feed_render_frame(&mixed_48k);
 
-        active
-            .play_resampler
-            .process_frame(&mixed_48k, &mut resampled_out);
-        if active.play_prod.occupied_len() == 0 && !resampled_out.is_empty() {
-            underrun_cushion.clear();
-            underrun_cushion.resize(resampled_out.len() * 2, 0.0);
-            let _ = active.play_prod.push_slice(&underrun_cushion);
-        }
-        if active.play_prod.occupied_len() <= resampled_out.len() * 8 {
-            let _ = active.play_prod.push_slice(&resampled_out);
-        } else {
-            let frame_energy: f32 =
-                mixed_48k.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32);
-            if frame_energy > 1e-6 {
+            active
+                .play_resampler
+                .process_frame(&mixed_48k, &mut resampled_out);
+            if active.play_prod.occupied_len() == 0 && !resampled_out.is_empty() {
+                underrun_cushion.clear();
+                underrun_cushion.resize(resampled_out.len() * 2, 0.0);
+                let _ = active.play_prod.push_slice(&underrun_cushion);
+            }
+            if active.play_prod.occupied_len() <= resampled_out.len() * 8 {
                 let _ = active.play_prod.push_slice(&resampled_out);
+            } else {
+                let frame_energy: f32 =
+                    mixed_48k.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32);
+                if frame_energy > 1e-6 {
+                    let _ = active.play_prod.push_slice(&resampled_out);
+                }
             }
         }
 
@@ -803,90 +973,34 @@ fn run_audio_worker(
             );
         }
 
-        // 3. Забираем сырые сэмплы с микрофона и прогоняем через Capture DSP-тракт
-        let mut got_capture_samples = false;
-        while active.cap_cons.occupied_len() > 0 {
-            let n = active.cap_cons.pop_slice(&mut raw_in_buf);
-            if n > 0 {
-                got_capture_samples = true;
-            }
-            active.cap_resampler.push_samples(&raw_in_buf[..n]);
-        }
-        if got_capture_samples {
-            silent_capture_ticks = 0;
-        } else {
-            silent_capture_ticks = silent_capture_ticks.saturating_add(1);
-        }
+        let muted = atomics.mic_muted.load(Ordering::Relaxed);
+        let hotkey_held = atomics.hotkey_active.load(Ordering::Relaxed);
+        let mode = MicActivationMode::from_u8(atomics.activation_mode.load(Ordering::Relaxed));
+        let monitoring = atomics.monitoring_in_settings.load(Ordering::Relaxed)
+            || atomics.mic_loopback.load(Ordering::Relaxed);
+        let gate_open = !muted
+            && !deafened
+            && match mode {
+                MicActivationMode::ToggleMute => true,
+                MicActivationMode::PushToTalk => hotkey_held,
+                MicActivationMode::PushToMute => !hotkey_held,
+            };
 
-        while active.cap_resampler.pop_frame(&mut frame_48k) {
-            let gain = f32::from_bits(atomics.input_gain_bits.load(Ordering::Relaxed));
-            if (gain - 1.0).abs() > 0.001 {
-                for s in &mut frame_48k {
-                    *s = (*s * gain).clamp(-1.0, 1.0);
+        let mut got_capture_samples = false;
+        if !gate_open && !monitoring {
+            while active.cap_cons.occupied_len() > 0 {
+                let n = active.cap_cons.pop_slice(&mut raw_in_buf);
+                if n > 0 {
+                    got_capture_samples = true;
                 }
             }
-
-            // Строгий порядок: сначала AEC3, затем шумоподавление (RNNoise / DeepFilterNet3)
-            aec.process_capture_frame(&mut frame_48k);
-            suppressor.process_frame(&mut frame_48k);
-
-            // Вычисляем уровень сигнала микрофона в dBFS со сглаживанием для UI и Voice Gate
-            let rms =
-                (frame_48k.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
-            let raw_db = (20.0 * rms.max(1e-5).log10()).clamp(-60.0, 0.0);
-            if raw_db > smoothed_db {
-                smoothed_db = raw_db;
-            } else {
-                smoothed_db = smoothed_db * 0.82 + raw_db * 0.18;
-            }
+            voice_hold_frames = 0;
+            smoothed_db = -60.0;
             atomics
                 .mic_level_db_bits
-                .store(smoothed_db.to_bits(), Ordering::Relaxed);
-
-            // Проверяем гейт микрофона (ToggleMute / PushToTalk / PushToMute) + Voice Sensitivity с удержанием
-            let muted = atomics.mic_muted.load(Ordering::Relaxed);
-            let hotkey_held = atomics.hotkey_active.load(Ordering::Relaxed);
-            let mode = MicActivationMode::from_u8(atomics.activation_mode.load(Ordering::Relaxed));
-
-            let gate_open = !muted
-                && !deafened
-                && match mode {
-                    MicActivationMode::ToggleMute => true,
-                    MicActivationMode::PushToTalk => hotkey_held,
-                    MicActivationMode::PushToMute => !hotkey_held,
-                };
-
-            let vad_threshold_db =
-                f32::from_bits(atomics.vad_threshold_db_bits.load(Ordering::Relaxed));
-            if !muted && !deafened {
-                if raw_db >= vad_threshold_db || smoothed_db >= vad_threshold_db {
-                    voice_hold_frames = 25;
-                } else {
-                    voice_hold_frames = voice_hold_frames.saturating_sub(1);
-                }
-            } else {
-                voice_hold_frames = 0;
-            }
-
-            let is_speaking_now = gate_open && voice_hold_frames > 0;
-            atomics
-                .local_speaking
-                .store(is_speaking_now, Ordering::Relaxed);
-
-            if is_speaking_now {
-                match encoder.encode_speech_frame(&frame_48k) {
-                    Ok(opus_vec) => {
-                        let current_seq = seq_num;
-                        seq_num = seq_num.wrapping_add(1);
-                        let _ = outbound_tx.try_send(OutboundAudioFrame::Opus {
-                            seq_num: current_seq,
-                            opus_bytes: Bytes::from(opus_vec),
-                        });
-                        last_dtx_keepalive = Instant::now();
-                    }
-                    Err(e) => warn!("Opus encode error: {e}"),
-                }
-            } else if last_dtx_keepalive.elapsed() >= Duration::from_millis(500) {
+                .store((-60.0f32).to_bits(), Ordering::Relaxed);
+            atomics.local_speaking.store(false, Ordering::Relaxed);
+            if mixer.has_peers() && last_dtx_keepalive.elapsed() >= Duration::from_millis(500) {
                 let current_dtx_seq = dtx_seq_num;
                 dtx_seq_num = dtx_seq_num.wrapping_add(1);
                 let _ = outbound_tx.try_send(OutboundAudioFrame::DtxKeepalive {
@@ -894,6 +1008,96 @@ fn run_audio_worker(
                 });
                 last_dtx_keepalive = Instant::now();
             }
+        } else {
+            while active.cap_cons.occupied_len() > 0 {
+                let n = active.cap_cons.pop_slice(&mut raw_in_buf);
+                if n > 0 {
+                    got_capture_samples = true;
+                }
+                active.cap_resampler.push_samples(&raw_in_buf[..n]);
+            }
+
+            while active.cap_resampler.pop_frame(&mut frame_48k) {
+                let gain = f32::from_bits(atomics.input_gain_bits.load(Ordering::Relaxed));
+                if (gain - 1.0).abs() > 0.001 {
+                    for s in &mut frame_48k {
+                        *s = (*s * gain).clamp(-1.0, 1.0);
+                    }
+                }
+
+                let peak = frame_48k.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
+                if peak > 1e-6 || aec.is_enabled() {
+                    aec.process_capture_frame(&mut frame_48k);
+                    suppressor.process_frame(&mut frame_48k);
+                }
+
+                let rms =
+                    (frame_48k.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
+                let raw_db = (20.0 * rms.max(1e-5).log10()).clamp(-60.0, 0.0);
+                if raw_db > smoothed_db {
+                    smoothed_db = raw_db;
+                } else {
+                    smoothed_db = smoothed_db * 0.82 + raw_db * 0.18;
+                }
+                atomics
+                    .mic_level_db_bits
+                    .store(smoothed_db.to_bits(), Ordering::Relaxed);
+
+                let vad_threshold_db =
+                    f32::from_bits(atomics.vad_threshold_db_bits.load(Ordering::Relaxed));
+                if !muted && !deafened {
+                    if raw_db >= vad_threshold_db || smoothed_db >= vad_threshold_db {
+                        voice_hold_frames = 25;
+                    } else {
+                        voice_hold_frames = voice_hold_frames.saturating_sub(1);
+                    }
+                } else {
+                    voice_hold_frames = 0;
+                }
+
+                if atomics.mic_loopback.load(Ordering::Relaxed)
+                    && !muted
+                    && !deafened
+                    && voice_hold_frames > 0
+                {
+                    mixer.push_loopback_frame(&frame_48k);
+                }
+
+                let is_speaking_now = gate_open && voice_hold_frames > 0;
+                atomics
+                    .local_speaking
+                    .store(is_speaking_now, Ordering::Relaxed);
+
+                if is_speaking_now {
+                    match encoder.encode_speech_frame(&frame_48k) {
+                        Ok(opus_vec) => {
+                            let current_seq = seq_num;
+                            seq_num = seq_num.wrapping_add(1);
+                            let _ = outbound_tx.try_send(OutboundAudioFrame::Opus {
+                                seq_num: current_seq,
+                                opus_bytes: Bytes::from(opus_vec),
+                            });
+                            last_dtx_keepalive = Instant::now();
+                        }
+                        Err(e) => warn!("Opus encode error: {e}"),
+                    }
+                } else if mixer.has_peers()
+                    && last_dtx_keepalive.elapsed() >= Duration::from_millis(500)
+                {
+                    let current_dtx_seq = dtx_seq_num;
+                    dtx_seq_num = dtx_seq_num.wrapping_add(1);
+                    let _ = outbound_tx.try_send(OutboundAudioFrame::DtxKeepalive {
+                        seq_num: current_dtx_seq,
+                    });
+                    last_dtx_keepalive = Instant::now();
+                }
+            }
+        }
+
+        if got_capture_samples {
+            silent_capture_ticks = 0;
+        } else {
+            silent_capture_ticks = silent_capture_ticks.saturating_add(1);
         }
 
         if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
@@ -903,11 +1107,10 @@ fn run_audio_worker(
                     lb.resampler.push_samples(&raw_in_buf[..n]);
                 }
                 while lb.resampler.pop_frame(&mut stream_frame_48k) {
-                    let peak = stream_frame_48k
-                        .iter()
-                        .fold(0.0f32, |m, &x| m.max(x.abs()));
+                    let peak = stream_frame_48k.iter().fold(0.0f32, |m, &x| m.max(x.abs()));
                     if peak > 1e-5 {
-                        if let Ok(opus_vec) = stream_encoder.encode_speech_frame(&stream_frame_48k) {
+                        if let Ok(opus_vec) = stream_encoder.encode_speech_frame(&stream_frame_48k)
+                        {
                             let cur_seq = stream_seq_num;
                             stream_seq_num = stream_seq_num.wrapping_add(1);
                             let _ = outbound_tx.try_send(OutboundAudioFrame::StreamOpus {
@@ -980,7 +1183,7 @@ mod tests {
         let mut suppressor = NoiseSuppressor::new(NoiseSuppressionMode::Rnnoise);
         let mut encoder = OpusEncoder10ms::new(40_000).unwrap();
         let cue_bank = SoundCueBank::load_optional();
-        let mut mixer = AudioMixer::new(cue_bank);
+        let mut mixer = AudioMixer::new(cue_bank, JitterProfile::Balanced);
 
         // 1. Генерируем 200 мс чистой синусоиды 440 Гц на 44.1 кГц
         let total_in = 44_100 / 5;
@@ -1020,8 +1223,8 @@ mod tests {
             mixer.push_peer_opus(1, (idx + 1) as u64, pkt);
             if idx >= 1 {
                 mixer.mix_frame(false, &mut out_mixed);
-                let rms = (out_mixed.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32))
-                    .sqrt();
+                let rms =
+                    (out_mixed.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
                 if rms > 0.01 {
                     active_energy_frames += 1;
                 }

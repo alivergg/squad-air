@@ -10,7 +10,7 @@ pub struct EchoCanceller {
 
 impl EchoCanceller {
     pub fn new(enabled: bool) -> Self {
-        let inner = Self::build_aec3();
+        let inner = if enabled { Self::build_aec3() } else { None };
         Self {
             enabled,
             inner,
@@ -28,8 +28,12 @@ impl EchoCanceller {
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
-        if enabled && self.inner.is_none() {
-            self.inner = Self::build_aec3();
+        if enabled {
+            if self.inner.is_none() {
+                self.inner = Self::build_aec3();
+            }
+        } else {
+            self.inner = None;
         }
         self.enabled = enabled;
     }

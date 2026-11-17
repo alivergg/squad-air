@@ -15,7 +15,7 @@ pub use engine::{
     list_input_devices, list_output_devices, AudioEngineConfig, AudioEngineHandle,
     MicActivationMode, OutboundAudioFrame, PeerAudioStats,
 };
-pub use jitter::{JitterBuffer, JitterSnapshot};
+pub use jitter::{JitterBuffer, JitterProfile, JitterSnapshot};
 pub use mixer::AudioMixer;
 pub use resampler::{CaptureResampler, PlaybackResampler};
 

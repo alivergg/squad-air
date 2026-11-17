@@ -2,8 +2,8 @@ use crate::FRAME_SAMPLES;
 use nnnoiseless::DenoiseState;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
-use tract_onnx::prelude::*;
 use tracing::{info, warn};
+use tract_onnx::prelude::*;
 
 const PCM16_SCALE: f32 = 32768.0;
 const INV_PCM16_SCALE: f32 = 1.0 / 32768.0;
@@ -68,10 +68,7 @@ impl NoiseSuppressor {
                         return Some(plan);
                     }
                     Err(e) => {
-                        warn!(
-                            "Failed to initialize ONNX model at {}: {e}",
-                            path.display()
-                        );
+                        warn!("Failed to initialize ONNX model at {}: {e}", path.display());
                     }
                 }
             }
@@ -132,8 +129,9 @@ impl NoiseSuppressor {
     }
 
     fn run_df3_tract(plan: &TractRunnable, frame: &mut [f32; FRAME_SAMPLES]) -> TractResult<()> {
-        let input_tensor = tract_ndarray::Array2::from_shape_vec((1, FRAME_SAMPLES), frame.to_vec())?
-            .into_tensor();
+        let input_tensor =
+            tract_ndarray::Array2::from_shape_vec((1, FRAME_SAMPLES), frame.to_vec())?
+                .into_tensor();
         let mut outputs = plan.run(tvec!(input_tensor.into()))?;
         if let Some(first) = outputs.pop() {
             let view = first.to_array_view::<f32>()?;

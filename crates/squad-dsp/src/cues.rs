@@ -54,6 +54,17 @@ impl SoundCue {
             SoundCue::Unmute,
         ]
     }
+
+    pub fn embedded_wav_bytes(self) -> &'static [u8] {
+        match self {
+            SoundCue::Join => include_bytes!("../../../assets/sounds/join.wav"),
+            SoundCue::Leave => include_bytes!("../../../assets/sounds/leave.wav"),
+            SoundCue::PeerJoin => include_bytes!("../../../assets/sounds/peer_join.wav"),
+            SoundCue::PeerLeave => include_bytes!("../../../assets/sounds/peer_leave.wav"),
+            SoundCue::Mute => include_bytes!("../../../assets/sounds/mute.wav"),
+            SoundCue::Unmute => include_bytes!("../../../assets/sounds/unmute.wav"),
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -62,7 +73,8 @@ pub struct SoundCueBank {
 }
 
 impl SoundCueBank {
-    /// Scans `./assets/sounds/`, app bundle paths, and user config `squad-air/sounds/` for `.wav` / `.mp3` cues.
+    /// Scans `./assets/sounds/`, app bundle paths, and user config `squad-air/sounds/` for `.wav` / `.mp3` cues,
+    /// falling back to the embedded WAV cues when files are absent on disk.
     pub fn load_optional() -> Self {
         let mut dirs = vec![PathBuf::from("assets/sounds")];
         if let Ok(exe) = std::env::current_exe() {
@@ -76,7 +88,16 @@ impl SoundCueBank {
             cfg_dir.push("sounds");
             dirs.push(cfg_dir);
         }
-        Self::load_from_dirs(&dirs)
+        let mut bank = Self::load_from_dirs(&dirs);
+        for cue in SoundCue::all() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = bank.cues.entry(cue) {
+                if let Some(samples) = Self::decode_wav_bytes_to_48k_mono(cue.embedded_wav_bytes())
+                {
+                    entry.insert(Arc::new(samples));
+                }
+            }
+        }
+        bank
     }
 
     pub fn load_from_dirs(dirs: &[PathBuf]) -> Self {
@@ -130,8 +151,30 @@ impl SoundCueBank {
         resampled
     }
 
+    fn normalize_cue_samples(mut samples: Vec<f32>) -> Vec<f32> {
+        let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+        if peak > 0.01 && peak < 0.45 {
+            let gain = 0.60 / peak;
+            for s in &mut samples {
+                *s = (*s * gain).clamp(-1.0, 1.0);
+            }
+        }
+        samples
+    }
+
     fn decode_wav_to_48k_mono(path: &Path) -> Option<Vec<f32>> {
-        let mut reader = hound::WavReader::open(path).ok()?;
+        let reader = hound::WavReader::open(path).ok()?;
+        Self::decode_wav_reader_to_48k_mono(reader)
+    }
+
+    fn decode_wav_bytes_to_48k_mono(bytes: &[u8]) -> Option<Vec<f32>> {
+        let reader = hound::WavReader::new(std::io::Cursor::new(bytes)).ok()?;
+        Self::decode_wav_reader_to_48k_mono(reader)
+    }
+
+    fn decode_wav_reader_to_48k_mono<R: std::io::Read>(
+        mut reader: hound::WavReader<R>,
+    ) -> Option<Vec<f32>> {
         let spec = reader.spec();
         let channels = (spec.channels as usize).max(1);
 
@@ -157,7 +200,10 @@ impl SoundCueBank {
             mono.push(sum / (chunk.len() as f32));
         }
 
-        Some(Self::resample_to_48k(mono, spec.sample_rate))
+        Some(Self::normalize_cue_samples(Self::resample_to_48k(
+            mono,
+            spec.sample_rate,
+        )))
     }
 
     fn decode_symphonia_to_48k_mono(path: &Path) -> Option<Vec<f32>> {
@@ -205,8 +251,7 @@ impl SoundCueBank {
                     let spec = *decoded.spec();
                     src_rate = spec.rate;
                     let channels = spec.channels.count().max(1);
-                    let mut sample_buf =
-                        SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
+                    let mut sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, spec);
                     sample_buf.copy_interleaved_ref(decoded);
                     for chunk in sample_buf.samples().chunks(channels) {
                         let sum: f32 = chunk.iter().copied().sum();
@@ -221,7 +266,9 @@ impl SoundCueBank {
         if mono.is_empty() {
             None
         } else {
-            Some(Self::resample_to_48k(mono, src_rate))
+            Some(Self::normalize_cue_samples(Self::resample_to_48k(
+                mono, src_rate,
+            )))
         }
     }
 }
@@ -243,11 +290,20 @@ mod tests {
     }
 
     #[test]
+    fn embedded_wav_cues_fallback_works_for_all_events() {
+        let bank = SoundCueBank::load_optional();
+        for cue in SoundCue::all() {
+            let samples = bank
+                .get(cue)
+                .unwrap_or_else(|| panic!("missing embedded cue {:?}", cue));
+            assert!(!samples.is_empty(), "empty embedded cue {:?}", cue);
+        }
+    }
+
+    #[test]
     fn symphonia_decodes_and_resamples_stereo_wav_and_skips_corrupt_mp3() {
-        let tmp_dir = std::env::temp_dir().join(format!(
-            "squad_dsp_cues_test_{}",
-            std::process::id()
-        ));
+        let tmp_dir =
+            std::env::temp_dir().join(format!("squad_dsp_cues_test_{}", std::process::id()));
         std::fs::create_dir_all(&tmp_dir).unwrap();
         let wav_path = tmp_dir.join("join.wav");
         let bad_mp3_path = tmp_dir.join("leave.mp3");

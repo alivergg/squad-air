@@ -120,11 +120,9 @@ impl PlaybackResampler {
         out.clear();
         if let Some(resampler) = self.resampler.as_mut() {
             self.input_scratch[0].copy_from_slice(frame_48k);
-            if let Ok((_, out_len)) = resampler.process_into_buffer(
-                &self.input_scratch,
-                &mut self.output_scratch,
-                None,
-            ) {
+            if let Ok((_, out_len)) =
+                resampler.process_into_buffer(&self.input_scratch, &mut self.output_scratch, None)
+            {
                 out.extend_from_slice(&self.output_scratch[0][..out_len]);
                 return;
             }
