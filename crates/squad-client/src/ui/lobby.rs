@@ -2,8 +2,8 @@ use crate::ui::{
     components::avatar_circle,
     theme::{
         canvas_panel_style, channel_nav_button, m3_text_input_style, pill_danger_button,
-        pill_primary_button, pill_tonal_button, sidebar_panel_style, surface_card_style,
-        M3_ERROR, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+        pill_primary_button, pill_tonal_button, sidebar_panel_style, surface_card_style, M3_ERROR,
+        M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
     },
     Message, SquadApp,
 };
@@ -28,14 +28,25 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         for ch in &app.config.saved_channels {
             let uri_join = ch.invite_uri.clone();
             let uri_del = ch.invite_uri.clone();
+            let room_id: squad_proto::RoomId = squad_proto::InviteLink::parse(&ch.invite_uri)
+                .map(|inv| inv.room_id)
+                .unwrap_or_else(|_| {
+                    let h = blake3::hash(ch.invite_uri.as_bytes());
+                    let mut id = [0u8; 16];
+                    id.copy_from_slice(&h.as_bytes()[..16]);
+                    id
+                });
             let row_item = row![
                 button(
-                    text(format!("# {}", ch.name))
-                        .size(13)
-                        .wrapping(text::Wrapping::None)
+                    row![
+                        avatar_circle(app.avatars.room_handle_for(&room_id), 26.0, false),
+                        text(&ch.name).size(13).wrapping(text::Wrapping::None),
+                    ]
+                    .spacing(8)
+                    .align_y(Vertical::Center),
                 )
                 .width(Length::Fill)
-                .padding([8, 10])
+                .padding([7, 10])
                 .style(channel_nav_button(false))
                 .on_press(Message::JoinSavedChannel(uri_join)),
                 button(text("×").size(13))
@@ -51,7 +62,11 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
 
     let user_footer = container(
         row![
-            avatar_circle(app.avatars.handle_for(&app.config.client_uuid()), 42.0, false),
+            avatar_circle(
+                app.avatars.handle_for(&app.config.client_uuid()),
+                42.0,
+                false
+            ),
             column![
                 text(&app.config.nickname).size(13),
                 text("Online").size(11).color(M3_SUCCESS),
@@ -79,9 +94,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                     .color(M3_ON_SURFACE_VARIANT),
             ]
             .spacing(2),
-            text("SAVED ROOMS")
-                .size(11)
-                .color(M3_ON_SURFACE_VARIANT),
+            text("SAVED ROOMS").size(11).color(M3_ON_SURFACE_VARIANT),
             scrollable(channel_list).height(Length::Fill),
             user_footer,
         ]
@@ -97,11 +110,9 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     let create_card = container(
         column![
             text("Start a Private Room").size(18),
-            text(
-                "Create a private voice & chat room and invite friends with one link."
-            )
-            .size(13)
-            .color(M3_ON_SURFACE_VARIANT),
+            text("Create a private voice & chat room and invite friends with one link.")
+                .size(13)
+                .color(M3_ON_SURFACE_VARIANT),
             vertical_space().height(4),
             button(
                 text("Create Room & Copy Invite")

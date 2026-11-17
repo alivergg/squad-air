@@ -192,7 +192,11 @@ pub fn view_stream_fullscreen(app: &SquadApp) -> Element<'_, Message> {
     }
 
     let (pill_label, has_audio, close_msg) = if is_preview {
-        ("PREVIEW".to_string(), false, Message::ToggleLocalStreamPreview)
+        (
+            "PREVIEW".to_string(),
+            false,
+            Message::ToggleLocalStreamPreview,
+        )
     } else {
         let watched_id = app.watched_peer_id.unwrap();
         let watched_peer = app.peers.iter().find(|p| p.peer_id == watched_id);
@@ -240,11 +244,9 @@ pub fn view_stream_fullscreen(app: &SquadApp) -> Element<'_, Message> {
         .into()
     };
 
-    let mut controls_row = row![
-        container(text(pill_label).size(11).color(M3_ON_PRIMARY))
-            .padding([5, 10])
-            .style(live_pill_style),
-    ]
+    let mut controls_row = row![container(text(pill_label).size(11).color(M3_ON_PRIMARY))
+        .padding([5, 10])
+        .style(live_pill_style),]
     .spacing(8)
     .align_y(Vertical::Center);
 
@@ -266,17 +268,18 @@ pub fn view_stream_fullscreen(app: &SquadApp) -> Element<'_, Message> {
                 .on_press(close_msg),
         );
 
-    let floating_controls = container(controls_row)
-        .padding(10)
-        .style(|_t: &Theme| container::Style {
-            background: Some(Background::Color(Color::from_rgba(0.08, 0.09, 0.12, 0.72))),
-            border: Border {
-                color: M3_OUTLINE_VARIANT,
-                width: 1.0,
-                radius: 12.0.into(),
-            },
-            ..Default::default()
-        });
+    let floating_controls =
+        container(controls_row)
+            .padding(10)
+            .style(|_t: &Theme| container::Style {
+                background: Some(Background::Color(Color::from_rgba(0.08, 0.09, 0.12, 0.72))),
+                border: Border {
+                    color: M3_OUTLINE_VARIANT,
+                    width: 1.0,
+                    radius: 12.0.into(),
+                },
+                ..Default::default()
+            });
 
     let top_right = container(floating_controls)
         .width(Length::Fill)

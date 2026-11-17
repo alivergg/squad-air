@@ -371,7 +371,10 @@ mod tests {
 
         assert_eq!(rgba_a1.len(), (AVATAR_SIZE * AVATAR_SIZE * 4) as usize);
         assert_eq!(rgba_a1, rgba_a2, "Identicon must be deterministic");
-        assert_ne!(rgba_a1, rgba_b, "Distinct UUIDs must produce distinct identicons");
+        assert_ne!(
+            rgba_a1, rgba_b,
+            "Distinct UUIDs must produce distinct identicons"
+        );
 
         // Corner pixels must be completely transparent outside circular mask.
         assert_eq!(rgba_a1[3], 0);
@@ -394,12 +397,7 @@ mod tests {
     fn test_process_custom_avatar_image_crop_resize_and_blake3() {
         let mut src = ImageBuffer::<Rgba<u8>, Vec<u8>>::new(240, 120);
         for (x, y, px) in src.enumerate_pixels_mut() {
-            *px = Rgba([
-                ((x * 2) % 256) as u8,
-                ((y * 2) % 256) as u8,
-                0xC8,
-                255,
-            ]);
+            *px = Rgba([((x * 2) % 256) as u8, ((y * 2) % 256) as u8, 0xC8, 255]);
         }
         let mut png_bytes = Vec::new();
         image::DynamicImage::ImageRgba8(src)

@@ -1,7 +1,5 @@
 use squad_dsp::{OpusDecoder10ms, OpusEncoder10ms, FRAME_SAMPLES};
-use squad_proto::{
-    InviteLink, P2pHeader, P2pMsgType, P2pPayload, RoomCipher, SignalingPacket,
-};
+use squad_proto::{InviteLink, P2pHeader, P2pMsgType, P2pPayload, RoomCipher, SignalingPacket};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 
@@ -40,7 +38,9 @@ async fn test_e2e_encrypted_hole_punch_and_opus_audio() {
         timestamp_us: 123_456,
     };
     let mut wire = Vec::new();
-    cipher_a.seal_packet(&syn_hdr, &syn_body, &mut wire).unwrap();
+    cipher_a
+        .seal_packet(&syn_hdr, &syn_body, &mut wire)
+        .unwrap();
     sock_a.send_to(&wire, addr_b).await.unwrap();
 
     let mut rx_buf = [0u8; 1500];
@@ -78,7 +78,9 @@ async fn test_e2e_encrypted_hole_punch_and_opus_audio() {
         sender_peer_id: 2,
         seq_num: 10,
     };
-    let audio_body = P2pPayload::AudioOpus { opus_data: opus_bytes };
+    let audio_body = P2pPayload::AudioOpus {
+        opus_data: opus_bytes,
+    };
 
     cipher_b
         .seal_packet(&audio_hdr, &audio_body, &mut wire)
@@ -96,7 +98,10 @@ async fn test_e2e_encrypted_hole_punch_and_opus_audio() {
             let mut pcm_out = [0.0f32; FRAME_SAMPLES];
             decoder.decode_frame(&opus_data, &mut pcm_out).unwrap();
             let rms = (pcm_out.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
-            assert!(rms > 0.05, "Decoded Opus audio frame should have audible RMS energy");
+            assert!(
+                rms > 0.05,
+                "Decoded Opus audio frame should have audible RMS energy"
+            );
         }
         other => panic!("Expected AudioOpus payload, got {other:?}"),
     }
@@ -188,7 +193,10 @@ async fn test_e2e_video_1080p_encode_fragment_cipher_reassemble_decode() {
     assert!(encoded.is_keyframe);
 
     let frags = fragment_frame(1, encoded.is_keyframe, &encoded.annex_b);
-    assert!(frags.len() >= 2, "must contain at least 1 data + 1 FEC parity");
+    assert!(
+        frags.len() >= 2,
+        "must contain at least 1 data + 1 FEC parity"
+    );
 
     let mut wire = Vec::new();
     let mut sent = 0usize;
@@ -247,7 +255,9 @@ async fn test_e2e_video_1080p_encode_fragment_cipher_reassemble_decode() {
     assert_eq!(recovered.annex_b_bytes, encoded.annex_b);
 
     let mut dec = H264Decoder::new();
-    let rgba = dec.decode(&recovered.annex_b_bytes).expect("1080p keyframe must decode");
+    let rgba = dec
+        .decode(&recovered.annex_b_bytes)
+        .expect("1080p keyframe must decode");
     assert_eq!(rgba.width, 1920);
     assert_eq!(rgba.height, 1080);
     assert_eq!(rgba.rgba.len(), 1920 * 1080 * 4);
@@ -325,9 +335,7 @@ async fn test_e2e_persistent_chat_identity_and_avatar_announce_loopback() {
 
 #[tokio::test]
 async fn test_e2e_video_idr_gating_and_neutral_gray_accuracy() {
-    use squad_video::{
-        fragment_frame, FrameReassembler, H264Decoder, H264Encoder, RawRgbaFrame,
-    };
+    use squad_video::{fragment_frame, FrameReassembler, H264Decoder, H264Encoder, RawRgbaFrame};
 
     let invite = InviteLink::generate();
     let cipher_a = RoomCipher::from_secret(&invite.secret);
@@ -399,7 +407,10 @@ async fn test_e2e_video_idr_gating_and_neutral_gray_accuracy() {
             }
         }
     }
-    assert!(requested_pli, "FrameReassembler must request PLI on dropped P-frame");
+    assert!(
+        requested_pli,
+        "FrameReassembler must request PLI on dropped P-frame"
+    );
 
     // Now encode a fresh IDR keyframe and drop one shard to also verify XOR-FEC recovery.
     enc.force_keyframe();
@@ -455,10 +466,18 @@ async fn test_e2e_video_idr_gating_and_neutral_gray_accuracy() {
     let frame_ok = recovered.expect("IDR frame must unlock reassembler");
     assert!(frame_ok.is_keyframe);
     let mut dec = H264Decoder::new();
-    let decoded = dec.decode(&frame_ok.annex_b_bytes).expect("IDR must decode");
+    let decoded = dec
+        .decode(&frame_ok.annex_b_bytes)
+        .expect("IDR must decode");
     for px in decoded.rgba.as_chunks::<4>().0 {
-        assert_eq!(px[0], px[1], "Neutral gray must have R == G (no purple tint)");
-        assert_eq!(px[1], px[2], "Neutral gray must have G == B (no purple tint)");
+        assert_eq!(
+            px[0], px[1],
+            "Neutral gray must have R == G (no purple tint)"
+        );
+        assert_eq!(
+            px[1], px[2],
+            "Neutral gray must have G == B (no purple tint)"
+        );
         assert!(
             px[0].abs_diff(128) <= 2,
             "Neutral gray luminance must remain near 128, got {}",
@@ -503,7 +522,9 @@ async fn test_e2e_h265_decoder_error_triggers_auto_h264_fallback_and_full_1080p(
         seq_num: seq,
     };
     seq += 1;
-    cipher_a.seal_packet(&hdr_ann, &announce, &mut wire).unwrap();
+    cipher_a
+        .seal_packet(&hdr_ann, &announce, &mut wire)
+        .unwrap();
     sock_a.send_to(&wire, addr_b).await.unwrap();
 
     let mut rx_buf = [0u8; 1500];
@@ -524,7 +545,9 @@ async fn test_e2e_h265_decoder_error_triggers_auto_h264_fallback_and_full_1080p(
         seq_num: seq,
     };
     seq += 1;
-    cipher_a.seal_packet(&hdr_aud, &audio_pkt, &mut wire).unwrap();
+    cipher_a
+        .seal_packet(&hdr_aud, &audio_pkt, &mut wire)
+        .unwrap();
     sock_a.send_to(&wire, addr_b).await.unwrap();
     let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_buf))
         .await
@@ -605,7 +628,9 @@ async fn test_e2e_h265_decoder_error_triggers_auto_h264_fallback_and_full_1080p(
         failed_codec: VideoCodec::H265.as_u8(),
         reason,
     };
-    cipher_b.seal_packet(&err_hdr, &err_payload, &mut wire).unwrap();
+    cipher_b
+        .seal_packet(&err_hdr, &err_payload, &mut wire)
+        .unwrap();
     sock_b.send_to(&wire, addr_a).await.unwrap();
 
     let (len, _) = tokio::time::timeout(Duration::from_secs(1), sock_a.recv_from(&mut rx_buf))
@@ -615,7 +640,10 @@ async fn test_e2e_h265_decoder_error_triggers_auto_h264_fallback_and_full_1080p(
     let (_, recv_err) = cipher_a.open_packet(&mut rx_buf[..len]).unwrap();
     assert!(matches!(
         recv_err,
-        P2pPayload::StreamDecoderError { failed_codec: 1, .. }
+        P2pPayload::StreamDecoderError {
+            failed_codec: 1,
+            ..
+        }
     ));
 
     enc.set_codec(VideoCodec::H264);

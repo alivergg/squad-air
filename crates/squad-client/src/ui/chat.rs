@@ -3,9 +3,8 @@ use crate::ui::{
     components::avatar_circle,
     theme::{
         attachment_card_style, canvas_panel_style, chat_bubble_style, m3_text_input_style,
-        pill_danger_button, pill_primary_button, pill_success_button, pill_tonal_button,
-        M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
-        M3_SURFACE_HIGHEST,
+        pill_danger_button, pill_primary_button, pill_success_button, pill_tonal_button, M3_ERROR,
+        M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_SURFACE_HIGHEST,
     },
     Message, SquadApp,
 };
@@ -206,12 +205,10 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
                         .spacing(6)
                         .into()
                     }
-                    BlobTransferState::Failed(err) => {
-                        text(format!("Image transfer failed: {err}"))
-                            .size(12)
-                            .color(M3_ERROR)
-                            .into()
-                    }
+                    BlobTransferState::Failed(err) => text(format!("Image transfer failed: {err}"))
+                        .size(12)
+                        .color(M3_ERROR)
+                        .into(),
                     _ => text("Waiting for image chunks...")
                         .size(12)
                         .color(M3_ON_SURFACE_VARIANT)
@@ -262,7 +259,11 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
                     .into()
                 }
                 BlobTransferState::Completed { saved_path } => {
-                    let label = if item.is_self { "Shared" } else { "Open Folder" };
+                    let label = if item.is_self {
+                        "Shared"
+                    } else {
+                        "Open Folder"
+                    };
                     button(text(label).size(12))
                         .padding([7, 12])
                         .style(pill_success_button)
@@ -300,9 +301,7 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
         .into()
 }
 
-fn read_only_chat_key_binding(
-    kp: text_editor::KeyPress,
-) -> Option<text_editor::Binding<Message>> {
+fn read_only_chat_key_binding(kp: text_editor::KeyPress) -> Option<text_editor::Binding<Message>> {
     if kp.status != text_editor::Status::Focused {
         return None;
     }

@@ -1,4 +1,4 @@
-use crate::net::{PeerConnStatus, PeerUiSnapshot};
+use crate::net::{PeerConnStatus, PeerRouteKind, PeerUiSnapshot};
 use crate::ui::theme::{
     M3_ERROR, M3_ON_SURFACE_VARIANT, M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SUCCESS,
     M3_SURFACE_HIGHEST, M3_WARNING,
@@ -42,11 +42,26 @@ pub fn avatar_circle<'a, Message: 'a>(
 }
 
 pub fn telemetry_badge<'a, Message: 'a>(peer: &PeerUiSnapshot) -> Element<'a, Message> {
-    let (label, color) = match peer.status {
-        PeerConnStatus::Punching => ("Connecting...".to_string(), M3_WARNING),
-        PeerConnStatus::NatFailed => ("Offline".to_string(), M3_ERROR),
-        PeerConnStatus::Connected => {
-            let txt = format!("{} ms", peer.rtt_ms);
+    let (label, color) = match (peer.status, peer.route) {
+        (PeerConnStatus::Punching, _) | (_, PeerRouteKind::Connecting) => {
+            ("Connecting...".to_string(), M3_WARNING)
+        }
+        (PeerConnStatus::NatFailed, _) | (_, PeerRouteKind::NatFailed) => {
+            ("NAT Failed".to_string(), M3_ERROR)
+        }
+        (PeerConnStatus::Connected, route) => {
+            let prefix = match route {
+                PeerRouteKind::LanDirect => "LAN",
+                _ => "P2P",
+            };
+            let txt = if peer.loss_pct >= 0.5 {
+                format!(
+                    "{prefix} • {} ms • +{}ms buf • {:.1}%",
+                    peer.rtt_ms, peer.jitter_ms, peer.loss_pct
+                )
+            } else {
+                format!("{prefix} • {} ms • +{}ms buf", peer.rtt_ms, peer.jitter_ms)
+            };
             let col = if peer.rtt_ms < 60 && peer.loss_pct < 1.0 {
                 M3_SUCCESS
             } else if peer.rtt_ms < 120 && peer.loss_pct < 5.0 {
@@ -105,10 +120,7 @@ pub fn mic_level_meter<'a, Message: 'a>(db: f32, is_speaking: bool) -> Element<'
     .into()
 }
 
-pub fn mic_sensitivity_meter<'a, Message: 'a>(
-    db: f32,
-    threshold_db: f32,
-) -> Element<'a, Message> {
+pub fn mic_sensitivity_meter<'a, Message: 'a>(db: f32, threshold_db: f32) -> Element<'a, Message> {
     let gate_active = db >= threshold_db;
     let level_norm = ((db + 60.0) / 60.0).clamp(0.01, 0.99);
     let fill_portion = (level_norm * 1000.0).round() as u16;

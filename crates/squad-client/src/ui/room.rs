@@ -72,14 +72,21 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                 .padding([8, 10])
                 .size(12)
                 .style(m3_text_input_style),
-            button(text(if already_saved { "Saved ✓" } else { "Save Channel" }).size(12))
-                .padding([9, 14])
-                .style(if already_saved {
-                    pill_success_button
+            button(
+                text(if already_saved {
+                    "Saved ✓"
                 } else {
-                    pill_tonal_button
+                    "Save Channel"
                 })
-                .on_press(Message::SaveActiveChannel),
+                .size(12)
+            )
+            .padding([9, 14])
+            .style(if already_saved {
+                pill_success_button
+            } else {
+                pill_tonal_button
+            })
+            .on_press(Message::SaveActiveChannel),
             button(text(copy_label).size(12))
                 .padding([9, 14])
                 .style(pill_primary_button)
@@ -142,7 +149,10 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                 .on_press(Message::ToggleLocalStreamPreview),
         );
     }
-    self_row = self_row.push(mic_level_meter(app.audio.local_mic_level_db(), local_speaking));
+    self_row = self_row.push(mic_level_meter(
+        app.audio.local_mic_level_db(),
+        local_speaking,
+    ));
 
     let self_card: Element<'_, Message> = container(self_row)
         .width(Length::Fill)

@@ -40,12 +40,13 @@ echo "==> [2/4] Building Windows x86_64 release binary (v${VERSION})..."
 "$CARGO_BIN" build --release --target x86_64-pc-windows-gnu -p squad-client
 
 rm -rf "$STAGING_DIR"
-mkdir -p "$DIST_DIR" "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources" "$MAC_SCRIPTS"
+mkdir -p "$DIST_DIR" "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/assets/sounds" "$MAC_SCRIPTS"
 
 echo "==> [3/4] Packaging macOS installer (${MAC_PKG})..."
 cp "$ROOT_DIR/target/release/squad-client" "$APP_BUNDLE/Contents/MacOS/squad-client"
 chmod 755 "$APP_BUNDLE/Contents/MacOS/squad-client"
 cp "$ROOT_DIR/assets/icons/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+cp "$ROOT_DIR"/assets/sounds/*.wav "$APP_BUNDLE/Contents/Resources/assets/sounds/" 2>/dev/null || true
 
 cat > "$APP_BUNDLE/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

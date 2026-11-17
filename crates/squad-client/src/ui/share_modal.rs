@@ -132,10 +132,7 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
                 width,
                 height,
                 ..
-            } => (
-                title.clone(),
-                format!("{app_name} • {width}x{height}"),
-            ),
+            } => (title.clone(), format!("{app_name} • {width}x{height}")),
         };
 
         let item_btn = button(
@@ -193,25 +190,37 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
         });
 
     let resolution_row = row![
-        text("Resolution").size(12).color(M3_ON_SURFACE_VARIANT).width(Length::Fixed(80.0)),
+        text("Resolution")
+            .size(12)
+            .color(M3_ON_SURFACE_VARIANT)
+            .width(Length::Fixed(80.0)),
         button(text("720p").size(12))
             .padding([7, 12])
-            .style(pill_chip_button(app.share_resolution == StreamResolution::R720p))
+            .style(pill_chip_button(
+                app.share_resolution == StreamResolution::R720p
+            ))
             .on_press(Message::SetShareResolution(StreamResolution::R720p)),
         button(text("1080p").size(12))
             .padding([7, 12])
-            .style(pill_chip_button(app.share_resolution == StreamResolution::R1080p))
+            .style(pill_chip_button(
+                app.share_resolution == StreamResolution::R1080p
+            ))
             .on_press(Message::SetShareResolution(StreamResolution::R1080p)),
         button(text("Native").size(12))
             .padding([7, 12])
-            .style(pill_chip_button(app.share_resolution == StreamResolution::Native))
+            .style(pill_chip_button(
+                app.share_resolution == StreamResolution::Native
+            ))
             .on_press(Message::SetShareResolution(StreamResolution::Native)),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
 
     let fps_row = row![
-        text("Frame Rate").size(12).color(M3_ON_SURFACE_VARIANT).width(Length::Fixed(80.0)),
+        text("Frame Rate")
+            .size(12)
+            .color(M3_ON_SURFACE_VARIANT)
+            .width(Length::Fixed(80.0)),
         button(text("30 FPS").size(12))
             .padding([7, 12])
             .style(pill_chip_button(app.share_fps == StreamFps::Fps30))
@@ -239,7 +248,10 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
     .align_y(Vertical::Center);
 
     let codec_row = row![
-        text("Codec").size(12).color(M3_ON_SURFACE_VARIANT).width(Length::Fixed(80.0)),
+        text("Codec")
+            .size(12)
+            .color(M3_ON_SURFACE_VARIANT)
+            .width(Length::Fixed(80.0)),
         button(text("H.264 (Compatible)").size(12))
             .padding([7, 12])
             .style(pill_chip_button(app.share_codec == VideoCodec::H264))
@@ -258,7 +270,10 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
         "[ ] Share System Audio"
     };
     let audio_row = row![
-        text("Sound").size(12).color(M3_ON_SURFACE_VARIANT).width(Length::Fixed(80.0)),
+        text("Sound")
+            .size(12)
+            .color(M3_ON_SURFACE_VARIANT)
+            .width(Length::Fixed(80.0)),
         button(text(audio_label).size(12))
             .padding([7, 12])
             .style(pill_chip_button(app.share_audio))
@@ -286,8 +301,17 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
     .align_y(Vertical::Center);
 
     let card = container(
-        column![header, tabs, source_list, resolution_row, fps_row, codec_row, audio_row, footer]
-            .spacing(12),
+        column![
+            header,
+            tabs,
+            source_list,
+            resolution_row,
+            fps_row,
+            codec_row,
+            audio_row,
+            footer
+        ]
+        .spacing(12),
     )
     .width(Length::Fixed(620.0))
     .padding(22)

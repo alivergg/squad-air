@@ -2,11 +2,11 @@ use crate::hotkeys::{is_macos_accessibility_trusted, is_macos_input_monitoring_t
 use crate::ui::{
     components::{avatar_circle, mic_sensitivity_meter},
     theme::{
-        m3_menu_style, m3_pick_list_style, m3_slider_style, m3_text_input_style,
-        pill_chip_button, pill_primary_button, pill_tonal_button, surface_card_style,
+        m3_menu_style, m3_pick_list_style, m3_slider_style, m3_text_input_style, pill_chip_button,
+        pill_danger_button, pill_primary_button, pill_tonal_button, surface_card_style,
         M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_WARNING,
     },
-    Message, SquadApp, SYSTEM_DEFAULT_DEVICE,
+    HotkeySlot, Message, SquadApp, SYSTEM_DEFAULT_DEVICE,
 };
 use iced::{
     alignment::Vertical,
@@ -16,7 +16,7 @@ use iced::{
     },
     Element, Length,
 };
-use squad_dsp::NoiseSuppressionMode;
+use squad_dsp::{JitterProfile, NoiseSuppressionMode};
 
 pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     let top_bar = row![
@@ -35,7 +35,11 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     ]
     .align_y(Vertical::Center);
 
-    let avatar_preview = avatar_circle(app.avatars.handle_for(&app.config.client_uuid()), 72.0, false);
+    let avatar_preview = avatar_circle(
+        app.avatars.handle_for(&app.config.client_uuid()),
+        72.0,
+        false,
+    );
 
     let profile_section = container(
         column![
@@ -78,9 +82,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                 .width(Length::FillPortion(1))
                 .spacing(6),
                 column![
-                    text("Voice Server")
-                        .size(12)
-                        .color(M3_ON_SURFACE_VARIANT),
+                    text("Voice Server").size(12).color(M3_ON_SURFACE_VARIANT),
                     text_input("host:port", &app.config.rendezvous_server)
                         .on_input(Message::RendezvousServerChanged)
                         .padding(10)
@@ -249,12 +251,68 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                     .size(12)
                     .color(M3_ON_SURFACE_VARIANT)
                     .width(Length::Fixed(330.0)),
-                mic_sensitivity_meter(
-                    app.audio.local_mic_level_db(),
-                    app.config.vad_threshold_db
-                ),
+                mic_sensitivity_meter(app.audio.local_mic_level_db(), app.config.vad_threshold_db),
+                button(
+                    text(if app.audio.is_mic_loopback() {
+                        "Stop Mic Test"
+                    } else {
+                        "Hear Yourself"
+                    })
+                    .size(12)
+                )
+                .padding([7, 14])
+                .style(if app.audio.is_mic_loopback() {
+                    pill_danger_button
+                } else {
+                    pill_tonal_button
+                })
+                .on_press(Message::ToggleMicLoopback),
             ]
             .spacing(12)
+            .align_y(Vertical::Center),
+            row![
+                text("Latency Profile (Jitter Buffer):")
+                    .size(14)
+                    .width(Length::Fixed(330.0)),
+                row(JitterProfile::ALL.into_iter().map(|profile| {
+                    let active = app.config.jitter_profile == profile;
+                    let short_label = match profile {
+                        JitterProfile::LanUltraLow => "LAN (10 ms)",
+                        JitterProfile::LowLatency => "Low (20 ms)",
+                        JitterProfile::Balanced => "Balanced (30 ms)",
+                        JitterProfile::StableWifi => "Wi-Fi (50 ms)",
+                    };
+                    button(text(short_label).size(12))
+                        .padding([8, 12])
+                        .style(pill_chip_button(active))
+                        .on_press(Message::SetJitterProfile(profile))
+                        .into()
+                }))
+                .spacing(8),
+            ]
+            .spacing(10)
+            .align_y(Vertical::Center),
+            row![
+                text("Voice Bitrate (Opus):")
+                    .size(14)
+                    .width(Length::Fixed(330.0)),
+                row([
+                    (24_000, "24 kbps"),
+                    (40_000, "40 kbps"),
+                    (64_000, "64 kbps"),
+                    (96_000, "96 kbps"),
+                ]
+                .into_iter()
+                .map(|(bps, label)| {
+                    button(text(label).size(12))
+                        .padding([8, 12])
+                        .style(pill_chip_button(app.config.opus_bitrate_bps == bps))
+                        .on_press(Message::SetOpusBitrate(bps))
+                        .into()
+                }))
+                .spacing(8),
+            ]
+            .spacing(10)
             .align_y(Vertical::Center),
         ]
         .spacing(14),
@@ -265,46 +323,37 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
 
     let mut hotkey_col = column![
         text("Keyboard Shortcuts").size(16),
-        text("Works in fullscreen games without blocking your keys.")
+        text("Click any binding and press a key or Mouse3/4/5 (Esc to cancel). Works in fullscreen games.")
             .size(12)
             .color(M3_ON_SURFACE_VARIANT),
         row![
-            column![
-                text("Push-to-Mute")
-                    .size(12)
-                    .color(M3_ON_SURFACE_VARIANT),
-                text_input("KeyV", &app.config.hotkey_ptm)
-                    .on_input(Message::HotkeyPtmChanged)
-                    .padding(10)
-                    .size(14)
-                    .style(m3_text_input_style),
-            ]
-            .width(Length::FillPortion(1))
-            .spacing(6),
-            column![
-                text("Push-to-Talk")
-                    .size(12)
-                    .color(M3_ON_SURFACE_VARIANT),
-                text_input("CapsLock", &app.config.hotkey_ptt)
-                    .on_input(Message::HotkeyPttChanged)
-                    .padding(10)
-                    .size(14)
-                    .style(m3_text_input_style),
-            ]
-            .width(Length::FillPortion(1))
-            .spacing(6),
-            column![
-                text("Toggle Mic Mute")
-                    .size(12)
-                    .color(M3_ON_SURFACE_VARIANT),
-                text_input("F9", &app.config.hotkey_toggle_mute)
-                    .on_input(Message::HotkeyToggleChanged)
-                    .padding(10)
-                    .size(14)
-                    .style(m3_text_input_style),
-            ]
-            .width(Length::FillPortion(1))
-            .spacing(6),
+            hotkey_recorder_slot(
+                "Push-to-Mute",
+                &app.config.hotkey_ptm,
+                HotkeySlot::Ptm,
+                app.recording_hotkey,
+            ),
+            hotkey_recorder_slot(
+                "Push-to-Talk",
+                &app.config.hotkey_ptt,
+                HotkeySlot::Ptt,
+                app.recording_hotkey,
+            ),
+        ]
+        .spacing(14),
+        row![
+            hotkey_recorder_slot(
+                "Toggle Mic Mute",
+                &app.config.hotkey_toggle_mute,
+                HotkeySlot::ToggleMute,
+                app.recording_hotkey,
+            ),
+            hotkey_recorder_slot(
+                "Toggle Deafen",
+                &app.config.hotkey_deafen,
+                HotkeySlot::Deafen,
+                app.recording_hotkey,
+            ),
         ]
         .spacing(14),
     ]
@@ -318,7 +367,11 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             if ax_ok { "Granted" } else { "Required" },
             if im_ok { "Granted" } else { "Required" }
         );
-        let perm_color = if ax_ok && im_ok { M3_SUCCESS } else { M3_WARNING };
+        let perm_color = if ax_ok && im_ok {
+            M3_SUCCESS
+        } else {
+            M3_WARNING
+        };
 
         hotkey_col = hotkey_col.push(
             row![
@@ -460,5 +513,53 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     .padding(24)
     .width(Length::Fill)
     .height(Length::Fill)
+    .into()
+}
+
+fn hotkey_recorder_slot<'a>(
+    label: &'a str,
+    binding: &'a str,
+    slot: HotkeySlot,
+    active_recording: Option<HotkeySlot>,
+) -> Element<'a, Message> {
+    let is_recording = active_recording == Some(slot);
+    let display_txt = if is_recording {
+        "Press key or Mouse3/4/5..."
+    } else if binding.trim().is_empty() {
+        "Unbound (Click to set)"
+    } else {
+        binding
+    };
+
+    let record_btn = button(text(display_txt).size(13))
+        .width(Length::Fill)
+        .padding([10, 14])
+        .style(if is_recording {
+            pill_primary_button
+        } else {
+            pill_tonal_button
+        })
+        .on_press(Message::StartRecordingHotkey(slot));
+
+    let clear_btn = if is_recording {
+        button(text("Cancel").size(12))
+            .padding([10, 12])
+            .style(pill_tonal_button)
+            .on_press(Message::CancelRecordingHotkey)
+    } else {
+        button(text("×").size(13))
+            .padding([10, 12])
+            .style(pill_tonal_button)
+            .on_press(Message::ClearHotkey(slot))
+    };
+
+    column![
+        text(label).size(12).color(M3_ON_SURFACE_VARIANT),
+        row![record_btn, clear_btn]
+            .spacing(6)
+            .align_y(Vertical::Center),
+    ]
+    .width(Length::FillPortion(1))
+    .spacing(6)
     .into()
 }

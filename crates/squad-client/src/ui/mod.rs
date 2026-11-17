@@ -11,7 +11,7 @@ pub mod stream_view;
 pub mod theme;
 
 use crate::config::AppConfig;
-use crate::hotkeys::{request_macos_permissions, HotkeyController};
+use crate::hotkeys::{is_supported_hotkey_name, request_macos_permissions, HotkeyController};
 use crate::net::{
     downloads_root_dir, spawn_mesh_worker, ChatContentUi, ChatItemUi, DecodedVideoFrame,
     MeshCommand, MeshEvent, PeerUiSnapshot,
@@ -27,19 +27,20 @@ use crate::ui::theme::{
     root_container_style, M3_ON_SURFACE, M3_OUTLINE, M3_SURFACE_CONTAINER,
 };
 use iced::{
+    advanced::subscription::{from_recipe, EventStream, Hasher, Recipe},
     alignment::Vertical,
-    clipboard, event, keyboard, time,
+    clipboard, event,
+    futures::{stream::BoxStream, SinkExt},
+    keyboard, mouse, stream,
     widget::{
         button, column, container, horizontal_space, image as iced_image, row, stack, text,
         text_editor,
     },
-    Background, Border, Color, ContentFit, Element, Length, Point, Size, Subscription, Task,
-    Theme,
+    Background, Border, Color, ContentFit, Element, Length, Point, Size, Subscription, Task, Theme,
 };
-use std::borrow::Cow;
 use image::imageops::FilterType;
 use squad_dsp::{
-    list_input_devices, list_output_devices, AudioEngineConfig, AudioEngineHandle,
+    list_input_devices, list_output_devices, AudioEngineConfig, AudioEngineHandle, JitterProfile,
     MicActivationMode, NoiseSuppressionMode, SoundCue,
 };
 use squad_proto::{ClientUuid, InviteLink, PeerId, INLINE_IMAGE_MAX_BYTES};
@@ -47,12 +48,16 @@ use squad_video::{
     enumerate_capture_targets, request_screen_capture_permission, CaptureTarget, StreamConfig,
     StreamFps, StreamResolution, VideoCodec,
 };
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Notify};
 
 pub const SYSTEM_DEFAULT_DEVICE: &str = "System Default (OS)";
 
@@ -71,9 +76,22 @@ pub enum ClipboardPayload {
     PlainText(String),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HotkeySlot {
+    Ptm,
+    Ptt,
+    ToggleMute,
+    Deafen,
+}
+
 #[derive(Debug, Clone)]
 pub enum Message {
-    Tick,
+    MeshEventsPending,
+    TrayEventsPending,
+    VideoFrameReady,
+    AudioStateChanged,
+    ClearCopiedFlash,
+    ReleaseMemory,
     CreateRoom,
     InviteInputChanged(String),
     JoinRoomWithInput,
@@ -83,16 +101,20 @@ pub enum Message {
     CloseSettings,
     ToggleMicMute,
     ToggleDeafen,
+    ToggleMicLoopback,
     SetActivationMode(MicActivationMode),
     SetAecEnabled(bool),
     SetNsMode(NoiseSuppressionMode),
+    SetJitterProfile(JitterProfile),
+    SetOpusBitrate(i32),
     InputGainChanged(f32),
     VadThresholdChanged(f32),
     NicknameChanged(String),
     RendezvousServerChanged(String),
-    HotkeyPtmChanged(String),
-    HotkeyPttChanged(String),
-    HotkeyToggleChanged(String),
+    StartRecordingHotkey(HotkeySlot),
+    CancelRecordingHotkey,
+    RecordedHotkeyInput(String),
+    ClearHotkey(HotkeySlot),
     RefreshAudioDevices,
     InputDeviceSelected(String),
     OutputDeviceSelected(String),
@@ -152,10 +174,120 @@ pub enum Message {
     SetOverlayEnabled(bool),
     SetOverlaySpeakingOnly(bool),
     OverlayOpacityChanged(f32),
-    WindowOpened,
+    WindowOpened(iced::window::Id),
     OverlayWindowOpened(iced::window::Id),
     OverlayConfigured,
     WindowCloseRequested(iced::window::Id),
+}
+
+struct UiSyncState {
+    mesh_notify: Arc<Notify>,
+    tray_notify: Arc<Notify>,
+    video_notify: Arc<Notify>,
+    audio_ui_notify: Arc<Notify>,
+    audio: AudioEngineHandle,
+    in_room: AtomicBool,
+    in_settings: AtomicBool,
+    in_tray: AtomicBool,
+    has_overlay: AtomicBool,
+    watching_video: AtomicBool,
+}
+
+struct AppWorkerRecipe(Arc<UiSyncState>);
+
+impl Recipe for AppWorkerRecipe {
+    type Output = Message;
+
+    fn hash(&self, state: &mut Hasher) {
+        use std::hash::Hash;
+        0x51A0_0001u64.hash(state);
+    }
+
+    fn stream(self: Box<Self>, _input: EventStream) -> BoxStream<'static, Self::Output> {
+        let sync = self.0;
+        Box::pin(stream::channel(64, |mut output| async move {
+            let mut last_audio_snapshot: Option<(bool, bool, bool, i32)> = None;
+            let mut last_video_sent = std::time::Instant::now() - Duration::from_millis(20);
+            let mut poll_interval = tokio::time::interval(Duration::from_millis(66));
+            poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            loop {
+                let in_room = sync.in_room.load(Ordering::Acquire);
+                let in_settings = sync.in_settings.load(Ordering::Acquire);
+                let in_tray = sync.in_tray.load(Ordering::Acquire);
+                let has_overlay = sync.has_overlay.load(Ordering::Acquire);
+                let need_audio_poll = (in_room || in_settings) && (!in_tray || has_overlay);
+
+                if !need_audio_poll {
+                    last_audio_snapshot = None;
+                }
+
+                tokio::select! {
+                    biased;
+
+                    _ = sync.mesh_notify.notified() => {
+                        let _ = output.send(Message::MeshEventsPending).await;
+                    }
+                    _ = sync.tray_notify.notified() => {
+                        let _ = output.send(Message::TrayEventsPending).await;
+                    }
+                    _ = sync.video_notify.notified(), if sync.watching_video.load(Ordering::Acquire) => {
+                        let elapsed = last_video_sent.elapsed();
+                        if elapsed < Duration::from_millis(14) {
+                            tokio::time::sleep(Duration::from_millis(14) - elapsed).await;
+                        }
+                        last_video_sent = std::time::Instant::now();
+                        let _ = output.send(Message::VideoFrameReady).await;
+                    }
+                    _ = sync.audio_ui_notify.notified() => {
+                        if (sync.in_room.load(Ordering::Acquire) || sync.in_settings.load(Ordering::Acquire))
+                            && (!sync.in_tray.load(Ordering::Acquire) || sync.has_overlay.load(Ordering::Acquire))
+                        {
+                            let snap = sample_audio_ui_snapshot(&sync);
+                            if last_audio_snapshot != Some(snap) {
+                                last_audio_snapshot = Some(snap);
+                                let _ = output.send(Message::AudioStateChanged).await;
+                            }
+                        }
+                    }
+                    _ = poll_interval.tick(), if need_audio_poll => {
+                        let snap = sample_audio_ui_snapshot(&sync);
+                        if last_audio_snapshot != Some(snap) {
+                            last_audio_snapshot = Some(snap);
+                            let _ = output.send(Message::AudioStateChanged).await;
+                        }
+                    }
+                }
+            }
+        }))
+    }
+}
+
+fn sample_audio_ui_snapshot(sync: &UiSyncState) -> (bool, bool, bool, i32) {
+    let speaking = sync.audio.is_local_speaking();
+    let muted = sync.audio.is_mic_muted();
+    let deafened = sync.audio.is_deafened();
+    let in_tray = sync.in_tray.load(Ordering::Acquire);
+    let db_bucket = if in_tray || muted || deafened {
+        -60
+    } else {
+        let db = sync.audio.local_mic_level_db();
+        if db <= -58.5 {
+            -60
+        } else {
+            db.round() as i32
+        }
+    };
+    (speaking, muted, deafened, db_bucket)
+}
+
+fn main_window_settings() -> iced::window::Settings {
+    iced::window::Settings {
+        size: Size::new(1180.0, 740.0),
+        icon: crate::load_window_icon(),
+        exit_on_close_request: false,
+        ..Default::default()
+    }
 }
 
 pub struct SquadApp {
@@ -203,8 +335,10 @@ pub struct SquadApp {
     pub stream_expanded: bool,
     pub stream_fullscreen: bool,
     pub is_in_tray: bool,
-    pub main_window_id: iced::window::Id,
+    pub main_window_id: Option<iced::window::Id>,
     pub overlay_window_id: Option<iced::window::Id>,
+    pub recording_hotkey: Option<HotkeySlot>,
+    ui_sync: Arc<UiSyncState>,
 }
 
 impl SquadApp {
@@ -220,22 +354,48 @@ impl SquadApp {
             activation_mode: config.activation_mode,
             input_gain: config.input_gain,
             vad_threshold_db: config.vad_threshold_db,
-            bitrate_bps: 40_000,
+            bitrate_bps: config.opus_bitrate_bps,
+            jitter_profile: config.jitter_profile,
         };
 
         let audio = AudioEngineHandle::start(engine_cfg, audio_out_tx)
             .expect("Failed to initialize Squad-Air DSP audio engine");
         audio.set_stream_gain(config.stream_volume);
 
+        let mesh_notify = Arc::new(Notify::new());
+        let tray_notify = Arc::new(Notify::new());
+        let video_notify = Arc::new(Notify::new());
+        let audio_ui_notify = Arc::new(Notify::new());
+
         let video_frame_slot = Arc::new(Mutex::new(None));
-        let (mesh_tx, mesh_rx) =
-            spawn_mesh_worker(audio.clone(), audio_out_rx, Arc::clone(&video_frame_slot));
+        let (mesh_tx, mesh_rx) = spawn_mesh_worker(
+            audio.clone(),
+            audio_out_rx,
+            Arc::clone(&video_frame_slot),
+            Arc::clone(&mesh_notify),
+            Arc::clone(&video_notify),
+        );
         let hotkeys = HotkeyController::new(
             &config.hotkey_toggle_mute,
             &config.hotkey_ptt,
             &config.hotkey_ptm,
+            &config.hotkey_deafen,
+            audio.clone(),
+            Arc::clone(&audio_ui_notify),
         );
-        let tray = SystemTray::new();
+        let tray = SystemTray::new(Arc::clone(&tray_notify));
+        let ui_sync = Arc::new(UiSyncState {
+            mesh_notify,
+            tray_notify,
+            video_notify,
+            audio_ui_notify,
+            audio: audio.clone(),
+            in_room: AtomicBool::new(false),
+            in_settings: AtomicBool::new(false),
+            in_tray: AtomicBool::new(false),
+            has_overlay: AtomicBool::new(false),
+            watching_video: AtomicBool::new(false),
+        });
         let mut config_mut = config;
         let avatars = AvatarCache::new();
         if let Some(ref hex_hash) = config_mut.custom_avatar_hash {
@@ -255,12 +415,7 @@ impl SquadApp {
             }
         }
 
-        let (main_window_id, open_main_task) = iced::window::open(iced::window::Settings {
-            size: Size::new(1180.0, 740.0),
-            icon: crate::load_window_icon(),
-            exit_on_close_request: false,
-            ..Default::default()
-        });
+        let (main_window_id, open_main_task) = iced::window::open(main_window_settings());
 
         let app = Self {
             config: config_mut,
@@ -307,11 +462,13 @@ impl SquadApp {
             stream_expanded: false,
             stream_fullscreen: false,
             is_in_tray: false,
-            main_window_id,
+            main_window_id: Some(main_window_id),
             overlay_window_id: None,
+            recording_hotkey: None,
+            ui_sync,
         };
 
-        (app, open_main_task.map(|_| Message::WindowOpened))
+        (app, open_main_task.map(Message::WindowOpened))
     }
 
     pub fn title(&self, window_id: iced::window::Id) -> String {
@@ -337,95 +494,114 @@ impl SquadApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
-        let tick_ms = if self.is_in_tray && self.overlay_window_id.is_none() {
-            200
-        } else {
-            20
-        };
-        let tick = time::every(Duration::from_millis(tick_ms)).map(|_| Message::Tick);
+        let worker = from_recipe(AppWorkerRecipe(Arc::clone(&self.ui_sync)));
         let close_reqs = iced::window::close_requests().map(Message::WindowCloseRequested);
         if self.is_in_tray {
-            return Subscription::batch([tick, close_reqs]);
+            return Subscription::batch([worker, close_reqs]);
         }
-        let keys = event::listen_with(|evt, status, _win| match evt {
-            iced::Event::Keyboard(keyboard::Event::KeyPressed {
-                key,
-                physical_key,
-                modifiers,
-                ..
-            }) => {
-                let is_c = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("c"))
-                    || matches!(
-                        physical_key,
-                        keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
-                    );
-                if modifiers.command() && is_c && status != iced::event::Status::Captured {
-                    return Some(Message::CopySelectedChatText);
-                }
-                let is_v = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("v"))
-                    || matches!(
-                        physical_key,
-                        keyboard::key::Physical::Code(keyboard::key::Code::KeyV)
-                    );
-                if modifiers.command() && is_v {
-                    return Some(Message::PasteFromClipboard {
-                        text_input_focused: status == iced::event::Status::Captured,
-                    });
-                }
-                let is_f = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("f"))
-                    || matches!(
-                        physical_key,
-                        keyboard::key::Physical::Code(keyboard::key::Code::KeyF)
-                    );
-                if status != iced::event::Status::Captured
-                    && !modifiers.command()
-                    && !modifiers.control()
-                    && !modifiers.alt()
-                    && is_f
-                {
-                    return Some(Message::ToggleStreamFullscreen);
-                }
-                if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
-                    return Some(Message::EscapePressed);
-                }
-                None
-            }
-            _ => None,
-        });
-        let close_reqs = iced::window::close_requests().map(Message::WindowCloseRequested);
-        Subscription::batch([tick, keys, close_reqs])
+        let keys = if self.recording_hotkey.is_some() {
+            event::listen_with(listen_recording_event)
+        } else {
+            event::listen_with(listen_normal_event)
+        };
+        Subscription::batch([worker, keys, close_reqs])
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            Message::Tick => {
-                self.hotkeys.poll_events(&self.audio);
+            Message::AudioStateChanged => Task::none(),
+            Message::ClearCopiedFlash => {
                 if let Some((_, ts)) = self.copied_msg_id {
                     if ts.elapsed() >= Duration::from_secs(2) {
                         self.copied_msg_id = None;
                     }
                 }
-                match self.tray.poll_action(&self.audio) {
-                    Some(TrayAction::ShowWindow) => {
-                        self.is_in_tray = false;
-                        let _ = self
-                            .mesh_tx
-                            .try_send(MeshCommand::SetTrayMode { in_tray: false });
-                        let id = self.main_window_id;
-                        return Task::batch([
-                            iced::window::change_mode(id, iced::window::Mode::Windowed),
-                            iced::window::resize(id, Size::new(1180.0, 740.0)),
-                            iced::window::gain_focus(id),
-                        ]);
-                    }
-                    Some(TrayAction::Quit) => {
-                        let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
-                        self.audio.shutdown();
-                        return iced::exit();
-                    }
-                    Some(TrayAction::ToggleMute) | None => {}
+                Task::none()
+            }
+            Message::ReleaseMemory => {
+                if self.is_in_tray {
+                    release_os_memory();
                 }
-
+                Task::none()
+            }
+            Message::TrayEventsPending => match self.tray.poll_action(&self.audio) {
+                Some(TrayAction::ShowWindow) => {
+                    self.is_in_tray = false;
+                    self.ui_sync.in_tray.store(false, Ordering::Release);
+                    self.ui_sync.audio_ui_notify.notify_one();
+                    for item in &self.chat_messages {
+                        match &item.content {
+                            ChatContentUi::Text(body_text) => {
+                                self.chat_text_editors
+                                    .entry((item.sender_uuid, item.msg_id))
+                                    .or_insert_with(|| text_editor::Content::with_text(body_text));
+                            }
+                            ChatContentUi::InlineImage {
+                                blob_id,
+                                filename,
+                                bytes: Some(raw),
+                                ..
+                            } => {
+                                self.image_handles
+                                    .entry(*blob_id)
+                                    .or_insert_with(|| iced_image::Handle::from_bytes(raw.clone()));
+                                self.inline_image_bytes
+                                    .entry(*blob_id)
+                                    .or_insert_with(|| (filename.clone(), raw.clone()));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if self.screen == Screen::Room {
+                        self.audio.set_streams_active(true);
+                    } else if self.screen == Screen::Settings {
+                        self.audio.set_streams_active(true);
+                        self.audio.set_monitoring_in_settings(true);
+                        self.ui_sync.in_settings.store(true, Ordering::Release);
+                    }
+                    let _ = self
+                        .mesh_tx
+                        .try_send(MeshCommand::SetTrayMode { in_tray: false });
+                    if let Some(id) = self.main_window_id {
+                        Task::batch([
+                            iced::window::change_mode(id, iced::window::Mode::Windowed),
+                            iced::window::gain_focus(id),
+                        ])
+                    } else {
+                        let (id, open_task) = iced::window::open(main_window_settings());
+                        self.main_window_id = Some(id);
+                        open_task.map(Message::WindowOpened)
+                    }
+                }
+                Some(TrayAction::Quit) => {
+                    self.hotkeys.shutdown();
+                    let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
+                    self.audio.shutdown();
+                    iced::exit()
+                }
+                Some(TrayAction::ToggleMute) | None => Task::none(),
+            },
+            Message::VideoFrameReady => {
+                if self.watched_peer_id.is_some() || self.local_stream_preview {
+                    if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                        if let Some(frame) = slot.take() {
+                            let matches_watch =
+                                Some(frame.streamer_peer_id) == self.watched_peer_id;
+                            let matches_preview = self.local_stream_preview
+                                && frame.streamer_peer_id == self.local_peer_id;
+                            if matches_watch || matches_preview {
+                                self.active_stream_frame = Some(iced_image::Handle::from_rgba(
+                                    frame.width,
+                                    frame.height,
+                                    frame.rgba,
+                                ));
+                            }
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::MeshEventsPending => {
                 let mut pending_tasks = Vec::new();
                 let mut overlay_sync_needed = false;
                 if let Ok(mut rx) = self.mesh_rx.try_lock() {
@@ -446,6 +622,12 @@ impl SquadApp {
                                     .unwrap_or_default();
                                 self.screen = Screen::Room;
                                 self.status_banner = None;
+                                self.audio.set_streams_active(true);
+                                self.audio.set_monitoring_in_settings(false);
+                                self.hotkeys.set_active(true);
+                                self.ui_sync.in_room.store(true, Ordering::Release);
+                                self.ui_sync.in_settings.store(false, Ordering::Release);
+                                self.ui_sync.audio_ui_notify.notify_one();
                                 overlay_sync_needed = true;
                             }
                             MeshEvent::LeftRoom => {
@@ -472,12 +654,18 @@ impl SquadApp {
                                     *slot = None;
                                 }
                                 self.screen = Screen::Lobby;
+                                self.audio.set_streams_active(false);
+                                self.audio.set_monitoring_in_settings(false);
+                                self.hotkeys.set_active(false);
+                                self.ui_sync.in_room.store(false, Ordering::Release);
+                                self.ui_sync.in_settings.store(false, Ordering::Release);
+                                self.ui_sync.watching_video.store(false, Ordering::Release);
+                                self.ui_sync.audio_ui_notify.notify_one();
                                 overlay_sync_needed = true;
                                 if was_fs {
-                                    pending_tasks.push(set_window_fullscreen_task(
-                                        self.main_window_id,
-                                        false,
-                                    ));
+                                    if let Some(id) = self.main_window_id {
+                                        pending_tasks.push(set_window_fullscreen_task(id, false));
+                                    }
                                 }
                             }
                             MeshEvent::PeersUpdated(snapshots) => {
@@ -495,21 +683,27 @@ impl SquadApp {
                                     ..
                                 } = item.content
                                 {
-                                    self.image_handles
-                                        .insert(blob_id, iced_image::Handle::from_bytes(raw.clone()));
-                                    self.inline_image_bytes
-                                        .insert(blob_id, (filename.clone(), raw.clone()));
+                                    if !self.is_in_tray {
+                                        self.image_handles.insert(
+                                            blob_id,
+                                            iced_image::Handle::from_bytes(raw.clone()),
+                                        );
+                                        self.inline_image_bytes
+                                            .insert(blob_id, (filename.clone(), raw.clone()));
+                                    }
                                 }
                                 let already = self.chat_messages.iter().any(|existing| {
                                     existing.sender_uuid == item.sender_uuid
                                         && existing.msg_id == item.msg_id
                                 });
                                 if !already {
-                                    if let ChatContentUi::Text(ref body_text) = item.content {
-                                        self.chat_text_editors.insert(
-                                            (item.sender_uuid, item.msg_id),
-                                            text_editor::Content::with_text(body_text),
-                                        );
+                                    if !self.is_in_tray {
+                                        if let ChatContentUi::Text(ref body_text) = item.content {
+                                            self.chat_text_editors.insert(
+                                                (item.sender_uuid, item.msg_id),
+                                                text_editor::Content::with_text(body_text),
+                                            );
+                                        }
                                     }
                                     self.chat_messages.push(item);
                                     self.chat_messages
@@ -528,9 +722,13 @@ impl SquadApp {
                                 state,
                                 inline_bytes,
                             } => {
-                                if let Some(ref raw) = inline_bytes {
-                                    self.image_handles
-                                        .insert(blob_id, iced_image::Handle::from_bytes(raw.clone()));
+                                if !self.is_in_tray {
+                                    if let Some(ref raw) = inline_bytes {
+                                        self.image_handles.insert(
+                                            blob_id,
+                                            iced_image::Handle::from_bytes(raw.clone()),
+                                        );
+                                    }
                                 }
                                 for item in &mut self.chat_messages {
                                     match &mut item.content {
@@ -544,8 +742,12 @@ impl SquadApp {
                                             *st = state.clone();
                                             if let Some(ref raw) = inline_bytes {
                                                 *bytes = Some(raw.clone());
-                                                self.inline_image_bytes
-                                                    .insert(blob_id, (filename.clone(), raw.clone()));
+                                                if !self.is_in_tray {
+                                                    self.inline_image_bytes.insert(
+                                                        blob_id,
+                                                        (filename.clone(), raw.clone()),
+                                                    );
+                                                }
                                             }
                                         }
                                         ChatContentUi::File {
@@ -569,12 +771,15 @@ impl SquadApp {
                                     self.watched_peer_id = None;
                                     self.active_stream_frame = None;
                                     self.stream_expanded = false;
+                                    self.ui_sync
+                                        .watching_video
+                                        .store(self.local_stream_preview, Ordering::Release);
                                     if self.stream_fullscreen {
                                         self.stream_fullscreen = false;
-                                        pending_tasks.push(set_window_fullscreen_task(
-                                            self.main_window_id,
-                                            false,
-                                        ));
+                                        if let Some(id) = self.main_window_id {
+                                            pending_tasks
+                                                .push(set_window_fullscreen_task(id, false));
+                                        }
                                     }
                                 }
                             }
@@ -612,22 +817,6 @@ impl SquadApp {
                 }
                 if overlay_sync_needed {
                     pending_tasks.push(self.sync_overlay_window());
-                }
-                if self.watched_peer_id.is_some() || self.local_stream_preview {
-                    if let Ok(mut slot) = self.video_frame_slot.try_lock() {
-                        if let Some(frame) = slot.take() {
-                            let matches_watch = Some(frame.streamer_peer_id) == self.watched_peer_id;
-                            let matches_preview =
-                                self.local_stream_preview && frame.streamer_peer_id == self.local_peer_id;
-                            if matches_watch || matches_preview {
-                                self.active_stream_frame = Some(iced_image::Handle::from_rgba(
-                                    frame.width,
-                                    frame.height,
-                                    frame.rgba,
-                                ));
-                            }
-                        }
-                    }
                 }
                 if pending_tasks.is_empty() {
                     Task::none()
@@ -676,12 +865,20 @@ impl SquadApp {
                     *slot = None;
                 }
                 self.screen = Screen::Lobby;
+                self.audio.set_streams_active(false);
+                self.audio.set_monitoring_in_settings(false);
+                self.hotkeys.set_active(false);
+                self.ui_sync.in_room.store(false, Ordering::Release);
+                self.ui_sync.in_settings.store(false, Ordering::Release);
+                self.ui_sync.watching_video.store(false, Ordering::Release);
+                self.ui_sync.audio_ui_notify.notify_one();
                 let overlay_task = self.sync_overlay_window();
                 if was_fs {
-                    Task::batch([
-                        overlay_task,
-                        set_window_fullscreen_task(self.main_window_id, false),
-                    ])
+                    if let Some(id) = self.main_window_id {
+                        Task::batch([overlay_task, set_window_fullscreen_task(id, false)])
+                    } else {
+                        overlay_task
+                    }
                 } else {
                     overlay_task
                 }
@@ -694,17 +891,25 @@ impl SquadApp {
                 if self.screen != Screen::Settings {
                     self.previous_screen = self.screen;
                     self.screen = Screen::Settings;
+                    self.audio.set_streams_active(true);
+                    self.audio.set_monitoring_in_settings(true);
+                    self.ui_sync.in_settings.store(true, Ordering::Release);
+                    self.ui_sync.audio_ui_notify.notify_one();
                 }
                 Task::none()
             }
             Message::CloseSettings => {
+                self.recording_hotkey = None;
+                self.audio.set_mic_loopback(false);
                 let _ = self.config.save();
-                self.hotkeys.rebind(
-                    &self.config.hotkey_toggle_mute,
-                    &self.config.hotkey_ptt,
-                    &self.config.hotkey_ptm,
-                );
+                self.rebind_hotkeys();
                 self.screen = self.previous_screen;
+                self.audio.set_monitoring_in_settings(false);
+                if self.screen != Screen::Room {
+                    self.audio.set_streams_active(false);
+                }
+                self.ui_sync.in_settings.store(false, Ordering::Release);
+                self.ui_sync.audio_ui_notify.notify_one();
                 Task::none()
             }
             Message::ToggleMicMute => {
@@ -720,6 +925,17 @@ impl SquadApp {
             Message::ToggleDeafen => {
                 let next = !self.audio.is_deafened();
                 self.audio.set_deafened(next);
+                self.audio.play_cue(if next {
+                    SoundCue::Mute
+                } else {
+                    SoundCue::Unmute
+                });
+                Task::none()
+            }
+            Message::ToggleMicLoopback => {
+                let next = !self.audio.is_mic_loopback();
+                self.audio.set_mic_loopback(next);
+                self.ui_sync.audio_ui_notify.notify_one();
                 Task::none()
             }
             Message::SetActivationMode(mode) => {
@@ -737,6 +953,18 @@ impl SquadApp {
             Message::SetNsMode(mode) => {
                 self.config.ns_mode = mode;
                 self.audio.set_ns_mode(mode);
+                let _ = self.config.save();
+                Task::none()
+            }
+            Message::SetJitterProfile(profile) => {
+                self.config.jitter_profile = profile;
+                self.audio.set_jitter_profile(profile);
+                let _ = self.config.save();
+                Task::none()
+            }
+            Message::SetOpusBitrate(bps) => {
+                self.config.opus_bitrate_bps = bps;
+                self.audio.set_opus_bitrate(bps);
                 let _ = self.config.save();
                 Task::none()
             }
@@ -759,16 +987,33 @@ impl SquadApp {
                 self.config.rendezvous_server = srv;
                 Task::none()
             }
-            Message::HotkeyPtmChanged(val) => {
-                self.config.hotkey_ptm = val;
+            Message::StartRecordingHotkey(slot) => {
+                self.recording_hotkey = if self.recording_hotkey == Some(slot) {
+                    None
+                } else {
+                    Some(slot)
+                };
                 Task::none()
             }
-            Message::HotkeyPttChanged(val) => {
-                self.config.hotkey_ptt = val;
+            Message::CancelRecordingHotkey => {
+                self.recording_hotkey = None;
                 Task::none()
             }
-            Message::HotkeyToggleChanged(val) => {
-                self.config.hotkey_toggle_mute = val;
+            Message::RecordedHotkeyInput(key_name) => {
+                if let Some(slot) = self.recording_hotkey.take() {
+                    self.set_hotkey_slot(slot, key_name);
+                    let _ = self.config.save();
+                    self.rebind_hotkeys();
+                }
+                Task::none()
+            }
+            Message::ClearHotkey(slot) => {
+                if self.recording_hotkey == Some(slot) {
+                    self.recording_hotkey = None;
+                }
+                self.set_hotkey_slot(slot, String::new());
+                let _ = self.config.save();
+                self.rebind_hotkeys();
                 Task::none()
             }
             Message::RefreshAudioDevices => {
@@ -924,7 +1169,15 @@ impl SquadApp {
             Message::ClipboardProcessed(None) => Task::none(),
             Message::CopyChatText(msg_id, text) => {
                 self.copied_msg_id = Some((msg_id, std::time::Instant::now()));
-                clipboard::write(text)
+                Task::batch([
+                    clipboard::write(text),
+                    Task::perform(
+                        async {
+                            tokio::time::sleep(Duration::from_secs(2)).await;
+                        },
+                        |_| Message::ClearCopiedFlash,
+                    ),
+                ])
             }
             Message::ChatEditorAction(key, action) => {
                 if !action.is_edit() {
@@ -949,9 +1202,11 @@ impl SquadApp {
                 if let Some((_, raw)) = self.inline_image_bytes.get(&blob_id).cloned() {
                     return Task::perform(
                         async move {
-                            tokio::task::spawn_blocking(move || copy_encoded_image_to_clipboard(&raw))
-                                .await
-                                .map_err(|e| format!("Clipboard task failed: {e}"))?
+                            tokio::task::spawn_blocking(move || {
+                                copy_encoded_image_to_clipboard(&raw)
+                            })
+                            .await
+                            .map_err(|e| format!("Clipboard task failed: {e}"))?
                         },
                         Message::ClipboardActionDone,
                     );
@@ -998,7 +1253,9 @@ impl SquadApp {
                 self.share_modal_open = false;
                 if self.stream_fullscreen {
                     self.stream_fullscreen = false;
-                    return set_window_fullscreen_task(self.main_window_id, false);
+                    if let Some(id) = self.main_window_id {
+                        return set_window_fullscreen_task(id, false);
+                    }
                 }
                 Task::none()
             }
@@ -1080,7 +1337,9 @@ impl SquadApp {
                         codec: self.share_codec,
                         share_audio: self.share_audio,
                     };
-                    let _ = self.mesh_tx.try_send(MeshCommand::StartScreenShare { config });
+                    let _ = self
+                        .mesh_tx
+                        .try_send(MeshCommand::StartScreenShare { config });
                     self.is_local_sharing = true;
                     self.local_stream_preview = false;
                     self.share_modal_open = false;
@@ -1092,6 +1351,9 @@ impl SquadApp {
                 self.is_local_sharing = false;
                 self.local_stream_preview = false;
                 self.local_stream_subscribers = 0;
+                self.ui_sync
+                    .watching_video
+                    .store(self.watched_peer_id.is_some(), Ordering::Release);
                 if self.watched_peer_id.is_none() {
                     self.active_stream_frame = None;
                     if let Ok(mut slot) = self.video_frame_slot.try_lock() {
@@ -1099,7 +1361,9 @@ impl SquadApp {
                     }
                     if self.stream_fullscreen {
                         self.stream_fullscreen = false;
-                        return set_window_fullscreen_task(self.main_window_id, false);
+                        if let Some(id) = self.main_window_id {
+                            return set_window_fullscreen_task(id, false);
+                        }
                     }
                 }
                 Task::none()
@@ -1117,6 +1381,13 @@ impl SquadApp {
                             *slot = None;
                         }
                     }
+                    self.ui_sync.watching_video.store(
+                        self.watched_peer_id.is_some() || self.local_stream_preview,
+                        Ordering::Release,
+                    );
+                    if self.local_stream_preview {
+                        self.ui_sync.video_notify.notify_one();
+                    }
                     let _ = self.mesh_tx.try_send(MeshCommand::SetLocalStreamPreview {
                         enabled: self.local_stream_preview,
                     });
@@ -1125,7 +1396,9 @@ impl SquadApp {
                         && self.watched_peer_id.is_none()
                     {
                         self.stream_fullscreen = false;
-                        return set_window_fullscreen_task(self.main_window_id, false);
+                        if let Some(id) = self.main_window_id {
+                            return set_window_fullscreen_task(id, false);
+                        }
                     }
                 }
                 Task::none()
@@ -1135,18 +1408,23 @@ impl SquadApp {
                 self.watched_peer_id = Some(peer_id);
                 self.active_stream_frame = None;
                 self.stream_expanded = false;
+                self.ui_sync.watching_video.store(true, Ordering::Release);
+                self.ui_sync.video_notify.notify_one();
                 if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                     *slot = None;
                 }
-                let _ = self
-                    .mesh_tx
-                    .try_send(MeshCommand::WatchPeerStream { peer_id: Some(peer_id) });
+                let _ = self.mesh_tx.try_send(MeshCommand::WatchPeerStream {
+                    peer_id: Some(peer_id),
+                });
                 Task::none()
             }
             Message::StopWatchingStream => {
                 self.watched_peer_id = None;
                 self.active_stream_frame = None;
                 self.stream_expanded = false;
+                self.ui_sync
+                    .watching_video
+                    .store(self.local_stream_preview, Ordering::Release);
                 let was_fs = self.stream_fullscreen;
                 self.stream_fullscreen = false;
                 if let Ok(mut slot) = self.video_frame_slot.try_lock() {
@@ -1156,10 +1434,11 @@ impl SquadApp {
                     .mesh_tx
                     .try_send(MeshCommand::WatchPeerStream { peer_id: None });
                 if was_fs {
-                    set_window_fullscreen_task(self.main_window_id, false)
-                } else {
-                    Task::none()
+                    if let Some(id) = self.main_window_id {
+                        return set_window_fullscreen_task(id, false);
+                    }
                 }
+                Task::none()
             }
             Message::StreamVolumeChanged(gain) => {
                 let clamped = gain.clamp(0.0, 2.0);
@@ -1177,23 +1456,28 @@ impl SquadApp {
                     && (self.watched_peer_id.is_some() || self.local_stream_preview)
                 {
                     self.stream_fullscreen = !self.stream_fullscreen;
-                    return set_window_fullscreen_task(self.main_window_id, self.stream_fullscreen);
+                    if let Some(id) = self.main_window_id {
+                        return set_window_fullscreen_task(id, self.stream_fullscreen);
+                    }
                 }
                 Task::none()
             }
             Message::ExitStreamFullscreen => {
                 if self.stream_fullscreen {
                     self.stream_fullscreen = false;
-                    return set_window_fullscreen_task(self.main_window_id, false);
+                    if let Some(id) = self.main_window_id {
+                        return set_window_fullscreen_task(id, false);
+                    }
                 }
                 Task::none()
             }
             Message::WindowCloseRequested(window_id) => {
-                if window_id != self.main_window_id {
+                if Some(window_id) != self.main_window_id {
                     return Task::none();
                 }
                 if self.config.minimize_to_tray {
                     self.is_in_tray = true;
+                    self.main_window_id = None;
                     self.share_modal_open = false;
                     self.lightbox_blob_id = None;
                     self.watched_peer_id = None;
@@ -1207,21 +1491,42 @@ impl SquadApp {
                     self.inline_image_bytes.shrink_to_fit();
                     self.capture_targets.clear();
                     self.capture_targets.shrink_to_fit();
+                    self.chat_text_editors.clear();
+                    self.chat_text_editors.shrink_to_fit();
+                    self.active_chat_selection = None;
                     if self.overlay_window_id.is_none() {
                         self.avatars.clear_memory_cache();
                     }
                     if let Ok(mut slot) = self.video_frame_slot.try_lock() {
                         *slot = None;
                     }
+                    let in_room = self.screen == Screen::Room
+                        || (self.screen == Screen::Settings
+                            && self.previous_screen == Screen::Room);
+                    self.recording_hotkey = None;
+                    self.audio.set_mic_loopback(false);
+                    self.audio.set_monitoring_in_settings(false);
+                    if !in_room {
+                        self.audio.set_streams_active(false);
+                    }
+                    self.ui_sync.in_settings.store(false, Ordering::Release);
+                    self.ui_sync.in_tray.store(true, Ordering::Release);
+                    self.ui_sync.watching_video.store(false, Ordering::Release);
+                    self.ui_sync.audio_ui_notify.notify_one();
                     let _ = self
                         .mesh_tx
                         .try_send(MeshCommand::SetTrayMode { in_tray: true });
-                    release_os_memory();
                     Task::batch([
-                        iced::window::resize(window_id, Size::new(1.0, 1.0)),
-                        iced::window::change_mode(window_id, iced::window::Mode::Hidden),
+                        iced::window::close(window_id),
+                        Task::perform(
+                            async {
+                                tokio::time::sleep(Duration::from_millis(120)).await;
+                            },
+                            |_| Message::ReleaseMemory,
+                        ),
                     ])
                 } else {
+                    self.hotkeys.shutdown();
                     let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
                     self.audio.shutdown();
                     iced::exit()
@@ -1247,7 +1552,14 @@ impl SquadApp {
                 let _ = self.config.save();
                 Task::none()
             }
-            Message::WindowOpened | Message::OverlayConfigured => Task::none(),
+            Message::WindowOpened(id) => {
+                if self.main_window_id == Some(id) {
+                    iced::window::gain_focus(id)
+                } else {
+                    Task::none()
+                }
+            }
+            Message::OverlayConfigured => Task::none(),
             Message::OverlayWindowOpened(id) => {
                 if self.overlay_window_id == Some(id) {
                     overlay_platform::configure_overlay_window(id)
@@ -1303,6 +1615,9 @@ impl SquadApp {
         if Some(window_id) == self.overlay_window_id {
             return overlay::view_overlay(self);
         }
+        if Some(window_id) != self.main_window_id {
+            return container(text("")).into();
+        }
 
         let content = match self.screen {
             Screen::Lobby => lobby::view_lobby(self),
@@ -1333,6 +1648,24 @@ impl SquadApp {
         }
     }
 
+    fn rebind_hotkeys(&self) {
+        self.hotkeys.rebind(
+            &self.config.hotkey_toggle_mute,
+            &self.config.hotkey_ptt,
+            &self.config.hotkey_ptm,
+            &self.config.hotkey_deafen,
+        );
+    }
+
+    fn set_hotkey_slot(&mut self, slot: HotkeySlot, value: String) {
+        match slot {
+            HotkeySlot::Ptm => self.config.hotkey_ptm = value,
+            HotkeySlot::Ptt => self.config.hotkey_ptt = value,
+            HotkeySlot::ToggleMute => self.config.hotkey_toggle_mute = value,
+            HotkeySlot::Deafen => self.config.hotkey_deafen = value,
+        }
+    }
+
     fn select_first_target_for_tab(&mut self) {
         let current_matches = self
             .capture_targets
@@ -1343,12 +1676,15 @@ impl SquadApp {
             })
             .unwrap_or(false);
         if !current_matches {
-            if let Some((idx, _)) = self.capture_targets.iter().enumerate().find(|(_, t)| {
-                match self.share_tab {
-                    ShareSourceTab::Monitors => t.is_monitor(),
-                    ShareSourceTab::Windows => !t.is_monitor(),
-                }
-            }) {
+            if let Some((idx, _)) =
+                self.capture_targets
+                    .iter()
+                    .enumerate()
+                    .find(|(_, t)| match self.share_tab {
+                        ShareSourceTab::Monitors => t.is_monitor(),
+                        ShareSourceTab::Windows => !t.is_monitor(),
+                    })
+            {
                 self.selected_capture_target_idx = idx;
             }
         }
@@ -1385,6 +1721,12 @@ impl SquadApp {
             initial_volumes: HashMap::new(),
         });
         self.screen = Screen::Room;
+        self.audio.set_streams_active(true);
+        self.audio.set_monitoring_in_settings(false);
+        self.hotkeys.set_active(true);
+        self.ui_sync.in_room.store(true, Ordering::Release);
+        self.ui_sync.in_settings.store(false, Ordering::Release);
+        self.ui_sync.audio_ui_notify.notify_one();
         self.sync_overlay_window()
     }
 
@@ -1395,11 +1737,12 @@ impl SquadApp {
 
         if should_open {
             if self.overlay_window_id.is_some() {
+                self.ui_sync.has_overlay.store(true, Ordering::Release);
                 return Task::none();
             }
             #[allow(unused_mut)]
             let mut settings = iced::window::Settings {
-                size: Size::new(240.0, 420.0),
+                size: Size::new(200.0, 420.0),
                 position: iced::window::Position::SpecificWith(overlay_left_center_position),
                 visible: true,
                 resizable: false,
@@ -1417,10 +1760,15 @@ impl SquadApp {
             }
             let (ov_id, open_task) = iced::window::open(settings);
             self.overlay_window_id = Some(ov_id);
+            self.ui_sync.has_overlay.store(true, Ordering::Release);
+            self.ui_sync.audio_ui_notify.notify_one();
             open_task.map(Message::OverlayWindowOpened)
         } else if let Some(ov_id) = self.overlay_window_id.take() {
+            self.ui_sync.has_overlay.store(false, Ordering::Release);
+            self.ui_sync.audio_ui_notify.notify_one();
             iced::window::close(ov_id)
         } else {
+            self.ui_sync.has_overlay.store(false, Ordering::Release);
             Task::none()
         }
     }
@@ -1548,7 +1896,13 @@ fn read_clipboard_payload(
         .unwrap_or_default()
         .as_millis();
 
-    for &(max_dim, quality) in &[(1920u32, 85u8), (1280, 75), (1024, 58), (800, 45), (640, 35)] {
+    for &(max_dim, quality) in &[
+        (1920u32, 85u8),
+        (1280, 75),
+        (1024, 58),
+        (800, 45),
+        (640, 35),
+    ] {
         if dyn_img.width() > max_dim || dyn_img.height() > max_dim {
             dyn_img = dyn_img.resize(max_dim, max_dim, FilterType::Triangle);
         }
@@ -1578,8 +1932,7 @@ fn copy_encoded_image_to_clipboard(encoded_bytes: &[u8]) -> Result<(), String> {
         .map_err(|e| format!("Failed to decode image for clipboard: {e}"))?;
     let rgba = img.to_rgba8();
     let (width, height) = (rgba.width() as usize, rgba.height() as usize);
-    let mut cb =
-        arboard::Clipboard::new().map_err(|e| format!("Clipboard unavailable: {e}"))?;
+    let mut cb = arboard::Clipboard::new().map_err(|e| format!("Clipboard unavailable: {e}"))?;
     cb.set_image(arboard::ImageData {
         width,
         height,
@@ -1634,5 +1987,227 @@ fn set_window_fullscreen_task(window_id: iced::window::Id, fullscreen: bool) -> 
 }
 
 fn hex_prefix(bytes: &[u8; 4]) -> String {
-    format!("{:02X}{:02X}{:02X}{:02X}", bytes[0], bytes[1], bytes[2], bytes[3])
+    format!(
+        "{:02X}{:02X}{:02X}{:02X}",
+        bytes[0], bytes[1], bytes[2], bytes[3]
+    )
+}
+
+fn listen_normal_event(
+    evt: iced::Event,
+    status: iced::event::Status,
+    _win: iced::window::Id,
+) -> Option<Message> {
+    let iced::Event::Keyboard(keyboard::Event::KeyPressed {
+        key,
+        physical_key,
+        modifiers,
+        ..
+    }) = evt
+    else {
+        return None;
+    };
+
+    let is_c = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("c"))
+        || matches!(
+            physical_key,
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
+        );
+    if modifiers.command() && is_c && status != iced::event::Status::Captured {
+        return Some(Message::CopySelectedChatText);
+    }
+    let is_v = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("v"))
+        || matches!(
+            physical_key,
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyV)
+        );
+    if modifiers.command() && is_v {
+        return Some(Message::PasteFromClipboard {
+            text_input_focused: status == iced::event::Status::Captured,
+        });
+    }
+    let is_f = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("f"))
+        || matches!(
+            physical_key,
+            keyboard::key::Physical::Code(keyboard::key::Code::KeyF)
+        );
+    if status != iced::event::Status::Captured
+        && !modifiers.command()
+        && !modifiers.control()
+        && !modifiers.alt()
+        && is_f
+    {
+        return Some(Message::ToggleStreamFullscreen);
+    }
+    if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+        return Some(Message::EscapePressed);
+    }
+    None
+}
+
+fn listen_recording_event(
+    evt: iced::Event,
+    _status: iced::event::Status,
+    _win: iced::window::Id,
+) -> Option<Message> {
+    match evt {
+        iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key, physical_key, ..
+        }) => {
+            if matches!(key, keyboard::Key::Named(keyboard::key::Named::Escape)) {
+                return Some(Message::CancelRecordingHotkey);
+            }
+            let name = iced_key_to_hotkey_name(&key, physical_key)?;
+            if is_supported_hotkey_name(&name) {
+                Some(Message::RecordedHotkeyInput(name))
+            } else {
+                None
+            }
+        }
+        iced::Event::Mouse(mouse::Event::ButtonPressed(btn)) => {
+            let name = match btn {
+                mouse::Button::Middle => Some("Mouse3"),
+                mouse::Button::Back | mouse::Button::Other(4) => Some("Mouse4"),
+                mouse::Button::Forward | mouse::Button::Other(5) => Some("Mouse5"),
+                _ => None,
+            }?;
+            if is_supported_hotkey_name(name) {
+                Some(Message::RecordedHotkeyInput(name.to_string()))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn iced_key_to_hotkey_name(
+    key: &keyboard::Key,
+    physical_key: keyboard::key::Physical,
+) -> Option<String> {
+    use keyboard::key::{Code, Named, Physical};
+    if let Physical::Code(code) = physical_key {
+        let mapped = match code {
+            Code::KeyA => Some("KeyA"),
+            Code::KeyB => Some("KeyB"),
+            Code::KeyC => Some("KeyC"),
+            Code::KeyD => Some("KeyD"),
+            Code::KeyE => Some("KeyE"),
+            Code::KeyF => Some("KeyF"),
+            Code::KeyG => Some("KeyG"),
+            Code::KeyH => Some("KeyH"),
+            Code::KeyI => Some("KeyI"),
+            Code::KeyJ => Some("KeyJ"),
+            Code::KeyK => Some("KeyK"),
+            Code::KeyL => Some("KeyL"),
+            Code::KeyM => Some("KeyM"),
+            Code::KeyN => Some("KeyN"),
+            Code::KeyO => Some("KeyO"),
+            Code::KeyP => Some("KeyP"),
+            Code::KeyQ => Some("KeyQ"),
+            Code::KeyR => Some("KeyR"),
+            Code::KeyS => Some("KeyS"),
+            Code::KeyT => Some("KeyT"),
+            Code::KeyU => Some("KeyU"),
+            Code::KeyV => Some("KeyV"),
+            Code::KeyW => Some("KeyW"),
+            Code::KeyX => Some("KeyX"),
+            Code::KeyY => Some("KeyY"),
+            Code::KeyZ => Some("KeyZ"),
+            Code::Digit0 => Some("Digit0"),
+            Code::Digit1 => Some("Digit1"),
+            Code::Digit2 => Some("Digit2"),
+            Code::Digit3 => Some("Digit3"),
+            Code::Digit4 => Some("Digit4"),
+            Code::Digit5 => Some("Digit5"),
+            Code::Digit6 => Some("Digit6"),
+            Code::Digit7 => Some("Digit7"),
+            Code::Digit8 => Some("Digit8"),
+            Code::Digit9 => Some("Digit9"),
+            Code::F1 => Some("F1"),
+            Code::F2 => Some("F2"),
+            Code::F3 => Some("F3"),
+            Code::F4 => Some("F4"),
+            Code::F5 => Some("F5"),
+            Code::F6 => Some("F6"),
+            Code::F7 => Some("F7"),
+            Code::F8 => Some("F8"),
+            Code::F9 => Some("F9"),
+            Code::F10 => Some("F10"),
+            Code::F11 => Some("F11"),
+            Code::F12 => Some("F12"),
+            Code::Space => Some("Space"),
+            Code::Tab => Some("Tab"),
+            Code::Enter => Some("Enter"),
+            Code::Backspace => Some("Backspace"),
+            Code::Delete => Some("Delete"),
+            Code::Insert => Some("Insert"),
+            Code::Home => Some("Home"),
+            Code::End => Some("End"),
+            Code::PageUp => Some("PageUp"),
+            Code::PageDown => Some("PageDown"),
+            Code::ArrowUp => Some("ArrowUp"),
+            Code::ArrowDown => Some("ArrowDown"),
+            Code::ArrowLeft => Some("ArrowLeft"),
+            Code::ArrowRight => Some("ArrowRight"),
+            Code::CapsLock => Some("CapsLock"),
+            Code::ShiftLeft => Some("LShift"),
+            Code::ShiftRight => Some("RShift"),
+            Code::ControlLeft => Some("LCtrl"),
+            Code::ControlRight => Some("RCtrl"),
+            Code::AltLeft => Some("LAlt"),
+            Code::AltRight => Some("RAlt"),
+            Code::SuperLeft => Some("MetaLeft"),
+            Code::SuperRight => Some("MetaRight"),
+            Code::Backquote => Some("Backquote"),
+            Code::Minus => Some("Minus"),
+            Code::Equal => Some("Equal"),
+            Code::BracketLeft => Some("BracketLeft"),
+            Code::BracketRight => Some("BracketRight"),
+            Code::Backslash => Some("Backslash"),
+            Code::Semicolon => Some("Semicolon"),
+            Code::Quote => Some("Quote"),
+            Code::Comma => Some("Comma"),
+            Code::Period => Some("Period"),
+            Code::Slash => Some("Slash"),
+            _ => None,
+        };
+        if let Some(name) = mapped {
+            return Some(name.to_string());
+        }
+    }
+
+    match key {
+        keyboard::Key::Named(Named::CapsLock) => Some("CapsLock".to_string()),
+        keyboard::Key::Named(Named::Space) => Some("Space".to_string()),
+        keyboard::Key::Named(Named::Tab) => Some("Tab".to_string()),
+        keyboard::Key::Named(Named::Enter) => Some("Enter".to_string()),
+        keyboard::Key::Named(Named::Backspace) => Some("Backspace".to_string()),
+        keyboard::Key::Named(Named::Delete) => Some("Delete".to_string()),
+        keyboard::Key::Named(Named::Insert) => Some("Insert".to_string()),
+        keyboard::Key::Named(Named::Home) => Some("Home".to_string()),
+        keyboard::Key::Named(Named::End) => Some("End".to_string()),
+        keyboard::Key::Named(Named::PageUp) => Some("PageUp".to_string()),
+        keyboard::Key::Named(Named::PageDown) => Some("PageDown".to_string()),
+        keyboard::Key::Named(Named::ArrowUp) => Some("ArrowUp".to_string()),
+        keyboard::Key::Named(Named::ArrowDown) => Some("ArrowDown".to_string()),
+        keyboard::Key::Named(Named::ArrowLeft) => Some("ArrowLeft".to_string()),
+        keyboard::Key::Named(Named::ArrowRight) => Some("ArrowRight".to_string()),
+        keyboard::Key::Named(Named::F1) => Some("F1".to_string()),
+        keyboard::Key::Named(Named::F2) => Some("F2".to_string()),
+        keyboard::Key::Named(Named::F3) => Some("F3".to_string()),
+        keyboard::Key::Named(Named::F4) => Some("F4".to_string()),
+        keyboard::Key::Named(Named::F5) => Some("F5".to_string()),
+        keyboard::Key::Named(Named::F6) => Some("F6".to_string()),
+        keyboard::Key::Named(Named::F7) => Some("F7".to_string()),
+        keyboard::Key::Named(Named::F8) => Some("F8".to_string()),
+        keyboard::Key::Named(Named::F9) => Some("F9".to_string()),
+        keyboard::Key::Named(Named::F10) => Some("F10".to_string()),
+        keyboard::Key::Named(Named::F11) => Some("F11".to_string()),
+        keyboard::Key::Named(Named::F12) => Some("F12".to_string()),
+        keyboard::Key::Named(Named::Shift) => Some("Shift".to_string()),
+        keyboard::Key::Named(Named::Control) => Some("Ctrl".to_string()),
+        keyboard::Key::Named(Named::Alt) => Some("Alt".to_string()),
+        _ => None,
+    }
 }
