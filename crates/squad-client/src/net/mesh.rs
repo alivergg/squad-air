@@ -2015,7 +2015,8 @@ async fn handle_p2p_rx(
         return;
     }
 
-    if matches!(relay_source, Some(RelaySource::Server)) && !header.msg_type.is_server_relay_allowed()
+    if matches!(relay_source, Some(RelaySource::Server))
+        && !header.msg_type.is_server_relay_allowed()
     {
         return;
     }
@@ -2064,7 +2065,8 @@ async fn handle_p2p_rx(
             }
             Some(RelaySource::PeerMesh(b_pid)) => {
                 if peer.status != PeerConnStatus::Connected {
-                    if peer.status != PeerConnStatus::MeshRelayed || peer.mesh_relay_peer != Some(b_pid)
+                    if peer.status != PeerConnStatus::MeshRelayed
+                        || peer.mesh_relay_peer != Some(b_pid)
                     {
                         info!(
                             "Peer-Mesh relay path active with peer #{} ({}) via teammate #{}",
@@ -2592,7 +2594,8 @@ async fn broadcast_mesh_reachability_if_needed(
     direct_peers.sort_unstable();
 
     let changed = direct_peers != sess.last_advertised_direct_peers;
-    let periodic_due = periodic && sess.last_mesh_reachability_sent.elapsed() >= MESH_REACHABILITY_INTERVAL;
+    let periodic_due =
+        periodic && sess.last_mesh_reachability_sent.elapsed() >= MESH_REACHABILITY_INTERVAL;
     if !changed && !periodic_due {
         return;
     }
@@ -2643,10 +2646,8 @@ async fn reconcile_mesh_routes(
     let peer_ids: Vec<PeerId> = sess.peers.keys().copied().collect();
 
     for pid in peer_ids {
-        let Some((status, current_relay)) = sess
-            .peers
-            .get(&pid)
-            .map(|p| (p.status, p.mesh_relay_peer))
+        let Some((status, current_relay)) =
+            sess.peers.get(&pid).map(|p| (p.status, p.mesh_relay_peer))
         else {
             continue;
         };
@@ -2705,8 +2706,7 @@ async fn reconcile_mesh_routes(
             now_us,
             seal_buf,
         ) {
-            send_sealed_to_peer(socket, sess, pid, P2pMsgType::PunchSyn, seal_buf, relay_buf)
-                .await;
+            send_sealed_to_peer(socket, sess, pid, P2pMsgType::PunchSyn, seal_buf, relay_buf).await;
         }
     }
 
@@ -3120,14 +3120,7 @@ async fn send_stream_announce_to_endpoint(
         encoder_backend,
     };
     if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
-        send_sealed_to_endpoint(
-            socket,
-            dst,
-            P2pMsgType::StreamAnnounce,
-            seal_buf,
-            relay_buf,
-        )
-        .await;
+        send_sealed_to_endpoint(socket, dst, P2pMsgType::StreamAnnounce, seal_buf, relay_buf).await;
     }
 }
 
@@ -3641,7 +3634,11 @@ mod tests {
             }
         };
 
-        let mk_peer = |pid: PeerId, uuid_b: u8, nick: &str, status: PeerConnStatus, addr: Option<SocketAddr>| {
+        let mk_peer = |pid: PeerId,
+                       uuid_b: u8,
+                       nick: &str,
+                       status: PeerConnStatus,
+                       addr: Option<SocketAddr>| {
             let now = Instant::now();
             RemotePeerState {
                 record: PeerRecord {
@@ -3674,20 +3671,44 @@ mod tests {
         let mut sess_c = mk_sess(0xC3, 3, "Charlie");
 
         // Priority 1: B sees both A and C directly; A and C cannot see each other directly (stuck on Relayed).
-        sess_a.peers.insert(2, mk_peer(2, 0xB2, "Bravo", PeerConnStatus::Connected, Some(addr_b)));
-        sess_a.peers.insert(3, mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Relayed, None));
+        sess_a.peers.insert(
+            2,
+            mk_peer(2, 0xB2, "Bravo", PeerConnStatus::Connected, Some(addr_b)),
+        );
+        sess_a.peers.insert(
+            3,
+            mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Relayed, None),
+        );
 
-        sess_b.peers.insert(1, mk_peer(1, 0xA1, "Alice", PeerConnStatus::Connected, Some(addr_a)));
-        sess_b.peers.insert(3, mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Connected, Some(addr_c)));
+        sess_b.peers.insert(
+            1,
+            mk_peer(1, 0xA1, "Alice", PeerConnStatus::Connected, Some(addr_a)),
+        );
+        sess_b.peers.insert(
+            3,
+            mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Connected, Some(addr_c)),
+        );
 
-        sess_c.peers.insert(1, mk_peer(1, 0xA1, "Alice", PeerConnStatus::Relayed, None));
-        sess_c.peers.insert(2, mk_peer(2, 0xB2, "Bravo", PeerConnStatus::Connected, Some(addr_b)));
+        sess_c
+            .peers
+            .insert(1, mk_peer(1, 0xA1, "Alice", PeerConnStatus::Relayed, None));
+        sess_c.peers.insert(
+            2,
+            mk_peer(2, 0xB2, "Bravo", PeerConnStatus::Connected, Some(addr_b)),
+        );
 
         let mut seal_buf = Vec::new();
         let mut relay_buf = Vec::new();
 
         // 1. B advertises its direct peers [1, 3] to A and C.
-        broadcast_mesh_reachability_if_needed(&sock_b, &mut sess_b, &mut seal_buf, &mut relay_buf, false).await;
+        broadcast_mesh_reachability_if_needed(
+            &sock_b,
+            &mut sess_b,
+            &mut seal_buf,
+            &mut relay_buf,
+            false,
+        )
+        .await;
 
         let (tr_tx_a, _tr_rx_a) = mpsc::channel(16);
         let (tr_tx_b, _tr_rx_b) = mpsc::channel(16);
@@ -3695,18 +3716,39 @@ mod tests {
         let (raw_evt_a, _evt_rx_a) = mpsc::channel(32);
         let (raw_evt_b, _evt_rx_b) = mpsc::channel(32);
         let (raw_evt_c, mut evt_rx_c) = mpsc::channel(32);
-        let evt_a = NotifyingEventTx { tx: raw_evt_a, notify: Arc::new(Notify::new()) };
-        let evt_b = NotifyingEventTx { tx: raw_evt_b, notify: Arc::new(Notify::new()) };
-        let evt_c = NotifyingEventTx { tx: raw_evt_c, notify: Arc::new(Notify::new()) };
+        let evt_a = NotifyingEventTx {
+            tx: raw_evt_a,
+            notify: Arc::new(Notify::new()),
+        };
+        let evt_b = NotifyingEventTx {
+            tx: raw_evt_b,
+            notify: Arc::new(Notify::new()),
+        };
+        let evt_c = NotifyingEventTx {
+            tx: raw_evt_c,
+            notify: Arc::new(Notify::new()),
+        };
         let (vtx_a, _vrx_a) = mpsc::channel(4);
         let (vtx_b, _vrx_b) = mpsc::channel(4);
         let (vtx_c, _vrx_c) = mpsc::channel(4);
         let (dtx_a, _drx_a) = std::sync::mpsc::sync_channel(4);
         let (dtx_b, _drx_b) = std::sync::mpsc::sync_channel(4);
         let (dtx_c, _drx_c) = std::sync::mpsc::sync_channel(4);
-        let dec_a = VideoDecodeHandle { tx: dtx_a, generation: Arc::new(AtomicU64::new(0)), shrink_pending: Arc::new(AtomicBool::new(false)) };
-        let dec_b = VideoDecodeHandle { tx: dtx_b, generation: Arc::new(AtomicU64::new(0)), shrink_pending: Arc::new(AtomicBool::new(false)) };
-        let dec_c = VideoDecodeHandle { tx: dtx_c, generation: Arc::new(AtomicU64::new(0)), shrink_pending: Arc::new(AtomicBool::new(false)) };
+        let dec_a = VideoDecodeHandle {
+            tx: dtx_a,
+            generation: Arc::new(AtomicU64::new(0)),
+            shrink_pending: Arc::new(AtomicBool::new(false)),
+        };
+        let dec_b = VideoDecodeHandle {
+            tx: dtx_b,
+            generation: Arc::new(AtomicU64::new(0)),
+            shrink_pending: Arc::new(AtomicBool::new(false)),
+        };
+        let dec_c = VideoDecodeHandle {
+            tx: dtx_c,
+            generation: Arc::new(AtomicU64::new(0)),
+            shrink_pending: Arc::new(AtomicBool::new(false)),
+        };
         let slot_a = Arc::new(Mutex::new(None));
         let slot_b = Arc::new(Mutex::new(None));
         let slot_c = Arc::new(Mutex::new(None));
@@ -3720,13 +3762,36 @@ mod tests {
         // A and C receive B's MeshReachability -> both promote A<->C to Priority 2 (MeshRelayed via B).
         let mut buf = vec![0u8; MAX_RELAY_UDP_PAYLOAD + 64];
         for (sock, sess, aud, tr_tx, evt_tx, cap, vtx, slot, vnot, dec) in [
-            (&sock_a, &mut sess_a, &aud_a, &tr_tx_a, &evt_a, &mut cap_a, &vtx_a, &slot_a, &vnot_a, &dec_a),
-            (&sock_c, &mut sess_c, &aud_c, &tr_tx_c, &evt_c, &mut cap_c, &vtx_c, &slot_c, &vnot_c, &dec_c),
+            (
+                &sock_a,
+                &mut sess_a,
+                &aud_a,
+                &tr_tx_a,
+                &evt_a,
+                &mut cap_a,
+                &vtx_a,
+                &slot_a,
+                &vnot_a,
+                &dec_a,
+            ),
+            (
+                &sock_c,
+                &mut sess_c,
+                &aud_c,
+                &tr_tx_c,
+                &evt_c,
+                &mut cap_c,
+                &vtx_c,
+                &slot_c,
+                &vnot_c,
+                &dec_c,
+            ),
         ] {
-            let (len, from) = tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
+            let (len, from) =
+                tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
             let mut sb = Vec::new();
             let mut rb = Vec::new();
             let mut ctx = MeshRxCtx {
@@ -3746,9 +3811,15 @@ mod tests {
             handle_p2p_rx(sock, &mut buf[..len], from, None, None, sess, &mut ctx).await;
         }
 
-        assert_eq!(sess_a.peers.get(&3).unwrap().status, PeerConnStatus::MeshRelayed);
+        assert_eq!(
+            sess_a.peers.get(&3).unwrap().status,
+            PeerConnStatus::MeshRelayed
+        );
         assert_eq!(sess_a.peers.get(&3).unwrap().mesh_relay_peer, Some(2));
-        assert_eq!(sess_c.peers.get(&1).unwrap().status, PeerConnStatus::MeshRelayed);
+        assert_eq!(
+            sess_c.peers.get(&1).unwrap().status,
+            PeerConnStatus::MeshRelayed
+        );
         assert_eq!(sess_c.peers.get(&1).unwrap().mesh_relay_peer, Some(2));
 
         // 2. A sends a VideoFrameFrag to C -> must traverse B via OPCODE_PEER_RELAY (0 bytes to rv_sock!).
@@ -3767,8 +3838,19 @@ mod tests {
             flags: squad_proto::VIDEO_FLAG_KEYFRAME,
             data: vec![0x7E; 64],
         };
-        sess_a.cipher.seal_packet(&vid_hdr, &vid_payload, &mut seal_buf).unwrap();
-        send_sealed_to_peer(&sock_a, &sess_a, 3, P2pMsgType::VideoFrameFrag, &seal_buf, &mut relay_buf).await;
+        sess_a
+            .cipher
+            .seal_packet(&vid_hdr, &vid_payload, &mut seal_buf)
+            .unwrap();
+        send_sealed_to_peer(
+            &sock_a,
+            &sess_a,
+            3,
+            P2pMsgType::VideoFrameFrag,
+            &seal_buf,
+            &mut relay_buf,
+        )
+        .await;
 
         // B forwards all queued OPCODE_PEER_RELAY datagrams (PunchSyn + VideoFrameFrag) without decrypting.
         while let Ok(Ok((len_b, from_b))) =
@@ -3839,9 +3921,19 @@ mod tests {
 
         // 3. B disconnects -> C degrades to Priority 3 Server Relay; video watch stops and video sends are blocked.
         sess_c.peers.remove(&2);
-        let degraded = reconcile_mesh_routes(&sock_c, &mut sess_c, &mut seal_buf, &mut relay_buf, Instant::now()).await;
+        let degraded = reconcile_mesh_routes(
+            &sock_c,
+            &mut sess_c,
+            &mut seal_buf,
+            &mut relay_buf,
+            Instant::now(),
+        )
+        .await;
         assert_eq!(degraded, vec![1]);
-        assert_eq!(sess_c.peers.get(&1).unwrap().status, PeerConnStatus::Relayed);
+        assert_eq!(
+            sess_c.peers.get(&1).unwrap().status,
+            PeerConnStatus::Relayed
+        );
         enforce_video_route_policy(
             &mut sess_c,
             &degraded,
@@ -3859,7 +3951,15 @@ mod tests {
 
         // Attempting to send VideoFrameFrag while in Server Relay must send nothing to rv_sock,
         // whereas AudioOpus must be sent via Server Relay.
-        send_sealed_to_peer(&sock_c, &sess_c, 1, P2pMsgType::VideoFrameFrag, &seal_buf, &mut relay_buf).await;
+        send_sealed_to_peer(
+            &sock_c,
+            &sess_c,
+            1,
+            P2pMsgType::VideoFrameFrag,
+            &seal_buf,
+            &mut relay_buf,
+        )
+        .await;
         assert!(rv_sock.try_recv_from(&mut buf).is_err());
 
         let aud_hdr = P2pHeader {
@@ -3870,13 +3970,28 @@ mod tests {
         };
         sess_c
             .cipher
-            .seal_packet(&aud_hdr, &P2pPayload::AudioOpus { opus_data: vec![1, 2, 3] }, &mut seal_buf)
+            .seal_packet(
+                &aud_hdr,
+                &P2pPayload::AudioOpus {
+                    opus_data: vec![1, 2, 3],
+                },
+                &mut seal_buf,
+            )
             .unwrap();
-        send_sealed_to_peer(&sock_c, &sess_c, 1, P2pMsgType::AudioOpus, &seal_buf, &mut relay_buf).await;
-        let (srv_len, _) = tokio::time::timeout(Duration::from_secs(1), rv_sock.recv_from(&mut buf))
-            .await
-            .unwrap()
-            .unwrap();
+        send_sealed_to_peer(
+            &sock_c,
+            &sess_c,
+            1,
+            P2pMsgType::AudioOpus,
+            &seal_buf,
+            &mut relay_buf,
+        )
+        .await;
+        let (srv_len, _) =
+            tokio::time::timeout(Duration::from_secs(1), rv_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
         assert!(is_relay_datagram(&buf[..srv_len]));
 
         aud_a.shutdown();

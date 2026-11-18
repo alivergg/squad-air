@@ -530,7 +530,12 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
     }
 
     default_cfg
-        .map(|c| (c.sample_rate().0.clamp(8_000, 192_000), (c.channels() as usize).max(1)))
+        .map(|c| {
+            (
+                c.sample_rate().0.clamp(8_000, 192_000),
+                (c.channels() as usize).max(1),
+            )
+        })
         .unwrap_or((SAMPLE_RATE, if is_input { 1 } else { 2 }))
 }
 

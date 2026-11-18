@@ -22,10 +22,7 @@ pub struct RendezvousConfig {
     pub enable_relay: bool,
 }
 
-pub async fn run_server(
-    socket: Arc<UdpSocket>,
-    shutdown_rx: watch::Receiver<bool>,
-) -> Result<()> {
+pub async fn run_server(socket: Arc<UdpSocket>, shutdown_rx: watch::Receiver<bool>) -> Result<()> {
     run_server_with_config(socket, RendezvousConfig::default(), shutdown_rx).await
 }
 
@@ -88,7 +85,14 @@ pub async fn handle_datagram(
     datagram: &mut [u8],
     src_addr: SocketAddr,
 ) {
-    handle_datagram_with_config(socket, state, RendezvousConfig::default(), datagram, src_addr).await;
+    handle_datagram_with_config(
+        socket,
+        state,
+        RendezvousConfig::default(),
+        datagram,
+        src_addr,
+    )
+    .await;
 }
 
 pub async fn handle_datagram_with_config(

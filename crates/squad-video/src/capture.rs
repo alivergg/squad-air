@@ -252,6 +252,7 @@ pub fn request_screen_capture_permission() {
 }
 
 pub struct ScreenCapturer {
+    #[cfg_attr(not(any(target_os = "macos", target_os = "windows")), allow(dead_code))]
     config: StreamConfig,
     out_width: u32,
     out_height: u32,
@@ -910,8 +911,7 @@ mod windows_impl {
         };
 
         let mut bits_ptr: *mut c_void = std::ptr::null_mut();
-        let Ok(dib) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
-        else {
+        let Ok(dib) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) else {
             let _ = DeleteDC(mem_dc);
             return None;
         };

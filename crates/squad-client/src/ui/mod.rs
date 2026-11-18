@@ -1316,8 +1316,8 @@ impl SquadApp {
             }
             Message::SaveImageAs(blob_id) => {
                 if let Some((filename, raw)) = self.inline_image_bytes.get(&blob_id).cloned() {
-                    let safe_name = squad_proto::sanitize_display_str(&filename, 128)
-                        .replace(['/', '\\'], "_");
+                    let safe_name =
+                        squad_proto::sanitize_display_str(&filename, 128).replace(['/', '\\'], "_");
                     let safe_name = if safe_name.is_empty() || safe_name == "." || safe_name == ".."
                     {
                         "image.png".to_string()

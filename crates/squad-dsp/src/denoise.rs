@@ -62,8 +62,7 @@ impl NoiseSuppressor {
     fn try_load_df3_model() -> Option<TractRunnable> {
         const MAX_DF3_MODEL_BYTES: u64 = 64 * 1024 * 1024;
         for path in Self::candidate_model_paths() {
-            if std::fs::metadata(&path)
-                .is_ok_and(|m| m.is_file() && m.len() <= MAX_DF3_MODEL_BYTES)
+            if std::fs::metadata(&path).is_ok_and(|m| m.is_file() && m.len() <= MAX_DF3_MODEL_BYTES)
             {
                 match Self::load_onnx(&path) {
                     Ok(plan) => {

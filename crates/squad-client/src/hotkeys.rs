@@ -225,9 +225,7 @@ fn is_input_pressed(input: PhysicalInput) -> bool {
     {
         match input {
             PhysicalInput::MacKey(kc) => unsafe { CGEventSourceKeyState(1, kc) != 0 },
-            PhysicalInput::MacMouseButton(btn) => unsafe {
-                CGEventSourceButtonState(1, btn) != 0
-            },
+            PhysicalInput::MacMouseButton(btn) => unsafe { CGEventSourceButtonState(1, btn) != 0 },
             PhysicalInput::Shift => unsafe {
                 CGEventSourceKeyState(1, 0x38) != 0 || CGEventSourceKeyState(1, 0x3C) != 0
             },

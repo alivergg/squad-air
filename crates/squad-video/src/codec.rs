@@ -797,7 +797,9 @@ impl H264Decoder {
 
         let strip_rgb: Vec<u8> = match mode {
             P_MODE_DEFLATE_TILES => {
-                let Some(expected) = strip_w.checked_mul(strip_h).and_then(|px| px.checked_mul(3))
+                let Some(expected) = strip_w
+                    .checked_mul(strip_h)
+                    .and_then(|px| px.checked_mul(3))
                 else {
                     return false;
                 };

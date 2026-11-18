@@ -531,8 +531,7 @@ impl SwarmChatManager {
         if self.seen_messages.len() >= MAX_SEEN_MESSAGES {
             self.seen_messages.clear();
             for entry in &self.history {
-                self.seen_messages
-                    .insert((entry.sender_uuid, entry.msg_id));
+                self.seen_messages.insert((entry.sender_uuid, entry.msg_id));
             }
         }
         self.seen_messages.insert(key)
@@ -2298,7 +2297,11 @@ fn sanitize_filename(raw: &str) -> String {
     if trimmed.is_empty() {
         return "received_file".to_string();
     }
-    let stem = trimmed.split('.').next().unwrap_or(trimmed).trim_end_matches(' ');
+    let stem = trimmed
+        .split('.')
+        .next()
+        .unwrap_or(trimmed)
+        .trim_end_matches(' ');
     if is_windows_reserved_stem(stem) {
         format!("file_{trimmed}")
     } else {
@@ -3295,7 +3298,10 @@ mod tests {
         assert_eq!(idx, "\"hello\\éworld\"".len());
 
         let mut idx = 0;
-        assert_eq!(parse_json_string("\"\\🦀\"", &mut idx).as_deref(), Some("🦀"));
+        assert_eq!(
+            parse_json_string("\"\\🦀\"", &mut idx).as_deref(),
+            Some("🦀")
+        );
         assert_eq!(idx, "\"\\🦀\"".len());
 
         let mut idx = 0;

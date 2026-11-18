@@ -33,12 +33,8 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    squad_rendezvous::run_server_with_config(
-        socket,
-        RendezvousConfig { enable_relay },
-        shutdown_rx,
-    )
-    .await
+    squad_rendezvous::run_server_with_config(socket, RendezvousConfig { enable_relay }, shutdown_rx)
+        .await
 }
 
 async fn wait_for_shutdown_signal() {
