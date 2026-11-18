@@ -24,6 +24,7 @@ pub const MAX_RELAY_UDP_PAYLOAD: usize = MAX_UDP_PAYLOAD + RELAY_HEADER_LEN;
 pub const LAN_DISCOVERY_PORT: u16 = 3479;
 pub const OPCODE_LAN_ANNOUNCE: u8 = 0x06;
 pub const OPCODE_LAN_GOODBYE: u8 = 0x07;
+pub const OPCODE_PEER_RELAY: u8 = 0x08;
 pub const MAX_LAN_ROOM_NAME_LEN: usize = 48;
 
 pub type RoomId = [u8; 16];
@@ -360,16 +361,15 @@ impl SignalingPacket {
 }
 
 #[inline]
-pub fn is_relay_datagram(datagram: &[u8]) -> bool {
+fn is_envelope_datagram(datagram: &[u8], opcode: u8) -> bool {
     datagram.len() >= RELAY_HEADER_LEN + P2P_HEADER_LEN
         && datagram[0..2] == MAGIC
         && datagram[2] == PROTO_VERSION
-        && datagram[3] == OPCODE_RELAY
+        && datagram[3] == opcode
 }
 
-/// Wraps an already-sealed P2P datagram into a 22-byte relay envelope:
-/// `[MAGIC(2), PROTO_VERSION(1), OPCODE_RELAY(1), room_id(16), peer_id(2)]`.
-pub fn encode_relay_datagram_into(
+fn encode_envelope_into(
+    opcode: u8,
     room_id: &RoomId,
     peer_id: PeerId,
     inner_p2p: &[u8],
@@ -390,14 +390,17 @@ pub fn encode_relay_datagram_into(
     out.reserve(RELAY_HEADER_LEN + inner_p2p.len());
     out.extend_from_slice(&MAGIC);
     out.push(PROTO_VERSION);
-    out.push(OPCODE_RELAY);
+    out.push(opcode);
     out.extend_from_slice(room_id);
     out.extend_from_slice(&peer_id.to_be_bytes());
     out.extend_from_slice(inner_p2p);
     Ok(())
 }
 
-pub fn parse_relay_header(datagram: &[u8]) -> Result<(RoomId, PeerId, &[u8]), ProtoError> {
+fn parse_envelope_header(
+    datagram: &[u8],
+    opcode: u8,
+) -> Result<(RoomId, PeerId, &[u8]), ProtoError> {
     if datagram.len() < RELAY_HEADER_LEN + P2P_HEADER_LEN {
         return Err(ProtoError::PacketTooShort {
             expected: RELAY_HEADER_LEN + P2P_HEADER_LEN,
@@ -407,13 +410,52 @@ pub fn parse_relay_header(datagram: &[u8]) -> Result<(RoomId, PeerId, &[u8]), Pr
     if datagram.len() > MAX_RELAY_UDP_PAYLOAD {
         return Err(ProtoError::PacketTooLarge(datagram.len()));
     }
-    if datagram[0..2] != MAGIC || datagram[2] != PROTO_VERSION || datagram[3] != OPCODE_RELAY {
+    if datagram[0..2] != MAGIC || datagram[2] != PROTO_VERSION || datagram[3] != opcode {
         return Err(ProtoError::InvalidHeader);
     }
     let mut room_id = [0u8; 16];
     room_id.copy_from_slice(&datagram[4..20]);
     let peer_id = u16::from_be_bytes([datagram[20], datagram[21]]);
     Ok((room_id, peer_id, &datagram[RELAY_HEADER_LEN..]))
+}
+
+#[inline]
+pub fn is_relay_datagram(datagram: &[u8]) -> bool {
+    is_envelope_datagram(datagram, OPCODE_RELAY)
+}
+
+#[inline]
+pub fn is_peer_relay_datagram(datagram: &[u8]) -> bool {
+    is_envelope_datagram(datagram, OPCODE_PEER_RELAY)
+}
+
+/// Wraps an already-sealed P2P datagram into a 22-byte relay envelope:
+/// `[MAGIC(2), PROTO_VERSION(1), OPCODE_RELAY(1), room_id(16), peer_id(2)]`.
+pub fn encode_relay_datagram_into(
+    room_id: &RoomId,
+    peer_id: PeerId,
+    inner_p2p: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ProtoError> {
+    encode_envelope_into(OPCODE_RELAY, room_id, peer_id, inner_p2p, out)
+}
+
+/// Wraps an already-sealed P2P datagram into a 22-byte peer-mesh relay envelope (`OPCODE_PEER_RELAY`).
+pub fn encode_peer_relay_datagram_into(
+    room_id: &RoomId,
+    peer_id: PeerId,
+    inner_p2p: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<(), ProtoError> {
+    encode_envelope_into(OPCODE_PEER_RELAY, room_id, peer_id, inner_p2p, out)
+}
+
+pub fn parse_relay_header(datagram: &[u8]) -> Result<(RoomId, PeerId, &[u8]), ProtoError> {
+    parse_envelope_header(datagram, OPCODE_RELAY)
+}
+
+pub fn parse_peer_relay_header(datagram: &[u8]) -> Result<(RoomId, PeerId, &[u8]), ProtoError> {
+    parse_envelope_header(datagram, OPCODE_PEER_RELAY)
 }
 
 #[inline]
@@ -564,6 +606,7 @@ pub enum P2pMsgType {
     Pong = 0x13,
     LanHostMigrate = 0x14,
     LanHostClaim = 0x15,
+    MeshReachability = 0x16,
     AudioOpus = 0x20,
     AudioDtxKeepalive = 0x21,
     ChatText = 0x30,
@@ -591,6 +634,7 @@ impl P2pMsgType {
             0x13 => Ok(Self::Pong),
             0x14 => Ok(Self::LanHostMigrate),
             0x15 => Ok(Self::LanHostClaim),
+            0x16 => Ok(Self::MeshReachability),
             0x20 => Ok(Self::AudioOpus),
             0x21 => Ok(Self::AudioDtxKeepalive),
             0x30 => Ok(Self::ChatText),
@@ -609,6 +653,21 @@ impl P2pMsgType {
             0x55 => Ok(Self::StreamAudioOpus),
             other => Err(ProtoError::UnknownOpcode(other)),
         }
+    }
+
+    /// Returns `true` if this message type is permitted over the central server UDP relay
+    /// (voice, chat, file/avatar transfer, and lightweight signaling/keepalives).
+    /// Heavy screen-share video/stream media is restricted to Direct P2P or Peer-Mesh Relay.
+    #[inline]
+    pub const fn is_server_relay_allowed(self) -> bool {
+        !matches!(
+            self,
+            Self::StreamSubscribe
+                | Self::StreamPli
+                | Self::VideoFrameFrag
+                | Self::StreamDecoderError
+                | Self::StreamAudioOpus
+        )
     }
 }
 
@@ -683,6 +742,9 @@ pub enum P2pPayload {
     LanHostClaim {
         rv_port: u16,
         room_name: String,
+    },
+    MeshReachability {
+        direct_peers: Vec<PeerId>,
     },
     AudioOpus {
         opus_data: Vec<u8>,
@@ -770,6 +832,7 @@ impl P2pPayload {
             P2pPayload::Pong { .. } => P2pMsgType::Pong,
             P2pPayload::LanHostMigrate { .. } => P2pMsgType::LanHostMigrate,
             P2pPayload::LanHostClaim { .. } => P2pMsgType::LanHostClaim,
+            P2pPayload::MeshReachability { .. } => P2pMsgType::MeshReachability,
             P2pPayload::AudioOpus { .. } => P2pMsgType::AudioOpus,
             P2pPayload::AudioDtxKeepalive => P2pMsgType::AudioDtxKeepalive,
             P2pPayload::ChatText { .. } => P2pMsgType::ChatText,
@@ -819,6 +882,13 @@ impl P2pPayload {
                 out.extend_from_slice(&rv_port.to_be_bytes());
                 out.push(name_bytes.len() as u8);
                 out.extend_from_slice(name_bytes);
+            }
+            P2pPayload::MeshReachability { direct_peers } => {
+                let count = direct_peers.len().min(MAX_ROOM_PEERS);
+                out.push(count as u8);
+                for pid in direct_peers.iter().take(count) {
+                    out.extend_from_slice(&pid.to_be_bytes());
+                }
             }
             P2pPayload::AudioOpus { opus_data } => {
                 if opus_data.len() > 1024 {
@@ -1027,6 +1097,20 @@ impl P2pPayload {
                     .map_err(|_| ProtoError::InvalidUtf8)?
                     .to_string();
                 Ok(P2pPayload::LanHostClaim { rv_port, room_name })
+            }
+            P2pMsgType::MeshReachability => {
+                need_bytes(body, 0, 1)?;
+                let count = body[0] as usize;
+                if count > MAX_ROOM_PEERS {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(body, 1, count * 2)?;
+                let mut direct_peers = Vec::with_capacity(count);
+                for i in 0..count {
+                    let off = 1 + i * 2;
+                    direct_peers.push(u16::from_be_bytes([body[off], body[off + 1]]));
+                }
+                Ok(P2pPayload::MeshReachability { direct_peers })
             }
             P2pMsgType::AudioOpus => {
                 need_bytes(body, 0, 2)?;
@@ -1655,5 +1739,53 @@ mod tests {
             assert_eq!(dec_hdr.msg_type, payload.msg_type());
             assert_eq!(dec_payload, payload);
         }
+    }
+
+    #[test]
+    fn test_peer_relay_envelope_mesh_reachability_and_server_policy() {
+        let secret = [0x99u8; 32];
+        let cipher = crate::crypto::RoomCipher::from_secret(&secret);
+        let room_id = [0xCDu8; 16];
+        let room_prefix = [0xCD; 4];
+
+        let reach = P2pPayload::MeshReachability {
+            direct_peers: vec![1, 3, 5],
+        };
+        let hdr = P2pHeader {
+            msg_type: reach.msg_type(),
+            room_prefix,
+            sender_peer_id: 2,
+            seq_num: 17,
+        };
+        let mut inner = Vec::new();
+        cipher.seal_packet(&hdr, &reach, &mut inner).unwrap();
+
+        let mut wire = Vec::new();
+        encode_peer_relay_datagram_into(&room_id, 5, &inner, &mut wire).unwrap();
+        assert!(is_peer_relay_datagram(&wire));
+        assert!(!is_relay_datagram(&wire));
+
+        let (parsed_room, target_pid, parsed_inner) = parse_peer_relay_header(&wire).unwrap();
+        assert_eq!(parsed_room, room_id);
+        assert_eq!(target_pid, 5);
+        assert_eq!(parsed_inner, inner.as_slice());
+
+        rewrite_relay_peer_id(&mut wire, 2);
+        let (_, sender_pid, parsed_inner2) = parse_peer_relay_header(&wire).unwrap();
+        assert_eq!(sender_pid, 2);
+
+        let mut copy = parsed_inner2.to_vec();
+        let (dec_hdr, dec_payload) = cipher.open_packet(&mut copy).unwrap();
+        assert_eq!(dec_hdr, hdr);
+        assert_eq!(dec_payload, reach);
+
+        assert!(P2pMsgType::AudioOpus.is_server_relay_allowed());
+        assert!(P2pMsgType::ChatText.is_server_relay_allowed());
+        assert!(P2pMsgType::MeshReachability.is_server_relay_allowed());
+        assert!(!P2pMsgType::VideoFrameFrag.is_server_relay_allowed());
+        assert!(!P2pMsgType::StreamAudioOpus.is_server_relay_allowed());
+        assert!(!P2pMsgType::StreamSubscribe.is_server_relay_allowed());
+        assert!(!P2pMsgType::StreamPli.is_server_relay_allowed());
+        assert!(!P2pMsgType::StreamDecoderError.is_server_relay_allowed());
     }
 }
