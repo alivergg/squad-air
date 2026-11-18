@@ -6,3 +6,10 @@
 .env
 assets/sounds/*.wav
 assets/models/*.onnx
+.agent/
+.agents/
+skills-lock.json
+DEVELOPMENT.md
+PROJECT_MAP.md
+SPECIFICATION.md
+BUILD_AND_INSTALLERS.md

@@ -185,4 +185,4 @@ cargo test --workspace --locked
   ```bash
   ./scripts/package_linux.sh 1.0
   ```
-- **Automated Multi-Platform Releases:** Every push or merge into `main` automatically runs [`.github/workflows/release.yml`](.github/workflows/release.yml), increments the release tag (`v1.0`, `v1.1`, `v1.2`, ...), builds installers and packages for **macOS ARM64**, **Windows x86_64**, **Ubuntu/Debian**, **Fedora**, **Arch Linux**, and **portable Linux**, and publishes them with `SHA256SUMS.txt` under GitHub Releases. See [`BUILD_AND_INSTALLERS.md`](BUILD_AND_INSTALLERS.md) for details.
+- **Automated Multi-Platform Releases:** Every push or merge into `main` automatically runs [`.github/workflows/release.yml`](.github/workflows/release.yml), increments the release tag (`v1.0`, `v1.1`, `v1.2`, ...), builds installers and packages for **macOS ARM64**, **Windows x86_64**, **Ubuntu/Debian**, **Fedora**, **Arch Linux**, and **portable Linux**, and publishes them with `SHA256SUMS.txt` under GitHub Releases. The desktop client checks `releases/latest` automatically and offers a verified SHA-256 1-click update popup (with skip-version support).
