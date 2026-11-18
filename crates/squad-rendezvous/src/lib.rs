@@ -17,8 +17,21 @@ use tracing::{debug, info, warn};
 pub const DEFAULT_PEER_TTL: Duration = Duration::from_secs(6);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RendezvousConfig {
+    pub enable_relay: bool,
+}
+
 pub async fn run_server(
     socket: Arc<UdpSocket>,
+    shutdown_rx: watch::Receiver<bool>,
+) -> Result<()> {
+    run_server_with_config(socket, RendezvousConfig::default(), shutdown_rx).await
+}
+
+pub async fn run_server_with_config(
+    socket: Arc<UdpSocket>,
+    config: RendezvousConfig,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> Result<()> {
     let state = Arc::new(RendezvousState::new());
@@ -56,7 +69,7 @@ pub async fn run_server(
                         continue;
                     }
                 };
-                handle_datagram(&socket, &state, &mut buf[..len], src_addr).await;
+                handle_datagram_with_config(&socket, &state, config, &mut buf[..len], src_addr).await;
             }
             _ = shutdown_rx.changed() => {
                 info!("Shutting down SquadAir Rendezvous server");
@@ -75,14 +88,30 @@ pub async fn handle_datagram(
     datagram: &mut [u8],
     src_addr: SocketAddr,
 ) {
+    handle_datagram_with_config(socket, state, RendezvousConfig::default(), datagram, src_addr).await;
+}
+
+pub async fn handle_datagram_with_config(
+    socket: &UdpSocket,
+    state: &RendezvousState,
+    config: RendezvousConfig,
+    datagram: &mut [u8],
+    src_addr: SocketAddr,
+) {
     let now = Instant::now();
 
     // Handle zero-amplification relay datagrams before signaling rate-limiting/decoding.
     if is_relay_datagram(datagram) {
+        if !config.enable_relay {
+            return;
+        }
         let Ok((room_id, target_peer_id, inner)) = parse_relay_header(datagram) else {
             return;
         };
-        if P2pHeader::decode(inner).is_err() {
+        let Ok(inner_hdr) = P2pHeader::decode(inner) else {
+            return;
+        };
+        if !inner_hdr.msg_type.is_server_relay_allowed() {
             return;
         }
         if let Some((sender_peer_id, target_addr)) =
@@ -254,7 +283,11 @@ mod tests {
         let server_addr = server_sock.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
-        let srv_task = tokio::spawn(run_server(server_sock, shutdown_rx));
+        let srv_task = tokio::spawn(run_server_with_config(
+            server_sock,
+            RendezvousConfig { enable_relay: true },
+            shutdown_rx,
+        ));
 
         let peer_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -349,6 +382,167 @@ mod tests {
             tokio::time::timeout(silence_window, peer_b.recv_from(&mut recv_buf))
                 .await
                 .is_err()
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = srv_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_relay_disabled_by_default_drops_relay_packets() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let srv_task = tokio::spawn(run_server(server_sock, shutdown_rx));
+
+        let peer_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let room_id = [0xBCu8; 16];
+        let peer_a_id = register_client(&peer_a, server_addr, room_id, [1u8; 16], "Alice").await;
+        let peer_b_id = register_client(&peer_b, server_addr, room_id, [2u8; 16], "Bob").await;
+
+        let mut drain_buf = [0u8; 1200];
+        let _ = tokio::time::timeout(Duration::from_secs(1), peer_a.recv_from(&mut drain_buf))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let cipher = RoomCipher::from_secret(&[0x55u8; 32]);
+        let mut inner = Vec::new();
+        cipher
+            .seal_packet(
+                &P2pHeader {
+                    msg_type: P2pMsgType::AudioOpus,
+                    room_prefix: [0xBC; 4],
+                    sender_peer_id: peer_a_id,
+                    seq_num: 1,
+                },
+                &P2pPayload::AudioOpus {
+                    opus_data: vec![1, 2, 3],
+                },
+                &mut inner,
+            )
+            .unwrap();
+        let mut wire = Vec::new();
+        encode_relay_datagram_into(&room_id, peer_b_id, &inner, &mut wire).unwrap();
+        peer_a.send_to(&wire, server_addr).await.unwrap();
+
+        let mut recv_buf = [0u8; MAX_RELAY_UDP_PAYLOAD + 64];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), peer_b.recv_from(&mut recv_buf))
+                .await
+                .is_err(),
+            "server without --enable-relay must drop all relay datagrams"
+        );
+
+        let _ = shutdown_tx.send(true);
+        let _ = srv_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_relay_with_flag_allows_voice_chat_and_blocks_video() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let srv_task = tokio::spawn(run_server_with_config(
+            server_sock,
+            RendezvousConfig { enable_relay: true },
+            shutdown_rx,
+        ));
+
+        let peer_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let room_id = [0xCDu8; 16];
+        let peer_a_id = register_client(&peer_a, server_addr, room_id, [1u8; 16], "Alice").await;
+        let peer_b_id = register_client(&peer_b, server_addr, room_id, [2u8; 16], "Bob").await;
+
+        let mut drain_buf = [0u8; 1200];
+        let _ = tokio::time::timeout(Duration::from_secs(1), peer_a.recv_from(&mut drain_buf))
+            .await
+            .unwrap()
+            .unwrap();
+
+        let cipher = RoomCipher::from_secret(&[0x55u8; 32]);
+        let mut inner = Vec::new();
+        let mut wire = Vec::new();
+
+        // ChatText must pass through when relay is enabled
+        cipher
+            .seal_packet(
+                &P2pHeader {
+                    msg_type: P2pMsgType::ChatText,
+                    room_prefix: [0xCD; 4],
+                    sender_peer_id: peer_a_id,
+                    seq_num: 1,
+                },
+                &P2pPayload::ChatText {
+                    sender_uuid: [1u8; 16],
+                    sender_nickname: "Alice".into(),
+                    msg_id: 1,
+                    timestamp_ms: 100,
+                    text: "hello over relay".into(),
+                },
+                &mut inner,
+            )
+            .unwrap();
+        encode_relay_datagram_into(&room_id, peer_b_id, &inner, &mut wire).unwrap();
+        peer_a.send_to(&wire, server_addr).await.unwrap();
+
+        let mut recv_buf = [0u8; MAX_RELAY_UDP_PAYLOAD + 64];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), peer_b.recv_from(&mut recv_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        let (_, _, relayed_inner) = parse_relay_header(&recv_buf[..len]).unwrap();
+        let mut inner_copy = relayed_inner.to_vec();
+        let (hdr, _) = cipher.open_packet(&mut inner_copy).unwrap();
+        assert_eq!(hdr.msg_type, P2pMsgType::ChatText);
+
+        // VideoFrameFrag and StreamAudioOpus must be dropped by server relay even when enabled
+        for (seq, payload) in [
+            (
+                2u64,
+                P2pPayload::VideoFrameFrag {
+                    frame_id: 1,
+                    frag_idx: 0,
+                    frag_count: 1,
+                    flags: 1,
+                    data: vec![0xAA; 100],
+                },
+            ),
+            (
+                3u64,
+                P2pPayload::StreamAudioOpus {
+                    opus_data: vec![1, 2, 3, 4],
+                },
+            ),
+            (4u64, P2pPayload::StreamSubscribe { subscribe: true }),
+            (5u64, P2pPayload::StreamPli),
+        ] {
+            cipher
+                .seal_packet(
+                    &P2pHeader {
+                        msg_type: payload.msg_type(),
+                        room_prefix: [0xCD; 4],
+                        sender_peer_id: peer_a_id,
+                        seq_num: seq,
+                    },
+                    &payload,
+                    &mut inner,
+                )
+                .unwrap();
+            encode_relay_datagram_into(&room_id, peer_b_id, &inner, &mut wire).unwrap();
+            peer_a.send_to(&wire, server_addr).await.unwrap();
+        }
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(80), peer_b.recv_from(&mut recv_buf))
+                .await
+                .is_err(),
+            "server relay must block screen-share video/stream traffic"
         );
 
         let _ = shutdown_tx.send(true);

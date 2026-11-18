@@ -1,4 +1,5 @@
 use anyhow::Result;
+use squad_rendezvous::RendezvousConfig;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::watch;
@@ -14,10 +15,16 @@ async fn main() -> Result<()> {
         .init();
 
     let bind_addr = parse_bind_arg().unwrap_or_else(|| "0.0.0.0:3478".to_string());
+    let enable_relay = parse_enable_relay_arg();
     let socket = Arc::new(UdpSocket::bind(&bind_addr).await?);
     info!(
-        "SquadAir Rendezvous server listening on {}",
-        socket.local_addr()?
+        "SquadAir Rendezvous server listening on {} (server relay: {})",
+        socket.local_addr()?,
+        if enable_relay {
+            "enabled for voice & chat; video stream blocked"
+        } else {
+            "disabled (signaling-only; pass --enable-relay to allow voice/chat relay)"
+        }
     );
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -26,7 +33,12 @@ async fn main() -> Result<()> {
         let _ = shutdown_tx.send(true);
     });
 
-    squad_rendezvous::run_server(socket, shutdown_rx).await
+    squad_rendezvous::run_server_with_config(
+        socket,
+        RendezvousConfig { enable_relay },
+        shutdown_rx,
+    )
+    .await
 }
 
 fn parse_bind_arg() -> Option<String> {
@@ -37,4 +49,8 @@ fn parse_bind_arg() -> Option<String> {
         }
     }
     None
+}
+
+fn parse_enable_relay_arg() -> bool {
+    std::env::args().any(|arg| arg == "--enable-relay" || arg == "--relay")
 }
