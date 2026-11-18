@@ -5283,7 +5283,6 @@ dependencies = [
  "bs58",
  "chacha20poly1305",
  "rand 0.8.8",
- "serde",
  "thiserror 2.0.21",
 ]
 

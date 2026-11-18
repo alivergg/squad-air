@@ -2,6 +2,8 @@
 name = "squad-proto"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 thiserror.workspace = true
@@ -9,4 +11,3 @@ rand.workspace = true
 bs58.workspace = true
 blake3.workspace = true
 chacha20poly1305.workspace = true
-serde.workspace = true

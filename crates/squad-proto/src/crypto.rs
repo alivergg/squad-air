@@ -15,11 +15,16 @@ pub struct RoomCipher {
 impl RoomCipher {
     /// Derives a 256-bit AEAD key from the 32-byte room secret using BLAKE3.
     pub fn from_secret(secret: &[u8; 32]) -> Self {
-        let derived = blake3::derive_key(KDF_CONTEXT, secret);
+        let mut derived = blake3::derive_key(KDF_CONTEXT, secret);
         let key = Key::from_slice(&derived);
-        Self {
-            cipher: ChaCha20Poly1305::new(key),
+        let cipher = ChaCha20Poly1305::new(key);
+        for byte in &mut derived {
+            unsafe {
+                std::ptr::write_volatile(byte, 0);
+            }
         }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+        Self { cipher }
     }
 
     /// Constructs the deterministic 96-bit nonce from the packet header:
@@ -54,6 +59,9 @@ impl RoomCipher {
             .map_err(|_| ProtoError::CryptoFailure)?;
 
         out.extend_from_slice(tag.as_slice());
+        if out.len() > crate::packet::MAX_UDP_PAYLOAD {
+            return Err(ProtoError::PacketTooLarge(out.len()));
+        }
         Ok(())
     }
 
@@ -79,6 +87,58 @@ impl RoomCipher {
 
         let payload = P2pPayload::decode_body(header.msg_type, ciphertext)?;
         Ok((header, payload))
+    }
+}
+
+/// 128-packet sliding replay window using a bitmask anchored at `highest_seq`.
+#[derive(Debug, Clone, Default)]
+pub struct ReplayWindow {
+    highest_seq: u64,
+    bitmap: u128,
+    initialized: bool,
+}
+
+impl ReplayWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.highest_seq = 0;
+        self.bitmap = 0;
+        self.initialized = false;
+    }
+
+    pub fn check_and_accept(&mut self, seq_num: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            self.highest_seq = seq_num;
+            self.bitmap = 1;
+            return true;
+        }
+
+        if seq_num > self.highest_seq {
+            let shift = seq_num - self.highest_seq;
+            if shift >= 128 {
+                self.bitmap = 1;
+            } else {
+                self.bitmap = (self.bitmap << shift) | 1;
+            }
+            self.highest_seq = seq_num;
+            return true;
+        }
+
+        let diff = self.highest_seq - seq_num;
+        if diff >= 128 {
+            return false;
+        }
+
+        let mask = 1u128 << diff;
+        if (self.bitmap & mask) != 0 {
+            return false;
+        }
+        self.bitmap |= mask;
+        true
     }
 }
 
@@ -128,5 +188,45 @@ mod tests {
             cipher.open_packet(&mut tampered_ct),
             Err(ProtoError::CryptoFailure)
         ));
+    }
+
+    #[test]
+    fn test_replay_window_ordering_duplicates_and_reset() {
+        let mut window = ReplayWindow::new();
+
+        // In-order acceptance starting at seq 0
+        assert!(window.check_and_accept(0));
+        assert!(window.check_and_accept(1));
+        assert!(window.check_and_accept(2));
+
+        // Duplicates rejected
+        assert!(!window.check_and_accept(2));
+        assert!(!window.check_and_accept(0));
+
+        // Out-of-order within 128-packet window
+        assert!(window.check_and_accept(10));
+        assert!(window.check_and_accept(5));
+        assert!(window.check_and_accept(9));
+        assert!(!window.check_and_accept(5));
+        assert!(!window.check_and_accept(10));
+
+        // Boundary of 128-packet window: highest_seq = 130 => [3..=130]
+        assert!(window.check_and_accept(130));
+        assert!(window.check_and_accept(3));
+        assert!(!window.check_and_accept(3));
+        assert!(!window.check_and_accept(2));
+
+        // Jump >= 128 clears prior window
+        assert!(window.check_and_accept(300));
+        assert!(!window.check_and_accept(172));
+        assert!(window.check_and_accept(173));
+        assert!(!window.check_and_accept(130));
+
+        // Reset allows reusing sequence numbers
+        window.reset();
+        assert!(window.check_and_accept(0));
+        assert!(window.check_and_accept(1));
+        assert!(window.check_and_accept(130));
+        assert!(!window.check_and_accept(130));
     }
 }

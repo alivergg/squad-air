@@ -4,10 +4,30 @@ use rand::RngCore;
 pub const INVITE_SCHEME: &str = "squad://";
 const LEGACY_SCHEME: &str = "voice://";
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct InviteLink {
     pub room_id: RoomId,
     pub secret: [u8; 32],
+}
+
+impl std::fmt::Debug for InviteLink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InviteLink")
+            .field("room_id", &self.room_id)
+            .field("secret", &"[REDACTED]")
+            .finish()
+    }
+}
+
+impl Drop for InviteLink {
+    fn drop(&mut self) {
+        for byte in &mut self.secret {
+            unsafe {
+                std::ptr::write_volatile(byte, 0);
+            }
+        }
+        std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 impl InviteLink {
@@ -31,6 +51,11 @@ impl InviteLink {
     /// Parses `squad://<base58_room_id>#<base58_secret>` (also accepts `voice://`).
     pub fn parse(input: &str) -> Result<Self, ProtoError> {
         let trimmed = input.trim();
+        if trimmed.len() > 256 {
+            return Err(ProtoError::InvalidInvite(
+                "invite URI exceeds maximum length".into(),
+            ));
+        }
         let body = if let Some(rest) = trimmed.strip_prefix(INVITE_SCHEME) {
             rest
         } else if let Some(rest) = trimmed.strip_prefix(LEGACY_SCHEME) {
@@ -44,6 +69,12 @@ impl InviteLink {
         let (room_str, secret_str) = body
             .split_once('#')
             .ok_or_else(|| ProtoError::InvalidInvite("missing '#' secret separator".into()))?;
+
+        if room_str.len() > 64 || secret_str.len() > 64 {
+            return Err(ProtoError::InvalidInvite(
+                "invite component exceeds maximum length".into(),
+            ));
+        }
 
         let room_vec = bs58::decode(room_str)
             .into_vec()
@@ -97,5 +128,19 @@ mod tests {
         assert!(InviteLink::parse("http://bad#link").is_err());
         assert!(InviteLink::parse("squad://no_hash_separator").is_err());
         assert!(InviteLink::parse("squad://1111#2222").is_err());
+
+        let too_long_uri = format!("squad://{}#{}", "1".repeat(250), "2".repeat(10));
+        assert!(InviteLink::parse(&too_long_uri).is_err());
+
+        let too_long_component = format!("squad://{}#2222", "1".repeat(65));
+        assert!(InviteLink::parse(&too_long_component).is_err());
+
+        let invite = InviteLink {
+            room_id: [0x11; 16],
+            secret: [0xAA; 32],
+        };
+        let debug_str = format!("{invite:?}");
+        assert!(debug_str.contains("[REDACTED]"));
+        assert!(!debug_str.contains("170"));
     }
 }

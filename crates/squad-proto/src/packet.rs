@@ -185,6 +185,9 @@ impl SignalingPacket {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, ProtoError> {
+        if data.len() > MAX_UDP_PAYLOAD {
+            return Err(ProtoError::PacketTooLarge(data.len()));
+        }
         if data.len() < 4 {
             return Err(ProtoError::PacketTooShort {
                 expected: 4,
@@ -215,9 +218,9 @@ impl SignalingPacket {
                     return Err(ProtoError::InvalidHeader);
                 }
                 need_bytes(data, cursor, nick_len + 1)?;
-                let nickname = std::str::from_utf8(&data[cursor..cursor + nick_len])
-                    .map_err(|_| ProtoError::InvalidUtf8)?
-                    .to_string();
+                let nickname_raw = std::str::from_utf8(&data[cursor..cursor + nick_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let nickname = sanitize_display_str(nickname_raw, MAX_NICKNAME_LEN);
                 cursor += nick_len;
 
                 let lan_count = data[cursor] as usize;
@@ -320,9 +323,9 @@ impl SignalingPacket {
                         return Err(ProtoError::InvalidHeader);
                     }
                     need_bytes(data, cursor, nick_len)?;
-                    let nickname = std::str::from_utf8(&data[cursor..cursor + nick_len])
-                        .map_err(|_| ProtoError::InvalidUtf8)?
-                        .to_string();
+                    let nickname_raw = std::str::from_utf8(&data[cursor..cursor + nick_len])
+                        .map_err(|_| ProtoError::InvalidUtf8)?;
+                    let nickname = sanitize_display_str(nickname_raw, MAX_NICKNAME_LEN);
                     cursor += nick_len;
 
                     peers.push(PeerRecord {
@@ -465,7 +468,7 @@ pub fn rewrite_relay_peer_id(datagram: &mut [u8], new_peer_id: PeerId) {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum LanDiscoveryPacket {
     /// `0x06` UDP broadcast advertising an open zero-config LAN room.
     Announce {
@@ -479,6 +482,36 @@ pub enum LanDiscoveryPacket {
     },
     /// `0x07` UDP broadcast announcing that a LAN room closed or migrated.
     Goodbye { room_id: RoomId, rv_port: u16 },
+}
+
+impl std::fmt::Debug for LanDiscoveryPacket {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Announce {
+                room_id,
+                secret: _,
+                rv_port,
+                peer_count,
+                max_peers,
+                room_name,
+                host_nickname,
+            } => f
+                .debug_struct("Announce")
+                .field("room_id", room_id)
+                .field("secret", &"[REDACTED]")
+                .field("rv_port", rv_port)
+                .field("peer_count", peer_count)
+                .field("max_peers", max_peers)
+                .field("room_name", room_name)
+                .field("host_nickname", host_nickname)
+                .finish(),
+            Self::Goodbye { room_id, rv_port } => f
+                .debug_struct("Goodbye")
+                .field("room_id", room_id)
+                .field("rv_port", rv_port)
+                .finish(),
+        }
+    }
 }
 
 impl LanDiscoveryPacket {
@@ -526,6 +559,9 @@ impl LanDiscoveryPacket {
     }
 
     pub fn decode(data: &[u8]) -> Result<Self, ProtoError> {
+        if data.len() > MAX_UDP_PAYLOAD {
+            return Err(ProtoError::PacketTooLarge(data.len()));
+        }
         if data.len() < 4 {
             return Err(ProtoError::PacketTooShort {
                 expected: 4,
@@ -560,9 +596,9 @@ impl LanDiscoveryPacket {
                     return Err(ProtoError::InvalidHeader);
                 }
                 need_bytes(data, cursor, name_len + 1)?;
-                let room_name = std::str::from_utf8(&data[cursor..cursor + name_len])
-                    .map_err(|_| ProtoError::InvalidUtf8)?
-                    .to_string();
+                let room_name_raw = std::str::from_utf8(&data[cursor..cursor + name_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let room_name = sanitize_display_str(room_name_raw, MAX_LAN_ROOM_NAME_LEN);
                 cursor += name_len;
 
                 let nick_len = data[cursor] as usize;
@@ -571,9 +607,9 @@ impl LanDiscoveryPacket {
                     return Err(ProtoError::InvalidHeader);
                 }
                 need_bytes(data, cursor, nick_len)?;
-                let host_nickname = std::str::from_utf8(&data[cursor..cursor + nick_len])
-                    .map_err(|_| ProtoError::InvalidUtf8)?
-                    .to_string();
+                let host_nickname_raw = std::str::from_utf8(&data[cursor..cursor + nick_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let host_nickname = sanitize_display_str(host_nickname_raw, MAX_NICKNAME_LEN);
 
                 Ok(LanDiscoveryPacket::Announce {
                     room_id,
@@ -1093,9 +1129,9 @@ impl P2pPayload {
                     return Err(ProtoError::InvalidHeader);
                 }
                 need_bytes(body, 3, name_len)?;
-                let room_name = std::str::from_utf8(&body[3..3 + name_len])
-                    .map_err(|_| ProtoError::InvalidUtf8)?
-                    .to_string();
+                let room_name_raw = std::str::from_utf8(&body[3..3 + name_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let room_name = sanitize_display_str(room_name_raw, MAX_LAN_ROOM_NAME_LEN);
                 Ok(P2pPayload::LanHostClaim { rv_port, room_name })
             }
             P2pMsgType::MeshReachability => {
@@ -1115,6 +1151,9 @@ impl P2pPayload {
             P2pMsgType::AudioOpus => {
                 need_bytes(body, 0, 2)?;
                 let len = u16::from_be_bytes([body[0], body[1]]) as usize;
+                if len > 1024 {
+                    return Err(ProtoError::PacketTooLarge(len));
+                }
                 need_bytes(body, 2, len)?;
                 Ok(P2pPayload::AudioOpus {
                     opus_data: body[2..2 + len].to_vec(),
@@ -1249,19 +1288,20 @@ impl P2pPayload {
                 }
                 need_bytes(body, 9, title_len + 1)?;
                 let title_end = 9 + title_len;
-                let source_title = std::str::from_utf8(&body[9..title_end])
-                    .map_err(|_| ProtoError::InvalidUtf8)?
-                    .to_string();
+                let source_title_raw = std::str::from_utf8(&body[9..title_end])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let source_title = sanitize_display_str(source_title_raw, MAX_STREAM_TITLE_BYTES);
                 let backend_len = body[title_end] as usize;
                 if backend_len > MAX_ENCODER_BACKEND_BYTES {
                     return Err(ProtoError::PacketTooLarge(backend_len));
                 }
                 let backend_start = title_end + 1;
                 need_bytes(body, backend_start, backend_len)?;
-                let encoder_backend =
+                let encoder_backend_raw =
                     std::str::from_utf8(&body[backend_start..backend_start + backend_len])
-                        .map_err(|_| ProtoError::InvalidUtf8)?
-                        .to_string();
+                        .map_err(|_| ProtoError::InvalidUtf8)?;
+                let encoder_backend =
+                    sanitize_display_str(encoder_backend_raw, MAX_ENCODER_BACKEND_BYTES);
                 Ok(P2pPayload::StreamAnnounce {
                     is_streaming,
                     codec,
@@ -1307,9 +1347,9 @@ impl P2pPayload {
                     return Err(ProtoError::PacketTooLarge(reason_len));
                 }
                 need_bytes(body, 2, reason_len)?;
-                let reason = std::str::from_utf8(&body[2..2 + reason_len])
-                    .map_err(|_| ProtoError::InvalidUtf8)?
-                    .to_string();
+                let reason_raw = std::str::from_utf8(&body[2..2 + reason_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let reason = sanitize_display_str(reason_raw, MAX_STREAM_ERROR_BYTES);
                 Ok(P2pPayload::StreamDecoderError {
                     failed_codec,
                     reason,
@@ -1332,9 +1372,10 @@ impl P2pPayload {
 
 #[inline]
 fn need_bytes(buf: &[u8], offset: usize, count: usize) -> Result<(), ProtoError> {
-    if buf.len() < offset + count {
+    let end = offset.checked_add(count).ok_or(ProtoError::InvalidHeader)?;
+    if buf.len() < end {
         Err(ProtoError::PacketTooShort {
-            expected: offset + count,
+            expected: end,
             actual: buf.len(),
         })
     } else {
@@ -1351,10 +1392,30 @@ fn decode_sender_meta(body: &[u8]) -> Result<(ClientUuid, String, usize), ProtoE
         return Err(ProtoError::InvalidHeader);
     }
     need_bytes(body, 17, nick_len)?;
-    let sender_nickname = std::str::from_utf8(&body[17..17 + nick_len])
-        .map_err(|_| ProtoError::InvalidUtf8)?
-        .to_string();
+    let sender_nickname_raw =
+        std::str::from_utf8(&body[17..17 + nick_len]).map_err(|_| ProtoError::InvalidUtf8)?;
+    let sender_nickname = sanitize_display_str(sender_nickname_raw, MAX_NICKNAME_LEN);
     Ok((sender_uuid, sender_nickname, 17 + nick_len))
+}
+
+pub fn sanitize_display_str(raw: &str, max_bytes: usize) -> String {
+    let filtered: String = raw
+        .chars()
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(
+                    c,
+                    '\u{202A}'..='\u{202E}'
+                        | '\u{2066}'..='\u{2069}'
+                        | '\u{200E}'
+                        | '\u{200F}'
+                        | '\u{FEFF}'
+                )
+        })
+        .collect();
+    let trimmed = filtered.trim();
+    let end = truncate_utf8(trimmed, max_bytes).len();
+    trimmed[..end].to_string()
 }
 
 fn truncate_utf8(s: &str, max_bytes: usize) -> &[u8] {
@@ -1787,5 +1848,62 @@ mod tests {
         assert!(!P2pMsgType::StreamSubscribe.is_server_relay_allowed());
         assert!(!P2pMsgType::StreamPli.is_server_relay_allowed());
         assert!(!P2pMsgType::StreamDecoderError.is_server_relay_allowed());
+    }
+
+    #[test]
+    fn test_hardening_sanitize_bounds_and_redaction() {
+        assert_eq!(
+            sanitize_display_str(" \u{202E}Al\x07ice\u{200F}\u{FEFF} ", 32),
+            "Alice"
+        );
+        assert_eq!(sanitize_display_str("Алиса", 5), "Ал");
+
+        let reg = SignalingPacket::C2sRegister {
+            room_id: [0x11; 16],
+            client_uuid: [0x22; 16],
+            nickname: " \u{202E}Bob\n ".to_string(),
+            lan_addrs: Vec::new(),
+        };
+        let encoded = reg.encode().unwrap();
+        match SignalingPacket::decode(&encoded).unwrap() {
+            SignalingPacket::C2sRegister { nickname, .. } => assert_eq!(nickname, "Bob"),
+            other => panic!("unexpected packet: {other:?}"),
+        }
+
+        let oversized = vec![0u8; MAX_UDP_PAYLOAD + 1];
+        assert!(matches!(
+            SignalingPacket::decode(&oversized),
+            Err(ProtoError::PacketTooLarge(_))
+        ));
+        assert!(matches!(
+            LanDiscoveryPacket::decode(&oversized),
+            Err(ProtoError::PacketTooLarge(_))
+        ));
+
+        let mut opus_body = Vec::new();
+        opus_body.extend_from_slice(&(1025u16).to_be_bytes());
+        opus_body.resize(2 + 1025, 0xAA);
+        assert!(matches!(
+            P2pPayload::decode_body(P2pMsgType::AudioOpus, &opus_body),
+            Err(ProtoError::PacketTooLarge(1025))
+        ));
+
+        assert!(matches!(
+            need_bytes(&[0u8; 4], usize::MAX, 1),
+            Err(ProtoError::InvalidHeader)
+        ));
+
+        let announce = LanDiscoveryPacket::Announce {
+            room_id: [0x33; 16],
+            secret: [0xAB; 32],
+            rv_port: 3478,
+            peer_count: 1,
+            max_peers: 10,
+            room_name: "LAN".to_string(),
+            host_nickname: "Host".to_string(),
+        };
+        let dbg = format!("{announce:?}");
+        assert!(dbg.contains("[REDACTED]"));
+        assert!(!dbg.contains("171"));
     }
 }
