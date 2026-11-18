@@ -49,6 +49,24 @@ pub fn telemetry_badge<'a, Message: 'a>(peer: &PeerUiSnapshot) -> Element<'a, Me
         (PeerConnStatus::NatFailed, _) | (_, PeerRouteKind::NatFailed) => {
             ("NAT Failed".to_string(), M3_ERROR)
         }
+        (PeerConnStatus::MeshRelayed, _) | (_, PeerRouteKind::MeshRelayed) => {
+            let txt = if peer.loss_pct >= 0.5 {
+                format!(
+                    "Mesh • {} ms • +{}ms buf • {:.1}%",
+                    peer.rtt_ms, peer.jitter_ms, peer.loss_pct
+                )
+            } else {
+                format!("Mesh • {} ms • +{}ms buf", peer.rtt_ms, peer.jitter_ms)
+            };
+            let col = if peer.rtt_ms < 80 && peer.loss_pct < 1.0 {
+                M3_SUCCESS
+            } else if peer.rtt_ms < 150 && peer.loss_pct < 5.0 {
+                M3_WARNING
+            } else {
+                M3_ERROR
+            };
+            (txt, col)
+        }
         (PeerConnStatus::Relayed, _) | (_, PeerRouteKind::Relayed) => {
             let txt = if peer.loss_pct >= 0.5 {
                 format!(

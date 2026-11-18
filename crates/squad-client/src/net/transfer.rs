@@ -1,6 +1,6 @@
 use squad_proto::{
-    encode_relay_datagram_into, ClientUuid, P2pHeader, P2pPayload, PeerId, RoomCipher, RoomId,
-    BLOB_CHUNK_SIZE, INLINE_IMAGE_MAX_BYTES, MAX_RELAY_UDP_PAYLOAD,
+    encode_peer_relay_datagram_into, encode_relay_datagram_into, ClientUuid, P2pHeader, P2pPayload,
+    PeerId, RoomCipher, RoomId, BLOB_CHUNK_SIZE, INLINE_IMAGE_MAX_BYTES, MAX_RELAY_UDP_PAYLOAD,
 };
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
@@ -86,6 +86,11 @@ pub enum TransferEvent {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerEndpoint {
     Direct(SocketAddr),
+    PeerRelay {
+        relay_addr: SocketAddr,
+        room_id: RoomId,
+        target_peer_id: PeerId,
+    },
     Relay {
         server: SocketAddr,
         room_id: RoomId,
@@ -132,11 +137,31 @@ impl TransferCtx<'_> {
                 PeerEndpoint::Direct(addr) => {
                     let _ = self.socket.send_to(self.seal_buf, addr).await;
                 }
+                PeerEndpoint::PeerRelay {
+                    relay_addr,
+                    room_id,
+                    target_peer_id,
+                } => {
+                    let mut relay_buf = Vec::with_capacity(MAX_RELAY_UDP_PAYLOAD);
+                    if encode_peer_relay_datagram_into(
+                        &room_id,
+                        target_peer_id,
+                        self.seal_buf,
+                        &mut relay_buf,
+                    )
+                    .is_ok()
+                    {
+                        let _ = self.socket.send_to(&relay_buf, relay_addr).await;
+                    }
+                }
                 PeerEndpoint::Relay {
                     server,
                     room_id,
                     peer_id,
                 } => {
+                    if !payload.msg_type().is_server_relay_allowed() {
+                        return;
+                    }
                     let mut relay_buf = Vec::with_capacity(MAX_RELAY_UDP_PAYLOAD);
                     if encode_relay_datagram_into(&room_id, peer_id, self.seal_buf, &mut relay_buf)
                         .is_ok()

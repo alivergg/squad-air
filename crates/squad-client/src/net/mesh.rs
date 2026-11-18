@@ -10,10 +10,11 @@ use crate::net::PeerEndpoint;
 use crate::tray::release_os_memory;
 use squad_dsp::{AudioEngineHandle, OutboundAudioFrame, SoundCue};
 use squad_proto::{
-    encode_relay_datagram_into, is_relay_datagram, parse_relay_header, ClientUuid, InviteLink,
-    LanDiscoveryPacket, P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, RoomId,
-    SignalingPacket, LAN_DISCOVERY_PORT, MAX_RELAY_UDP_PAYLOAD, MAX_ROOM_PEERS, MAX_UDP_PAYLOAD,
-    RELAY_HEADER_LEN,
+    encode_peer_relay_datagram_into, encode_relay_datagram_into, is_peer_relay_datagram,
+    is_relay_datagram, parse_peer_relay_header, parse_relay_header, rewrite_relay_peer_id,
+    ClientUuid, InviteLink, LanDiscoveryPacket, P2pHeader, P2pMsgType, P2pPayload, PeerId,
+    PeerRecord, RoomCipher, RoomId, SignalingPacket, LAN_DISCOVERY_PORT, MAX_RELAY_UDP_PAYLOAD,
+    MAX_ROOM_PEERS, MAX_UDP_PAYLOAD, RELAY_HEADER_LEN,
 };
 use squad_video::{
     detect_hardware_encoder_backend, fragment_frame, is_hevc_hardware_supported, DecoderError,
@@ -37,6 +38,9 @@ const RELAY_DIRECT_PROBE_INTERVAL: Duration = Duration::from_secs(2);
 const PING_INTERVAL: Duration = Duration::from_secs(1);
 const PEER_STALE_TIMEOUT: Duration = Duration::from_secs(6);
 const RELAY_STALE_TIMEOUT: Duration = Duration::from_secs(12);
+const MESH_REACHABILITY_INTERVAL: Duration = Duration::from_secs(2);
+const MESH_REACHABILITY_TTL: Duration = Duration::from_secs(7);
+const NAT_FAILED_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 const LAN_BEACON_INTERVAL: Duration = Duration::from_millis(1500);
 const LAN_ROOM_TTL: Duration = Duration::from_secs(5);
 const LAN_RV_LOST_TIMEOUT: Duration = Duration::from_secs(7);
@@ -46,6 +50,7 @@ const LAN_MIGRATION_GRACE: Duration = Duration::from_secs(3);
 pub enum PeerConnStatus {
     Punching,
     Connected,
+    MeshRelayed,
     Relayed,
     NatFailed,
 }
@@ -55,6 +60,7 @@ pub enum PeerRouteKind {
     Connecting,
     LanDirect,
     P2pDirect,
+    MeshRelayed,
     Relayed,
     NatFailed,
 }
@@ -179,6 +185,9 @@ struct RemotePeerState {
     record: PeerRecord,
     status: PeerConnStatus,
     active_addr: Option<SocketAddr>,
+    mesh_relay_peer: Option<PeerId>,
+    reported_direct_peers: HashSet<PeerId>,
+    reachability_updated_at: Option<Instant>,
     punch_started_at: Instant,
     last_direct_probe: Instant,
     last_rx: Instant,
@@ -264,6 +273,8 @@ struct ActiveSession {
     last_rv_rx: Instant,
     migrating_until: Option<Instant>,
     migration_claimed_at: Option<Instant>,
+    last_mesh_reachability_sent: Instant,
+    last_advertised_direct_peers: Vec<PeerId>,
 }
 
 #[derive(Clone)]
@@ -825,6 +836,19 @@ pub fn spawn_mesh_worker(
                                 audio_engine.clear_stream_audio();
                                 *video_frame_slot.lock().unwrap() = None;
                                 if let Some(target_pid) = peer_id {
+                                    let relay_only = sess
+                                        .peers
+                                        .get(&target_pid)
+                                        .is_some_and(|p| p.status == PeerConnStatus::Relayed);
+                                    if relay_only {
+                                        sess.watched_peer_id = None;
+                                        let _ = evt_tx
+                                            .send(MeshEvent::Error(
+                                                "Screen share requires Direct P2P or Peer-Mesh Relay (disabled over server relay)".to_string(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    }
                                     let peer_uses_hevc = sess
                                         .peers
                                         .get(&target_pid)
@@ -952,6 +976,7 @@ pub fn spawn_mesh_worker(
                                         &socket,
                                         sess,
                                         peer_id,
+                                        P2pMsgType::AudioOpus,
                                         &seal_buf,
                                         &mut relay_buf,
                                     )
@@ -976,6 +1001,7 @@ pub fn spawn_mesh_worker(
                                         &socket,
                                         sess,
                                         peer_id,
+                                        P2pMsgType::AudioDtxKeepalive,
                                         &seal_buf,
                                         &mut relay_buf,
                                     )
@@ -1004,6 +1030,7 @@ pub fn spawn_mesh_worker(
                                             &socket,
                                             sess,
                                             sub_id,
+                                            P2pMsgType::StreamAudioOpus,
                                             &seal_buf,
                                             &mut relay_buf,
                                         )
@@ -1023,6 +1050,7 @@ pub fn spawn_mesh_worker(
                     let datagram = &mut recv_buf[..len];
 
                     let mut rx_ctx = MeshRxCtx {
+                        socket: &socket,
                         audio_engine: &audio_engine,
                         seal_buf: &mut seal_buf,
                         relay_buf: &mut relay_buf,
@@ -1045,7 +1073,7 @@ pub fn spawn_mesh_worker(
                                         &socket,
                                         &mut datagram[RELAY_HEADER_LEN..],
                                         src_addr,
-                                        true,
+                                        Some(RelaySource::Server),
                                         Some(relay_sender_pid),
                                         sess,
                                         &mut rx_ctx,
@@ -1055,6 +1083,10 @@ pub fn spawn_mesh_worker(
                                 }
                             }
                         }
+                    } else if is_peer_relay_datagram(datagram) {
+                        handle_peer_relay_datagram(&socket, datagram, src_addr, sess, &mut rx_ctx)
+                            .await;
+                        forward_transfer_events(&mut tr_rx, &evt_tx).await;
                     } else if src_addr == sess.rendezvous_addr || is_signaling_opcode(datagram) {
                         handle_signaling_rx(datagram, sess, &mut rx_ctx).await;
                     } else {
@@ -1062,7 +1094,7 @@ pub fn spawn_mesh_worker(
                             &socket,
                             datagram,
                             src_addr,
-                            false,
+                            None,
                             None,
                             sess,
                             &mut rx_ctx,
@@ -1078,7 +1110,19 @@ pub fn spawn_mesh_worker(
                     if sess.local_peer_id == 0 || sess.stream_subscribers.is_empty() {
                         continue;
                     }
-                    let subs: Vec<PeerId> = sess.stream_subscribers.iter().copied().collect();
+                    let subs: Vec<PeerId> = sess
+                        .stream_subscribers
+                        .iter()
+                        .copied()
+                        .filter(|&pid| {
+                            sess.peers.get(&pid).is_some_and(|p| {
+                                matches!(p.status, PeerConnStatus::Connected | PeerConnStatus::MeshRelayed)
+                            })
+                        })
+                        .collect();
+                    if subs.is_empty() {
+                        continue;
+                    }
                     for (idx, frag) in frags.into_iter().enumerate() {
                         sess.control_seq = sess.control_seq.wrapping_add(1);
                         let hdr = P2pHeader {
@@ -1100,6 +1144,7 @@ pub fn spawn_mesh_worker(
                                     &socket,
                                     sess,
                                     sub_id,
+                                    P2pMsgType::VideoFrameFrag,
                                     &seal_buf,
                                     &mut relay_buf,
                                 )
@@ -1214,7 +1259,9 @@ pub fn spawn_mesh_worker(
                                 .filter(|(_, p)| {
                                     matches!(
                                         p.status,
-                                        PeerConnStatus::Connected | PeerConnStatus::Relayed
+                                        PeerConnStatus::Connected
+                                            | PeerConnStatus::MeshRelayed
+                                            | PeerConnStatus::Relayed
                                     )
                                 })
                                 .map(|(&pid, _)| pid)
@@ -1302,17 +1349,40 @@ pub fn spawn_mesh_worker(
                     let now = Instant::now();
                     let now_us = now_micros();
                     let mut relay_fallback_peers = Vec::new();
+                    let mut degraded_to_server_relay = Vec::new();
+                    let peer_ids: Vec<PeerId> = sess.peers.keys().copied().collect();
 
-                    for (&peer_id, peer) in &mut sess.peers {
-                        match peer.status {
+                    for peer_id in peer_ids {
+                        let Some(status) = sess.peers.get(&peer_id).map(|p| p.status) else {
+                            continue;
+                        };
+                        match status {
                             PeerConnStatus::Punching => {
-                                if now.duration_since(peer.punch_started_at) >= RELAY_FALLBACK_AFTER {
-                                    peer.status = PeerConnStatus::Relayed;
-                                    peer.last_direct_probe = now;
-                                    info!(
-                                        "Hole punch timed out for peer #{} ({}); activating UDP relay fallback",
-                                        peer.record.peer_id, peer.record.nickname
-                                    );
+                                let timed_out = sess
+                                    .peers
+                                    .get(&peer_id)
+                                    .is_some_and(|p| now.duration_since(p.punch_started_at) >= RELAY_FALLBACK_AFTER);
+                                if timed_out {
+                                    let mesh_candidate = find_best_mesh_relay(sess, peer_id, None, now);
+                                    if let Some(peer) = sess.peers.get_mut(&peer_id) {
+                                        peer.last_direct_probe = now;
+                                        if let Some(b_pid) = mesh_candidate {
+                                            peer.status = PeerConnStatus::MeshRelayed;
+                                            peer.mesh_relay_peer = Some(b_pid);
+                                            info!(
+                                                "Hole punch timed out for peer #{} ({}); activating Peer-Mesh relay via #{}",
+                                                peer.record.peer_id, peer.record.nickname, b_pid
+                                            );
+                                        } else {
+                                            peer.status = PeerConnStatus::Relayed;
+                                            peer.mesh_relay_peer = None;
+                                            degraded_to_server_relay.push(peer_id);
+                                            info!(
+                                                "Hole punch timed out for peer #{} ({}); activating server UDP relay fallback (voice/chat only)",
+                                                peer.record.peer_id, peer.record.nickname
+                                            );
+                                        }
+                                    }
                                     relay_fallback_peers.push(peer_id);
                                     continue;
                                 }
@@ -1325,15 +1395,23 @@ pub fn spawn_mesh_worker(
                                     now_us,
                                     &mut seal_buf,
                                 ) {
-                                    let _ = socket.send_to(&seal_buf, peer.record.public_addr).await;
-                                    for lan in &peer.record.lan_addrs {
-                                        let _ = socket.send_to(&seal_buf, SocketAddr::V4(*lan)).await;
+                                    if let Some(peer) = sess.peers.get(&peer_id) {
+                                        let _ = socket.send_to(&seal_buf, peer.record.public_addr).await;
+                                        for lan in &peer.record.lan_addrs {
+                                            let _ = socket.send_to(&seal_buf, SocketAddr::V4(*lan)).await;
+                                        }
                                     }
                                 }
                             }
-                            PeerConnStatus::Relayed => {
-                                if now.duration_since(peer.last_direct_probe) >= RELAY_DIRECT_PROBE_INTERVAL {
-                                    peer.last_direct_probe = now;
+                            PeerConnStatus::MeshRelayed | PeerConnStatus::Relayed => {
+                                let should_probe = sess
+                                    .peers
+                                    .get(&peer_id)
+                                    .is_some_and(|p| now.duration_since(p.last_direct_probe) >= RELAY_DIRECT_PROBE_INTERVAL);
+                                if should_probe {
+                                    if let Some(peer) = sess.peers.get_mut(&peer_id) {
+                                        peer.last_direct_probe = now;
+                                    }
                                     if seal_punch_syn_parts(
                                         &sess.cipher,
                                         sess.room_prefix,
@@ -1343,15 +1421,59 @@ pub fn spawn_mesh_worker(
                                         now_us,
                                         &mut seal_buf,
                                     ) {
-                                        let _ = socket.send_to(&seal_buf, peer.record.public_addr).await;
-                                        for lan in &peer.record.lan_addrs {
-                                            let _ = socket.send_to(&seal_buf, SocketAddr::V4(*lan)).await;
+                                        if let Some(peer) = sess.peers.get(&peer_id) {
+                                            let _ = socket.send_to(&seal_buf, peer.record.public_addr).await;
+                                            for lan in &peer.record.lan_addrs {
+                                                let _ = socket.send_to(&seal_buf, SocketAddr::V4(*lan)).await;
+                                            }
                                         }
                                     }
                                 }
                             }
-                            PeerConnStatus::Connected | PeerConnStatus::NatFailed => {}
+                            PeerConnStatus::NatFailed => {
+                                let should_probe = sess
+                                    .peers
+                                    .get(&peer_id)
+                                    .is_some_and(|p| now.duration_since(p.last_direct_probe) >= NAT_FAILED_PROBE_INTERVAL);
+                                if should_probe {
+                                    if let Some(peer) = sess.peers.get_mut(&peer_id) {
+                                        peer.last_direct_probe = now;
+                                    }
+                                    if seal_punch_syn_parts(
+                                        &sess.cipher,
+                                        sess.room_prefix,
+                                        sess.local_peer_id,
+                                        sess.local_uuid,
+                                        &mut sess.control_seq,
+                                        now_us,
+                                        &mut seal_buf,
+                                    ) {
+                                        if let Some(peer) = sess.peers.get(&peer_id) {
+                                            let _ = socket.send_to(&seal_buf, peer.record.public_addr).await;
+                                            for lan in &peer.record.lan_addrs {
+                                                let _ = socket.send_to(&seal_buf, SocketAddr::V4(*lan)).await;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            PeerConnStatus::Connected => {}
                         }
+                    }
+
+                    if !degraded_to_server_relay.is_empty() {
+                        enforce_video_route_policy(
+                            sess,
+                            &degraded_to_server_relay,
+                            &mut capture_worker,
+                            &video_out_tx,
+                            &video_frame_slot,
+                            &video_notify,
+                            &decode_handle,
+                            &audio_engine,
+                            &evt_tx,
+                        )
+                        .await;
                     }
 
                     for peer_id in relay_fallback_peers {
@@ -1368,6 +1490,7 @@ pub fn spawn_mesh_worker(
                                 &socket,
                                 sess,
                                 peer_id,
+                                P2pMsgType::PunchSyn,
                                 &seal_buf,
                                 &mut relay_buf,
                             )
@@ -1392,6 +1515,9 @@ pub fn spawn_mesh_worker(
                                 if now.duration_since(peer.last_rx) > PEER_STALE_TIMEOUT {
                                     peer.status = PeerConnStatus::Punching;
                                     peer.active_addr = None;
+                                    peer.mesh_relay_peer = None;
+                                    peer.reported_direct_peers.clear();
+                                    peer.reachability_updated_at = None;
                                     peer.punch_started_at = now;
                                     went_stale.push(pid);
                                     continue;
@@ -1399,6 +1525,16 @@ pub fn spawn_mesh_worker(
                                 if peer.active_addr.is_some() {
                                     ping_peers.push(pid);
                                 }
+                            }
+                            PeerConnStatus::MeshRelayed => {
+                                if now.duration_since(peer.last_rx) > RELAY_STALE_TIMEOUT {
+                                    peer.status = PeerConnStatus::Relayed;
+                                    peer.mesh_relay_peer = None;
+                                    peer.last_rx = now;
+                                    went_stale.push(pid);
+                                    continue;
+                                }
+                                ping_peers.push(pid);
                             }
                             PeerConnStatus::Relayed => {
                                 if now.duration_since(peer.last_rx) > RELAY_STALE_TIMEOUT {
@@ -1412,6 +1548,9 @@ pub fn spawn_mesh_worker(
                         }
                     }
 
+                    let route_changes = reconcile_mesh_routes(&socket, sess, &mut seal_buf, &mut relay_buf, now).await;
+                    went_stale.extend(route_changes);
+
                     for pid in ping_peers {
                         sess.control_seq = sess.control_seq.wrapping_add(1);
                         let hdr = P2pHeader {
@@ -1422,33 +1561,25 @@ pub fn spawn_mesh_worker(
                         };
                         let payload = P2pPayload::Ping { timestamp_us: now_us };
                         if sess.cipher.seal_packet(&hdr, &payload, &mut seal_buf).is_ok() {
-                            send_sealed_to_peer(&socket, sess, pid, &seal_buf, &mut relay_buf).await;
+                            send_sealed_to_peer(&socket, sess, pid, P2pMsgType::Ping, &seal_buf, &mut relay_buf).await;
                         }
                     }
 
+                    broadcast_mesh_reachability_if_needed(&socket, sess, &mut seal_buf, &mut relay_buf, true).await;
+
                     if !went_stale.is_empty() {
-                        let mut sub_changed = false;
-                        for pid in went_stale {
-                            if sess.stream_subscribers.remove(&pid) {
-                                sub_changed = true;
-                            }
-                        }
-                        if sub_changed {
-                            reconcile_capture_worker(
-                                sess,
-                                &mut capture_worker,
-                                &video_out_tx,
-                                &video_frame_slot,
-                                &video_notify,
-                                false,
-                            );
-                            evt_tx
-                                .send(MeshEvent::LocalStreamStatus {
-                                    is_sharing: sess.local_stream_config.is_some(),
-                                    subscriber_count: sess.stream_subscribers.len(),
-                                })
-                                .await;
-                        }
+                        enforce_video_route_policy(
+                            sess,
+                            &went_stale,
+                            &mut capture_worker,
+                            &video_out_tx,
+                            &video_frame_slot,
+                            &video_notify,
+                            &decode_handle,
+                            &audio_engine,
+                            &evt_tx,
+                        )
+                        .await;
                     }
                 }
 
@@ -1490,6 +1621,7 @@ pub fn spawn_mesh_worker(
 fn classify_peer_route(status: PeerConnStatus, active_addr: Option<SocketAddr>) -> PeerRouteKind {
     match status {
         PeerConnStatus::Punching => PeerRouteKind::Connecting,
+        PeerConnStatus::MeshRelayed => PeerRouteKind::MeshRelayed,
         PeerConnStatus::Relayed => PeerRouteKind::Relayed,
         PeerConnStatus::NatFailed => PeerRouteKind::NatFailed,
         PeerConnStatus::Connected => match active_addr {
@@ -1622,6 +1754,14 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                             sess.watched_peer_id = Some(rec.peer_id);
                         }
                         io.audio_engine.remove_peer(old_id);
+                        for other in sess.peers.values_mut() {
+                            if other.mesh_relay_peer == Some(old_id) {
+                                other.mesh_relay_peer = Some(rec.peer_id);
+                            }
+                            if other.reported_direct_peers.remove(&old_id) {
+                                other.reported_direct_peers.insert(rec.peer_id);
+                            }
+                        }
                         sess.peers.insert(rec.peer_id, moved);
                     }
                 } else {
@@ -1632,6 +1772,9 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                             record: rec,
                             status: PeerConnStatus::Punching,
                             active_addr: None,
+                            mesh_relay_peer: None,
+                            reported_direct_peers: HashSet::new(),
+                            reachability_updated_at: None,
                             punch_started_at: now,
                             last_direct_probe: now,
                             last_rx: now,
@@ -1657,9 +1800,17 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
             };
 
             let mut sub_changed = false;
+            let mut removed_any = false;
             for id in stale {
+                removed_any = true;
                 sess.peers.remove(&id);
                 sess.transfer.remove_peer(id);
+                for other in sess.peers.values_mut() {
+                    if other.mesh_relay_peer == Some(id) {
+                        other.mesh_relay_peer = None;
+                    }
+                    other.reported_direct_peers.remove(&id);
+                }
                 if sess.stream_subscribers.remove(&id) {
                     sub_changed = true;
                 }
@@ -1680,6 +1831,32 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                 }
                 io.audio_engine.remove_peer(id);
                 io.audio_engine.play_cue(SoundCue::PeerLeave);
+            }
+            if removed_any {
+                let route_changes =
+                    reconcile_mesh_routes(io.socket, sess, io.seal_buf, io.relay_buf, now).await;
+                if !route_changes.is_empty() {
+                    enforce_video_route_policy(
+                        sess,
+                        &route_changes,
+                        io.capture_worker,
+                        io.video_out_tx,
+                        io.video_frame_slot,
+                        io.video_notify,
+                        io.decode_handle,
+                        io.audio_engine,
+                        io.evt_tx,
+                    )
+                    .await;
+                }
+                broadcast_mesh_reachability_if_needed(
+                    io.socket,
+                    sess,
+                    io.seal_buf,
+                    io.relay_buf,
+                    false,
+                )
+                .await;
             }
             if sub_changed {
                 reconcile_capture_worker(
@@ -1709,6 +1886,7 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
 }
 
 struct MeshRxCtx<'a> {
+    socket: &'a UdpSocket,
     audio_engine: &'a AudioEngineHandle,
     seal_buf: &'a mut Vec<u8>,
     relay_buf: &'a mut Vec<u8>,
@@ -1722,12 +1900,86 @@ struct MeshRxCtx<'a> {
     lan_tx_sock: Option<&'a UdpSocket>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RelaySource {
+    Server,
+    PeerMesh(PeerId),
+}
+
+async fn handle_peer_relay_datagram(
+    socket: &UdpSocket,
+    datagram: &mut [u8],
+    src_addr: SocketAddr,
+    sess: &mut ActiveSession,
+    io: &mut MeshRxCtx<'_>,
+) {
+    let Some(relay_peer_id) = sess
+        .peers
+        .iter()
+        .find(|(_, p)| p.status == PeerConnStatus::Connected && p.active_addr == Some(src_addr))
+        .map(|(&pid, _)| pid)
+    else {
+        return;
+    };
+
+    let Ok((room_id, outer_peer_id, inner)) = parse_peer_relay_header(datagram) else {
+        return;
+    };
+    if room_id != sess.invite.room_id {
+        return;
+    }
+    let Ok(inner_hdr) = P2pHeader::decode(inner) else {
+        return;
+    };
+    if inner_hdr.room_prefix != sess.room_prefix {
+        return;
+    }
+
+    // Forwarding role (A -> B -> C, where local node is B).
+    if outer_peer_id != sess.local_peer_id
+        && outer_peer_id != relay_peer_id
+        && inner_hdr.sender_peer_id == relay_peer_id
+    {
+        if sess.peers.len() < 2 {
+            return;
+        }
+        let Some(target_addr) = sess
+            .peers
+            .get(&outer_peer_id)
+            .filter(|p| p.status == PeerConnStatus::Connected)
+            .and_then(|p| p.active_addr)
+        else {
+            return;
+        };
+        rewrite_relay_peer_id(datagram, relay_peer_id);
+        let _ = socket.send_to(datagram, target_addr).await;
+        return;
+    }
+
+    // Receiving role (B -> C, where local node is C and outer_peer_id is A).
+    if outer_peer_id == inner_hdr.sender_peer_id
+        && outer_peer_id != relay_peer_id
+        && outer_peer_id != sess.local_peer_id
+    {
+        handle_p2p_rx(
+            socket,
+            &mut datagram[RELAY_HEADER_LEN..],
+            src_addr,
+            Some(RelaySource::PeerMesh(relay_peer_id)),
+            Some(outer_peer_id),
+            sess,
+            io,
+        )
+        .await;
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_p2p_rx(
     socket: &UdpSocket,
     datagram: &mut [u8],
     src_addr: SocketAddr,
-    via_relay: bool,
+    relay_source: Option<RelaySource>,
     expected_sender_id: Option<PeerId>,
     sess: &mut ActiveSession,
     io: &mut MeshRxCtx<'_>,
@@ -1741,6 +1993,7 @@ async fn handle_p2p_rx(
         return;
     }
 
+    let via_relay = relay_source.is_some();
     if via_relay && expected_sender_id != Some(header.sender_peer_id) {
         debug!(
             "Dropped relay packet with mismatched sender id: header={}, relay={:?}",
@@ -1749,36 +2002,66 @@ async fn handle_p2p_rx(
         return;
     }
 
+    if matches!(relay_source, Some(RelaySource::Server)) && !header.msg_type.is_server_relay_allowed()
+    {
+        return;
+    }
+
     let now = Instant::now();
+    let mut reachability_dirty = false;
     let (sender_uuid, sender_nickname, first_connect) = {
         let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) else {
             return;
         };
 
         peer.last_rx = now;
-        if !via_relay {
-            if peer.status != PeerConnStatus::Connected {
-                info!(
-                    "Direct P2P connection active with peer #{} ({}) at {}",
-                    peer.record.peer_id, peer.record.nickname, src_addr
-                );
+        match relay_source {
+            None => {
+                if peer.status != PeerConnStatus::Connected {
+                    info!(
+                        "Direct P2P connection active with peer #{} ({}) at {}",
+                        peer.record.peer_id, peer.record.nickname, src_addr
+                    );
+                    reachability_dirty = true;
+                }
+                peer.status = PeerConnStatus::Connected;
+                peer.active_addr = Some(src_addr);
+                peer.mesh_relay_peer = None;
             }
-            peer.status = PeerConnStatus::Connected;
-            peer.active_addr = Some(src_addr);
-        } else if peer.status != PeerConnStatus::Connected {
-            if peer.status != PeerConnStatus::Relayed {
-                info!(
-                    "UDP relay path active with peer #{} ({}) via {}",
-                    peer.record.peer_id, peer.record.nickname, sess.rendezvous_addr
-                );
+            Some(RelaySource::PeerMesh(b_pid)) => {
+                if peer.status != PeerConnStatus::Connected {
+                    if peer.status != PeerConnStatus::MeshRelayed || peer.mesh_relay_peer != Some(b_pid)
+                    {
+                        info!(
+                            "Peer-Mesh relay path active with peer #{} ({}) via teammate #{}",
+                            peer.record.peer_id, peer.record.nickname, b_pid
+                        );
+                    }
+                    peer.status = PeerConnStatus::MeshRelayed;
+                    peer.mesh_relay_peer = Some(b_pid);
+                }
             }
-            peer.status = PeerConnStatus::Relayed;
+            Some(RelaySource::Server) => {
+                if !matches!(
+                    peer.status,
+                    PeerConnStatus::Connected | PeerConnStatus::MeshRelayed
+                ) {
+                    if peer.status != PeerConnStatus::Relayed {
+                        info!(
+                            "Server UDP relay path active with peer #{} ({}) via {} (voice/chat only)",
+                            peer.record.peer_id, peer.record.nickname, sess.rendezvous_addr
+                        );
+                    }
+                    peer.status = PeerConnStatus::Relayed;
+                    peer.mesh_relay_peer = None;
+                }
+            }
         }
 
         let first_connect = !peer.has_announced_once
             && matches!(
                 peer.status,
-                PeerConnStatus::Connected | PeerConnStatus::Relayed
+                PeerConnStatus::Connected | PeerConnStatus::MeshRelayed | PeerConnStatus::Relayed
             );
         if first_connect {
             peer.has_announced_once = true;
@@ -1789,6 +2072,10 @@ async fn handle_p2p_rx(
             first_connect,
         )
     };
+
+    if reachability_dirty {
+        broadcast_mesh_reachability_if_needed(socket, sess, io.seal_buf, io.relay_buf, false).await;
+    }
 
     if first_connect {
         if let Some(endpoint) = peer_endpoint(sess, header.sender_peer_id) {
@@ -1857,6 +2144,7 @@ async fn handle_p2p_rx(
                         socket,
                         sess,
                         header.sender_peer_id,
+                        P2pMsgType::PunchAck,
                         io.seal_buf,
                         io.relay_buf,
                     )
@@ -1894,6 +2182,7 @@ async fn handle_p2p_rx(
                     socket,
                     sess,
                     header.sender_peer_id,
+                    P2pMsgType::Pong,
                     io.seal_buf,
                     io.relay_buf,
                 )
@@ -1940,6 +2229,31 @@ async fn handle_p2p_rx(
                     );
                     send_register(socket, sess).await;
                 }
+            }
+        }
+        P2pPayload::MeshReachability { direct_peers } => {
+            if let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) {
+                peer.reported_direct_peers = direct_peers
+                    .into_iter()
+                    .filter(|&pid| pid != header.sender_peer_id && pid != sess.local_peer_id)
+                    .collect();
+                peer.reachability_updated_at = Some(now);
+            }
+            let route_changes =
+                reconcile_mesh_routes(socket, sess, io.seal_buf, io.relay_buf, now).await;
+            if !route_changes.is_empty() {
+                enforce_video_route_policy(
+                    sess,
+                    &route_changes,
+                    io.capture_worker,
+                    io.video_out_tx,
+                    io.video_frame_slot,
+                    io.video_notify,
+                    io.decode_handle,
+                    io.audio_engine,
+                    io.evt_tx,
+                )
+                .await;
             }
         }
         P2pPayload::AudioOpus { opus_data } => {
@@ -2169,10 +2483,289 @@ async fn handle_p2p_rx(
     }
 }
 
+fn is_mesh_relay_candidate_valid(
+    sess: &ActiveSession,
+    relay_pid: PeerId,
+    target_pid: PeerId,
+    now: Instant,
+) -> bool {
+    if relay_pid == target_pid || relay_pid == sess.local_peer_id {
+        return false;
+    }
+    sess.peers.get(&relay_pid).is_some_and(|relay_peer| {
+        relay_peer.status == PeerConnStatus::Connected
+            && relay_peer.active_addr.is_some()
+            && relay_peer
+                .reachability_updated_at
+                .is_some_and(|t| now.duration_since(t) <= MESH_REACHABILITY_TTL)
+            && relay_peer.reported_direct_peers.contains(&target_pid)
+    })
+}
+
+fn find_best_mesh_relay(
+    sess: &ActiveSession,
+    target_pid: PeerId,
+    current_relay: Option<PeerId>,
+    now: Instant,
+) -> Option<PeerId> {
+    if sess.peers.len() < 2 {
+        return None;
+    }
+    let current_score = current_relay
+        .filter(|&pid| is_mesh_relay_candidate_valid(sess, pid, target_pid, now))
+        .and_then(|pid| sess.peers.get(&pid).map(|p| (pid, effective_rtt(p.rtt_ms))));
+
+    let best = sess
+        .peers
+        .iter()
+        .filter(|(&pid, _)| is_mesh_relay_candidate_valid(sess, pid, target_pid, now))
+        .map(|(&pid, p)| (pid, effective_rtt(p.rtt_ms)))
+        .min_by_key(|&(pid, rtt)| (rtt, pid));
+
+    match (current_score, best) {
+        (Some((cur_pid, cur_rtt)), Some((best_pid, best_rtt))) => {
+            if best_pid != cur_pid && best_rtt + 20 < cur_rtt {
+                Some(best_pid)
+            } else {
+                Some(cur_pid)
+            }
+        }
+        (Some((cur_pid, _)), None) => Some(cur_pid),
+        (None, Some((best_pid, _))) => Some(best_pid),
+        (None, None) => None,
+    }
+}
+
+#[inline]
+fn effective_rtt(rtt_ms: u32) -> u32 {
+    if rtt_ms == 0 {
+        500
+    } else {
+        rtt_ms
+    }
+}
+
+async fn broadcast_mesh_reachability_if_needed(
+    socket: &UdpSocket,
+    sess: &mut ActiveSession,
+    seal_buf: &mut Vec<u8>,
+    relay_buf: &mut Vec<u8>,
+    periodic: bool,
+) {
+    if sess.local_peer_id == 0 {
+        return;
+    }
+    let mut direct_peers: Vec<PeerId> = sess
+        .peers
+        .iter()
+        .filter(|(_, p)| p.status == PeerConnStatus::Connected && p.active_addr.is_some())
+        .map(|(&pid, _)| pid)
+        .collect();
+    direct_peers.sort_unstable();
+
+    let changed = direct_peers != sess.last_advertised_direct_peers;
+    let periodic_due = periodic && sess.last_mesh_reachability_sent.elapsed() >= MESH_REACHABILITY_INTERVAL;
+    if !changed && !periodic_due {
+        return;
+    }
+    if direct_peers.is_empty() && !changed {
+        return;
+    }
+
+    sess.last_advertised_direct_peers = direct_peers.clone();
+    sess.last_mesh_reachability_sent = Instant::now();
+
+    let targets: Vec<PeerId> = direct_peers.clone();
+    if targets.is_empty() {
+        return;
+    }
+
+    sess.control_seq = sess.control_seq.wrapping_add(1);
+    let hdr = P2pHeader {
+        msg_type: P2pMsgType::MeshReachability,
+        room_prefix: sess.room_prefix,
+        sender_peer_id: sess.local_peer_id,
+        seq_num: sess.control_seq,
+    };
+    let payload = P2pPayload::MeshReachability { direct_peers };
+    if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
+        for pid in targets {
+            send_sealed_to_peer(
+                socket,
+                sess,
+                pid,
+                P2pMsgType::MeshReachability,
+                seal_buf,
+                relay_buf,
+            )
+            .await;
+        }
+    }
+}
+
+async fn reconcile_mesh_routes(
+    socket: &UdpSocket,
+    sess: &mut ActiveSession,
+    seal_buf: &mut Vec<u8>,
+    relay_buf: &mut Vec<u8>,
+    now: Instant,
+) -> Vec<PeerId> {
+    let mut degraded = Vec::new();
+    let mut promoted = Vec::new();
+    let peer_ids: Vec<PeerId> = sess.peers.keys().copied().collect();
+
+    for pid in peer_ids {
+        let Some((status, current_relay)) = sess
+            .peers
+            .get(&pid)
+            .map(|p| (p.status, p.mesh_relay_peer))
+        else {
+            continue;
+        };
+
+        match status {
+            PeerConnStatus::MeshRelayed => {
+                let next_relay = find_best_mesh_relay(sess, pid, current_relay, now);
+                if let Some(peer) = sess.peers.get_mut(&pid) {
+                    if let Some(b_pid) = next_relay {
+                        if peer.mesh_relay_peer != Some(b_pid) {
+                            info!(
+                                "Switched Peer-Mesh relay for peer #{} ({}) to teammate #{}",
+                                peer.record.peer_id, peer.record.nickname, b_pid
+                            );
+                            peer.mesh_relay_peer = Some(b_pid);
+                            promoted.push(pid);
+                        }
+                    } else {
+                        info!(
+                            "Peer-Mesh relay lost for peer #{} ({}); falling back to server relay (voice/chat only)",
+                            peer.record.peer_id, peer.record.nickname
+                        );
+                        peer.status = PeerConnStatus::Relayed;
+                        peer.mesh_relay_peer = None;
+                        peer.last_rx = now;
+                        degraded.push(pid);
+                    }
+                }
+            }
+            PeerConnStatus::Relayed | PeerConnStatus::NatFailed => {
+                if let Some(b_pid) = find_best_mesh_relay(sess, pid, None, now) {
+                    if let Some(peer) = sess.peers.get_mut(&pid) {
+                        info!(
+                            "Upgraded peer #{} ({}) to Peer-Mesh relay via teammate #{}",
+                            peer.record.peer_id, peer.record.nickname, b_pid
+                        );
+                        peer.status = PeerConnStatus::MeshRelayed;
+                        peer.mesh_relay_peer = Some(b_pid);
+                        peer.last_rx = now;
+                        promoted.push(pid);
+                    }
+                }
+            }
+            PeerConnStatus::Punching | PeerConnStatus::Connected => {}
+        }
+    }
+
+    let now_us = now_micros();
+    for pid in promoted {
+        if seal_punch_syn_parts(
+            &sess.cipher,
+            sess.room_prefix,
+            sess.local_peer_id,
+            sess.local_uuid,
+            &mut sess.control_seq,
+            now_us,
+            seal_buf,
+        ) {
+            send_sealed_to_peer(socket, sess, pid, P2pMsgType::PunchSyn, seal_buf, relay_buf)
+                .await;
+        }
+    }
+
+    degraded
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn enforce_video_route_policy(
+    sess: &mut ActiveSession,
+    affected_peers: &[PeerId],
+    capture_worker: &mut Option<CaptureWorkerHandle>,
+    video_out_tx: &mpsc::Sender<Vec<VideoPacketOut>>,
+    video_frame_slot: &Arc<Mutex<Option<DecodedVideoFrame>>>,
+    video_notify: &Arc<Notify>,
+    decode_handle: &VideoDecodeHandle,
+    audio_engine: &AudioEngineHandle,
+    evt_tx: &NotifyingEventTx,
+) {
+    let mut sub_changed = false;
+    let mut stopped_watch = false;
+
+    for &pid in affected_peers {
+        let allows_video = sess.peers.get(&pid).is_some_and(|p| {
+            matches!(
+                p.status,
+                PeerConnStatus::Connected | PeerConnStatus::MeshRelayed
+            )
+        });
+        if !allows_video {
+            if sess.stream_subscribers.remove(&pid) {
+                sub_changed = true;
+            }
+            if sess.watched_peer_id == Some(pid) {
+                sess.watched_peer_id = None;
+                sess.sent_decoder_error_to = None;
+                sess.video_reassembler.reset();
+                decode_handle.reset();
+                audio_engine.clear_stream_audio();
+                *video_frame_slot.lock().unwrap() = None;
+                stopped_watch = true;
+            }
+        }
+    }
+
+    if sub_changed {
+        reconcile_capture_worker(
+            sess,
+            capture_worker,
+            video_out_tx,
+            video_frame_slot,
+            video_notify,
+            false,
+        );
+        let _ = evt_tx
+            .send(MeshEvent::LocalStreamStatus {
+                is_sharing: sess.local_stream_config.is_some(),
+                subscriber_count: sess.stream_subscribers.len(),
+            })
+            .await;
+    }
+
+    if stopped_watch {
+        let _ = evt_tx
+            .send(MeshEvent::Error(
+                "Screen share stopped: peer switched to server relay (video requires Direct P2P or Peer-Mesh Relay)".to_string(),
+            ))
+            .await;
+    }
+}
+
 fn peer_endpoint(sess: &ActiveSession, peer_id: PeerId) -> Option<PeerEndpoint> {
     let peer = sess.peers.get(&peer_id)?;
     match peer.status {
         PeerConnStatus::Connected => peer.active_addr.map(PeerEndpoint::Direct),
+        PeerConnStatus::MeshRelayed => {
+            let relay_pid = peer.mesh_relay_peer?;
+            let relay_addr = sess
+                .peers
+                .get(&relay_pid)
+                .filter(|r| r.status == PeerConnStatus::Connected)
+                .and_then(|r| r.active_addr)?;
+            Some(PeerEndpoint::PeerRelay {
+                relay_addr,
+                room_id: sess.invite.room_id,
+                target_peer_id: peer_id,
+            })
+        }
         PeerConnStatus::Relayed => Some(PeerEndpoint::Relay {
             server: sess.rendezvous_addr,
             room_id: sess.invite.room_id,
@@ -2186,18 +2779,20 @@ async fn send_sealed_to_peer(
     socket: &UdpSocket,
     sess: &ActiveSession,
     peer_id: PeerId,
+    msg_type: P2pMsgType,
     sealed_bytes: &[u8],
     relay_buf: &mut Vec<u8>,
 ) {
     let Some(endpoint) = peer_endpoint(sess, peer_id) else {
         return;
     };
-    send_sealed_to_endpoint(socket, endpoint, sealed_bytes, relay_buf).await;
+    send_sealed_to_endpoint(socket, endpoint, msg_type, sealed_bytes, relay_buf).await;
 }
 
 async fn send_sealed_to_endpoint(
     socket: &UdpSocket,
     endpoint: PeerEndpoint,
+    msg_type: P2pMsgType,
     sealed_bytes: &[u8],
     relay_buf: &mut Vec<u8>,
 ) {
@@ -2205,11 +2800,25 @@ async fn send_sealed_to_endpoint(
         PeerEndpoint::Direct(addr) => {
             let _ = socket.send_to(sealed_bytes, addr).await;
         }
+        PeerEndpoint::PeerRelay {
+            relay_addr,
+            room_id,
+            target_peer_id,
+        } => {
+            if encode_peer_relay_datagram_into(&room_id, target_peer_id, sealed_bytes, relay_buf)
+                .is_ok()
+            {
+                let _ = socket.send_to(relay_buf, relay_addr).await;
+            }
+        }
         PeerEndpoint::Relay {
             server,
             room_id,
             peer_id,
         } => {
+            if !msg_type.is_server_relay_allowed() {
+                return;
+            }
             if encode_relay_datagram_into(&room_id, peer_id, sealed_bytes, relay_buf).is_ok() {
                 let _ = socket.send_to(relay_buf, server).await;
             }
@@ -2479,7 +3088,14 @@ async fn send_stream_announce_to_endpoint(
         encoder_backend,
     };
     if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
-        send_sealed_to_endpoint(socket, dst, seal_buf, relay_buf).await;
+        send_sealed_to_endpoint(
+            socket,
+            dst,
+            P2pMsgType::StreamAnnounce,
+            seal_buf,
+            relay_buf,
+        )
+        .await;
     }
 }
 
@@ -2503,7 +3119,15 @@ async fn send_stream_subscribe(
     };
     let payload = P2pPayload::StreamSubscribe { subscribe };
     if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
-        send_sealed_to_peer(socket, sess, target_peer_id, seal_buf, relay_buf).await;
+        send_sealed_to_peer(
+            socket,
+            sess,
+            target_peer_id,
+            P2pMsgType::StreamSubscribe,
+            seal_buf,
+            relay_buf,
+        )
+        .await;
     }
 }
 
@@ -2529,7 +3153,15 @@ async fn send_stream_pli(
         .seal_packet(&hdr, &P2pPayload::StreamPli, seal_buf)
         .is_ok()
     {
-        send_sealed_to_peer(socket, sess, target_peer_id, seal_buf, relay_buf).await;
+        send_sealed_to_peer(
+            socket,
+            sess,
+            target_peer_id,
+            P2pMsgType::StreamPli,
+            seal_buf,
+            relay_buf,
+        )
+        .await;
     }
 }
 
@@ -2557,7 +3189,15 @@ async fn send_stream_decoder_error(
         reason: reason.to_string(),
     };
     if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
-        send_sealed_to_peer(socket, sess, target_peer_id, seal_buf, relay_buf).await;
+        send_sealed_to_peer(
+            socket,
+            sess,
+            target_peer_id,
+            P2pMsgType::StreamDecoderError,
+            seal_buf,
+            relay_buf,
+        )
+        .await;
     }
 }
 
@@ -2619,6 +3259,8 @@ async fn init_session(
         last_rv_rx: Instant::now(),
         migrating_until: None,
         migration_claimed_at: None,
+        last_mesh_reachability_sent: Instant::now() - MESH_REACHABILITY_INTERVAL,
+        last_advertised_direct_peers: Vec::new(),
     }
 }
 
@@ -2639,7 +3281,9 @@ async fn teardown_session(
                 .filter(|(_, p)| {
                     matches!(
                         p.status,
-                        PeerConnStatus::Connected | PeerConnStatus::Relayed
+                        PeerConnStatus::Connected
+                            | PeerConnStatus::MeshRelayed
+                            | PeerConnStatus::Relayed
                     )
                 })
                 .map(|(&pid, _)| pid)
@@ -2656,7 +3300,15 @@ async fn teardown_session(
                 if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
                     let targets: Vec<PeerId> = sess.peers.keys().copied().collect();
                     for pid in targets {
-                        send_sealed_to_peer(socket, &sess, pid, seal_buf, relay_buf).await;
+                        send_sealed_to_peer(
+                            socket,
+                            &sess,
+                            pid,
+                            P2pMsgType::LanHostMigrate,
+                            seal_buf,
+                            relay_buf,
+                        )
+                        .await;
                     }
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
@@ -2711,7 +3363,15 @@ async fn promote_to_lan_host(
     if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
         let peer_ids: Vec<PeerId> = sess.peers.keys().copied().collect();
         for pid in peer_ids {
-            send_sealed_to_peer(socket, sess, pid, seal_buf, relay_buf).await;
+            send_sealed_to_peer(
+                socket,
+                sess,
+                pid,
+                P2pMsgType::LanHostClaim,
+                seal_buf,
+                relay_buf,
+            )
+            .await;
         }
     }
 
@@ -2888,6 +3548,301 @@ mod tests {
         let _ = tx_a.send(MeshCommand::Shutdown).await;
         let _ = tx_b.send(MeshCommand::Shutdown).await;
         let _ = tx_c.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        aud_c.shutdown();
+    }
+
+    #[tokio::test]
+    async fn test_hybrid_three_tier_routing_peer_mesh_and_server_relay_video_block() {
+        let rv_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let rv_addr = rv_sock.local_addr().unwrap();
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let addr_c = sock_c.local_addr().unwrap();
+
+        let invite = InviteLink::generate();
+        let (out_tx_a, _out_rx_a) = mpsc::channel(16);
+        let (out_tx_b, _out_rx_b) = mpsc::channel(16);
+        let (out_tx_c, _out_rx_c) = mpsc::channel(16);
+        let aud_a = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_a).unwrap();
+        let aud_b = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_b).unwrap();
+        let aud_c = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_c).unwrap();
+
+        let mk_sess = |uuid_b: u8, local_pid: PeerId, nick: &str| {
+            let cipher = RoomCipher::from_secret(&invite.secret);
+            let now = Instant::now();
+            ActiveSession {
+                rendezvous_addr: rv_addr,
+                invite: invite.clone(),
+                cipher,
+                room_prefix: invite.room_prefix(),
+                local_uuid: [uuid_b; 16],
+                nickname: nick.to_string(),
+                local_peer_id: local_pid,
+                lan_addrs: Vec::new(),
+                peers: HashMap::new(),
+                control_seq: 1,
+                transfer: SwarmChatManager::new(),
+                local_encoder_backend: "test".to_string(),
+                local_stream_config: None,
+                local_preview_enabled: false,
+                stream_subscribers: HashSet::new(),
+                next_video_frame_id: Arc::new(AtomicU32::new(1)),
+                watched_peer_id: None,
+                sent_decoder_error_to: None,
+                video_reassembler: FrameReassembler::new(),
+                hevc_decode_supported: false,
+                last_pli_sent: now,
+                is_lan_room: false,
+                lan_room_name: String::new(),
+                embedded_rv: None,
+                last_rv_rx: now,
+                migrating_until: None,
+                migration_claimed_at: None,
+                last_mesh_reachability_sent: now - MESH_REACHABILITY_INTERVAL,
+                last_advertised_direct_peers: Vec::new(),
+            }
+        };
+
+        let mk_peer = |pid: PeerId, uuid_b: u8, nick: &str, status: PeerConnStatus, addr: Option<SocketAddr>| {
+            let now = Instant::now();
+            RemotePeerState {
+                record: PeerRecord {
+                    peer_id: pid,
+                    client_uuid: [uuid_b; 16],
+                    public_addr: addr.unwrap_or_else(|| "127.0.0.1:1".parse().unwrap()),
+                    lan_addrs: Vec::new(),
+                    nickname: nick.to_string(),
+                },
+                status,
+                active_addr: addr,
+                mesh_relay_peer: None,
+                reported_direct_peers: HashSet::new(),
+                reachability_updated_at: None,
+                punch_started_at: now,
+                last_direct_probe: now,
+                last_rx: now,
+                rtt_ms: 10,
+                has_announced_once: true,
+                stream_info: None,
+            }
+        };
+
+        let mut sess_a = mk_sess(0xA1, 1, "Alice");
+        let mut sess_b = mk_sess(0xB2, 2, "Bravo");
+        let mut sess_c = mk_sess(0xC3, 3, "Charlie");
+
+        // Priority 1: B sees both A and C directly; A and C cannot see each other directly (stuck on Relayed).
+        sess_a.peers.insert(2, mk_peer(2, 0xB2, "Bravo", PeerConnStatus::Connected, Some(addr_b)));
+        sess_a.peers.insert(3, mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Relayed, None));
+
+        sess_b.peers.insert(1, mk_peer(1, 0xA1, "Alice", PeerConnStatus::Connected, Some(addr_a)));
+        sess_b.peers.insert(3, mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Connected, Some(addr_c)));
+
+        sess_c.peers.insert(1, mk_peer(1, 0xA1, "Alice", PeerConnStatus::Relayed, None));
+        sess_c.peers.insert(2, mk_peer(2, 0xB2, "Bravo", PeerConnStatus::Connected, Some(addr_b)));
+
+        let mut seal_buf = Vec::new();
+        let mut relay_buf = Vec::new();
+
+        // 1. B advertises its direct peers [1, 3] to A and C.
+        broadcast_mesh_reachability_if_needed(&sock_b, &mut sess_b, &mut seal_buf, &mut relay_buf, false).await;
+
+        let (tr_tx_a, _tr_rx_a) = mpsc::channel(16);
+        let (tr_tx_b, _tr_rx_b) = mpsc::channel(16);
+        let (tr_tx_c, _tr_rx_c) = mpsc::channel(16);
+        let (raw_evt_a, _evt_rx_a) = mpsc::channel(32);
+        let (raw_evt_b, _evt_rx_b) = mpsc::channel(32);
+        let (raw_evt_c, mut evt_rx_c) = mpsc::channel(32);
+        let evt_a = NotifyingEventTx { tx: raw_evt_a, notify: Arc::new(Notify::new()) };
+        let evt_b = NotifyingEventTx { tx: raw_evt_b, notify: Arc::new(Notify::new()) };
+        let evt_c = NotifyingEventTx { tx: raw_evt_c, notify: Arc::new(Notify::new()) };
+        let (vtx_a, _vrx_a) = mpsc::channel(4);
+        let (vtx_b, _vrx_b) = mpsc::channel(4);
+        let (vtx_c, _vrx_c) = mpsc::channel(4);
+        let (dtx_a, _drx_a) = std::sync::mpsc::sync_channel(4);
+        let (dtx_b, _drx_b) = std::sync::mpsc::sync_channel(4);
+        let (dtx_c, _drx_c) = std::sync::mpsc::sync_channel(4);
+        let dec_a = VideoDecodeHandle { tx: dtx_a, generation: Arc::new(AtomicU64::new(0)), shrink_pending: Arc::new(AtomicBool::new(false)) };
+        let dec_b = VideoDecodeHandle { tx: dtx_b, generation: Arc::new(AtomicU64::new(0)), shrink_pending: Arc::new(AtomicBool::new(false)) };
+        let dec_c = VideoDecodeHandle { tx: dtx_c, generation: Arc::new(AtomicU64::new(0)), shrink_pending: Arc::new(AtomicBool::new(false)) };
+        let slot_a = Arc::new(Mutex::new(None));
+        let slot_b = Arc::new(Mutex::new(None));
+        let slot_c = Arc::new(Mutex::new(None));
+        let vnot_a = Arc::new(Notify::new());
+        let vnot_b = Arc::new(Notify::new());
+        let vnot_c = Arc::new(Notify::new());
+        let mut cap_a = None;
+        let mut cap_b = None;
+        let mut cap_c = None;
+
+        // A and C receive B's MeshReachability -> both promote A<->C to Priority 2 (MeshRelayed via B).
+        let mut buf = vec![0u8; MAX_RELAY_UDP_PAYLOAD + 64];
+        for (sock, sess, aud, tr_tx, evt_tx, cap, vtx, slot, vnot, dec) in [
+            (&sock_a, &mut sess_a, &aud_a, &tr_tx_a, &evt_a, &mut cap_a, &vtx_a, &slot_a, &vnot_a, &dec_a),
+            (&sock_c, &mut sess_c, &aud_c, &tr_tx_c, &evt_c, &mut cap_c, &vtx_c, &slot_c, &vnot_c, &dec_c),
+        ] {
+            let (len, from) = tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx = MeshRxCtx {
+                socket: sock,
+                audio_engine: aud,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx,
+                evt_tx,
+                capture_worker: cap,
+                video_out_tx: vtx,
+                video_frame_slot: slot,
+                video_notify: vnot,
+                decode_handle: dec,
+                lan_tx_sock: None,
+            };
+            handle_p2p_rx(sock, &mut buf[..len], from, None, None, sess, &mut ctx).await;
+        }
+
+        assert_eq!(sess_a.peers.get(&3).unwrap().status, PeerConnStatus::MeshRelayed);
+        assert_eq!(sess_a.peers.get(&3).unwrap().mesh_relay_peer, Some(2));
+        assert_eq!(sess_c.peers.get(&1).unwrap().status, PeerConnStatus::MeshRelayed);
+        assert_eq!(sess_c.peers.get(&1).unwrap().mesh_relay_peer, Some(2));
+
+        // 2. A sends a VideoFrameFrag to C -> must traverse B via OPCODE_PEER_RELAY (0 bytes to rv_sock!).
+        sess_c.watched_peer_id = Some(1);
+        sess_a.stream_subscribers.insert(3);
+        let vid_hdr = P2pHeader {
+            msg_type: P2pMsgType::VideoFrameFrag,
+            room_prefix: sess_a.room_prefix,
+            sender_peer_id: 1,
+            seq_num: 99,
+        };
+        let vid_payload = P2pPayload::VideoFrameFrag {
+            frame_id: 1,
+            frag_idx: 0,
+            frag_count: 1,
+            flags: squad_proto::VIDEO_FLAG_KEYFRAME,
+            data: vec![0x7E; 64],
+        };
+        sess_a.cipher.seal_packet(&vid_hdr, &vid_payload, &mut seal_buf).unwrap();
+        send_sealed_to_peer(&sock_a, &sess_a, 3, P2pMsgType::VideoFrameFrag, &seal_buf, &mut relay_buf).await;
+
+        // B forwards all queued OPCODE_PEER_RELAY datagrams (PunchSyn + VideoFrameFrag) without decrypting.
+        while let Ok(Ok((len_b, from_b))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_b.recv_from(&mut buf)).await
+        {
+            assert!(is_peer_relay_datagram(&buf[..len_b]));
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_b = MeshRxCtx {
+                socket: &sock_b,
+                audio_engine: &aud_b,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_b,
+                evt_tx: &evt_b,
+                capture_worker: &mut cap_b,
+                video_out_tx: &vtx_b,
+                video_frame_slot: &slot_b,
+                video_notify: &vnot_b,
+                decode_handle: &dec_b,
+                lan_tx_sock: None,
+            };
+            handle_peer_relay_datagram(&sock_b, &mut buf[..len_b], from_b, &mut sess_b, &mut ctx_b)
+                .await;
+        }
+
+        // C receives the forwarded OPCODE_PEER_RELAY datagrams from B and decodes the keyframe.
+        let mut got_video_frame = false;
+        while let Ok(Ok((len_c, from_c))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_c.recv_from(&mut buf)).await
+        {
+            assert_eq!(from_c, addr_b);
+            assert!(is_peer_relay_datagram(&buf[..len_c]));
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_c = MeshRxCtx {
+                socket: &sock_c,
+                audio_engine: &aud_c,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_c,
+                evt_tx: &evt_c,
+                capture_worker: &mut cap_c,
+                video_out_tx: &vtx_c,
+                video_frame_slot: &slot_c,
+                video_notify: &vnot_c,
+                decode_handle: &dec_c,
+                lan_tx_sock: None,
+            };
+            handle_peer_relay_datagram(&sock_c, &mut buf[..len_c], from_c, &mut sess_c, &mut ctx_c)
+                .await;
+            if matches!(
+                _drx_c.try_recv(),
+                Ok(DecodeJob::Frame {
+                    streamer_peer_id: 1,
+                    ..
+                })
+            ) {
+                got_video_frame = true;
+            }
+        }
+        assert!(
+            got_video_frame,
+            "C must receive and reassemble video frame relayed through teammate B"
+        );
+        // Server received 0 packets during Peer-Mesh Relay!
+        assert!(rv_sock.try_recv_from(&mut buf).is_err());
+
+        // 3. B disconnects -> C degrades to Priority 3 Server Relay; video watch stops and video sends are blocked.
+        sess_c.peers.remove(&2);
+        let degraded = reconcile_mesh_routes(&sock_c, &mut sess_c, &mut seal_buf, &mut relay_buf, Instant::now()).await;
+        assert_eq!(degraded, vec![1]);
+        assert_eq!(sess_c.peers.get(&1).unwrap().status, PeerConnStatus::Relayed);
+        enforce_video_route_policy(
+            &mut sess_c,
+            &degraded,
+            &mut cap_c,
+            &vtx_c,
+            &slot_c,
+            &vnot_c,
+            &dec_c,
+            &aud_c,
+            &evt_c,
+        )
+        .await;
+        assert_eq!(sess_c.watched_peer_id, None);
+        assert!(matches!(evt_rx_c.try_recv(), Ok(MeshEvent::Error(_))));
+
+        // Attempting to send VideoFrameFrag while in Server Relay must send nothing to rv_sock,
+        // whereas AudioOpus must be sent via Server Relay.
+        send_sealed_to_peer(&sock_c, &sess_c, 1, P2pMsgType::VideoFrameFrag, &seal_buf, &mut relay_buf).await;
+        assert!(rv_sock.try_recv_from(&mut buf).is_err());
+
+        let aud_hdr = P2pHeader {
+            msg_type: P2pMsgType::AudioOpus,
+            room_prefix: sess_c.room_prefix,
+            sender_peer_id: 3,
+            seq_num: 100,
+        };
+        sess_c
+            .cipher
+            .seal_packet(&aud_hdr, &P2pPayload::AudioOpus { opus_data: vec![1, 2, 3] }, &mut seal_buf)
+            .unwrap();
+        send_sealed_to_peer(&sock_c, &sess_c, 1, P2pMsgType::AudioOpus, &seal_buf, &mut relay_buf).await;
+        let (srv_len, _) = tokio::time::timeout(Duration::from_secs(1), rv_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(is_relay_datagram(&buf[..srv_len]));
+
         aud_a.shutdown();
         aud_b.shutdown();
         aud_c.shutdown();

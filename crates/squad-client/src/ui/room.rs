@@ -1,3 +1,4 @@
+use crate::net::PeerConnStatus;
 use crate::ui::{
     chat::view_chat,
     components::{avatar_circle, mic_level_meter, telemetry_badge},
@@ -222,6 +223,10 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                         .padding([5, 10])
                         .style(pill_chip_button(true))
                         .on_press(Message::StopWatchingStream)
+                } else if peer.status == PeerConnStatus::Relayed {
+                    button(text("P2P/Mesh Only").size(11))
+                        .padding([5, 10])
+                        .style(pill_tonal_button)
                 } else {
                     button(text("Watch").size(11))
                         .padding([5, 10])

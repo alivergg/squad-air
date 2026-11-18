@@ -61,7 +61,9 @@ pub async fn start_embedded_rendezvous() -> Result<EmbeddedRendezvousHandle> {
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
     let task = tokio::spawn(async move {
-        if let Err(err) = squad_rendezvous::run_server(sock_arc, shutdown_rx).await {
+        let cfg = squad_rendezvous::RendezvousConfig { enable_relay: true };
+        if let Err(err) = squad_rendezvous::run_server_with_config(sock_arc, cfg, shutdown_rx).await
+        {
             warn!("Embedded LAN rendezvous server exited with error: {err}");
         }
     });
