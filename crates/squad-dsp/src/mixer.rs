@@ -24,7 +24,13 @@ impl SoftLimiter {
 
     #[inline]
     pub fn process_sample(&mut self, x: f32) -> f32 {
-        let abs_x = x.abs();
+        if !x.is_finite() {
+            return 0.0;
+        }
+        if !self.envelope.is_finite() {
+            self.envelope = 0.0;
+        }
+        let abs_x = x.abs().min(10.0);
         if abs_x > self.envelope {
             self.envelope = abs_x;
         } else {
@@ -136,6 +142,9 @@ impl AudioMixer {
     }
 
     pub fn push_peer_opus(&mut self, peer_id: PeerId, seq_num: u64, opus_payload: Vec<u8>) {
+        if !self.peers.contains_key(&peer_id) && self.peers.len() >= 16 {
+            return;
+        }
         let profile = self.jitter_profile;
         let channel = self.peers.entry(peer_id).or_insert_with(|| PeerChannel {
             jitter: JitterBuffer::with_profile(profile),
@@ -145,6 +154,9 @@ impl AudioMixer {
     }
 
     pub fn push_stream_opus(&mut self, peer_id: PeerId, seq_num: u64, opus_payload: Vec<u8>) {
+        if !self.stream_peers.contains_key(&peer_id) && self.stream_peers.len() >= 8 {
+            return;
+        }
         let profile = self.jitter_profile;
         let channel = self
             .stream_peers
@@ -157,7 +169,12 @@ impl AudioMixer {
     }
 
     pub fn set_stream_gain(&mut self, gain: f32) {
-        self.stream_gain = gain.clamp(0.0, 2.0);
+        let clamped = if gain.is_finite() {
+            gain.clamp(0.0, 2.0)
+        } else {
+            1.0
+        };
+        self.stream_gain = clamped;
     }
 
     pub fn clear_stream_audio(&mut self) {
@@ -166,7 +183,14 @@ impl AudioMixer {
 
     /// Устанавливает индивидуальную громкость участника (`0.0` = 0%, `1.0` = 100%, `2.0` = 200%).
     pub fn set_peer_gain(&mut self, peer_id: PeerId, gain: f32) {
-        let clamped = gain.clamp(0.0, 2.0);
+        if !self.peers.contains_key(&peer_id) && self.peers.len() >= 16 {
+            return;
+        }
+        let clamped = if gain.is_finite() {
+            gain.clamp(0.0, 2.0)
+        } else {
+            1.0
+        };
         let profile = self.jitter_profile;
         let channel = self.peers.entry(peer_id).or_insert_with(|| PeerChannel {
             jitter: JitterBuffer::with_profile(profile),
@@ -369,5 +393,18 @@ mod tests {
         assert!((out[0] - 0.3 * 1.25).abs() < 1e-5);
         assert!(!mixer.has_loopback());
         assert!(!mixer.mix_frame(false, &mut out));
+    }
+
+    #[test]
+    fn test_soft_limiter_recovers_from_non_finite_samples() {
+        let mut limiter = SoftLimiter::new();
+        assert!((limiter.process_sample(0.5) - 0.5).abs() < 1e-6);
+        assert_eq!(limiter.process_sample(f32::INFINITY), 0.0);
+        assert_eq!(limiter.process_sample(f32::NEG_INFINITY), 0.0);
+        assert_eq!(limiter.process_sample(f32::NAN), 0.0);
+
+        let recovered = limiter.process_sample(0.25);
+        assert!(recovered.is_finite());
+        assert!((recovered - 0.25).abs() < 1e-6);
     }
 }

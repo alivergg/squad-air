@@ -2,6 +2,8 @@
 name = "squad-dsp"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
+license.workspace = true
 
 [dependencies]
 squad-proto = { path = "../squad-proto" }

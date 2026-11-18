@@ -22,7 +22,7 @@ pub struct OpusEncoder10ms {
 impl OpusEncoder10ms {
     pub fn new(bitrate_bps: i32) -> Result<Self, OpusCodecError> {
         let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
-        encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate_bps))?;
+        encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate_bps.clamp(12_000, 128_000)))?;
         encoder.set_inband_fec(true)?;
         encoder.set_packet_loss_perc(5)?;
         let _ = encoder.set_complexity(8);
@@ -87,7 +87,8 @@ impl OpusDecoder10ms {
     ) -> Result<(), OpusCodecError> {
         let packet = Packet::try_from(opus_bytes)?;
         let signals = MutSignals::try_from(&mut out_pcm[..])?;
-        let _decoded_samples = self.decoder.decode_float(Some(packet), signals, false)?;
+        let decoded = self.decoder.decode_float(Some(packet), signals, false)?;
+        Self::finalize_decoded_frame(decoded, out_pcm);
         Ok(())
     }
 
@@ -99,13 +100,25 @@ impl OpusDecoder10ms {
         out_pcm: &mut [f32; FRAME_SAMPLES],
     ) -> Result<(), OpusCodecError> {
         let signals = MutSignals::try_from(&mut out_pcm[..])?;
-        if let Some(next_bytes) = next_opus_bytes {
+        let decoded = if let Some(next_bytes) = next_opus_bytes {
             let packet = Packet::try_from(next_bytes)?;
-            let _ = self.decoder.decode_float(Some(packet), signals, true)?;
+            self.decoder.decode_float(Some(packet), signals, true)?
         } else {
-            let _ = self.decoder.decode_float(None, signals, false)?;
-        }
+            self.decoder.decode_float(None, signals, false)?
+        };
+        Self::finalize_decoded_frame(decoded, out_pcm);
         Ok(())
+    }
+
+    fn finalize_decoded_frame(decoded: usize, out_pcm: &mut [f32; FRAME_SAMPLES]) {
+        if decoded < FRAME_SAMPLES {
+            out_pcm[decoded..FRAME_SAMPLES].fill(0.0);
+        }
+        for s in out_pcm.iter_mut() {
+            if !s.is_finite() {
+                *s = 0.0;
+            }
+        }
     }
 }
 

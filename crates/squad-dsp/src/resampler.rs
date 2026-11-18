@@ -2,6 +2,15 @@ use crate::{FRAME_SAMPLES, SAMPLE_RATE};
 use rubato::{FftFixedIn, FftFixedOut, Resampler};
 use std::collections::VecDeque;
 
+const MAX_FIFO_SAMPLES: usize = 96_000;
+
+fn cap_fifo(fifo: &mut VecDeque<f32>) {
+    if fifo.len() > MAX_FIFO_SAMPLES {
+        let excess = fifo.len() - MAX_FIFO_SAMPLES;
+        fifo.drain(..excess);
+    }
+}
+
 /// Преобразует входной моно-поток произвольной частоты (например, 44.1 кГц)
 /// в строгие кадры по 480 сэмплов (10 мс @ 48 кГц).
 pub struct CaptureResampler {
@@ -44,9 +53,11 @@ impl CaptureResampler {
     pub fn push_samples(&mut self, samples: &[f32]) {
         if self.resampler.is_none() {
             self.fifo_out.extend(samples.iter().copied());
+            cap_fifo(&mut self.fifo_out);
             return;
         }
         self.fifo_in.extend(samples.iter().copied());
+        cap_fifo(&mut self.fifo_in);
 
         if let Some(resampler) = self.resampler.as_mut() {
             loop {
@@ -67,6 +78,7 @@ impl CaptureResampler {
                         .extend(self.output_scratch[0][..FRAME_SAMPLES].iter().copied());
                 }
             }
+            cap_fifo(&mut self.fifo_out);
         }
     }
 

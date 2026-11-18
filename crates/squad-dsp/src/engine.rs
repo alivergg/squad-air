@@ -376,12 +376,18 @@ impl AudioEngineHandle {
     }
 
     pub fn set_input_gain(&self, gain: f32) {
+        if !gain.is_finite() {
+            return;
+        }
         self.atomics
             .input_gain_bits
             .store(gain.clamp(0.0, 2.5).to_bits(), Ordering::Relaxed);
     }
 
     pub fn set_vad_threshold_db(&self, threshold_db: f32) {
+        if !threshold_db.is_finite() {
+            return;
+        }
         self.atomics
             .vad_threshold_db_bits
             .store(threshold_db.clamp(-60.0, 0.0).to_bits(), Ordering::Relaxed);
@@ -504,7 +510,7 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
 
     if let Some(ref cfg) = default_cfg {
         if cfg.sample_rate().0 == SAMPLE_RATE && cfg.sample_format() == cpal::SampleFormat::F32 {
-            return (SAMPLE_RATE, cfg.channels() as usize);
+            return (SAMPLE_RATE, (cfg.channels() as usize).max(1));
         }
     }
 
@@ -520,11 +526,11 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
     };
 
     if let Some(ch) = f32_48k_channels {
-        return (SAMPLE_RATE, ch);
+        return (SAMPLE_RATE, ch.max(1));
     }
 
     default_cfg
-        .map(|c| (c.sample_rate().0, c.channels() as usize))
+        .map(|c| (c.sample_rate().0.clamp(8_000, 192_000), (c.channels() as usize).max(1)))
         .unwrap_or((SAMPLE_RATE, if is_input { 1 } else { 2 }))
 }
 
@@ -551,10 +557,12 @@ struct OutputStreamHalf {
 fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -> InputStreamHalf {
     let (in_device, resolved_name, using_fallback) =
         select_device_with_meta(host, input_device_name, true);
-    let (in_rate, in_channels) = in_device
+    let (raw_in_rate, raw_in_channels) = in_device
         .as_ref()
         .map(|d| negotiate_device_format(d, true))
         .unwrap_or((SAMPLE_RATE, 1));
+    let in_rate = raw_in_rate.clamp(8_000, 192_000);
+    let in_channels = raw_in_channels.max(1);
 
     let capture_rb = HeapRb::<f32>::new((in_rate as usize) / 2);
     let (mut cap_prod, cap_cons) = capture_rb.split();
@@ -579,8 +587,7 @@ fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -
                     }
                 }
             },
-            move |err| {
-                warn!("Audio input stream error: {err}");
+            move |_err| {
                 failed_cb.store(true, Ordering::Relaxed);
             },
             None,
@@ -620,10 +627,12 @@ fn build_output_stream_half(
 ) -> OutputStreamHalf {
     let (out_device, resolved_name, using_fallback) =
         select_device_with_meta(host, output_device_name, false);
-    let (out_rate, out_channels) = out_device
+    let (raw_out_rate, raw_out_channels) = out_device
         .as_ref()
         .map(|d| negotiate_device_format(d, false))
         .unwrap_or((SAMPLE_RATE, 2));
+    let out_rate = raw_out_rate.clamp(8_000, 192_000);
+    let out_channels = raw_out_channels.max(1);
 
     let playback_rb = HeapRb::<f32>::new((out_rate as usize) / 2);
     let (mut play_prod, mut play_cons) = playback_rb.split();
@@ -647,15 +656,25 @@ fn build_output_stream_half(
                 if out_channels == 1 {
                     let popped = play_cons.pop_slice(data);
                     data[popped..].fill(0.0);
-                } else {
-                    for frame in data.chunks_mut(out_channels) {
+                } else if out_channels == 2 {
+                    for frame in data.chunks_mut(2) {
                         let sample = play_cons.try_pop().unwrap_or(0.0);
                         frame.fill(sample);
                     }
+                } else {
+                    for frame in data.chunks_mut(out_channels) {
+                        let sample = play_cons.try_pop().unwrap_or(0.0);
+                        if frame.len() >= 2 {
+                            frame[0] = sample;
+                            frame[1] = sample;
+                            frame[2..].fill(0.0);
+                        } else {
+                            frame.fill(sample);
+                        }
+                    }
                 }
             },
-            move |err| {
-                warn!("Audio output stream error: {err}");
+            move |_err| {
                 failed_cb.store(true, Ordering::Relaxed);
             },
             None,
@@ -760,9 +779,11 @@ fn build_loopback_stream(
 
     let dev = target_dev?;
     #[cfg(target_os = "windows")]
-    let (lb_rate, lb_channels) = negotiate_device_format(&dev, false);
+    let (raw_lb_rate, raw_lb_channels) = negotiate_device_format(&dev, false);
     #[cfg(not(target_os = "windows"))]
-    let (lb_rate, lb_channels) = negotiate_device_format(&dev, true);
+    let (raw_lb_rate, raw_lb_channels) = negotiate_device_format(&dev, true);
+    let lb_rate = raw_lb_rate.clamp(8_000, 192_000);
+    let lb_channels = raw_lb_channels.max(1);
 
     let rb = HeapRb::<f32>::new((lb_rate as usize) / 2);
     let (mut prod, cons) = rb.split();
@@ -799,6 +820,7 @@ fn build_loopback_stream(
 struct WorkerAudioCtx<'a> {
     host: &'a cpal::Host,
     atomics: &'a SharedAtomics,
+    peer_stats: &'a Arc<DashMap<PeerId, PeerAudioStats>>,
     suppressor: &'a mut NoiseSuppressor,
     aec: &'a mut EchoCanceller,
     encoder: &'a mut OpusEncoder10ms,
@@ -931,8 +953,14 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
                 drop(ctx.stream_loopback.take());
             }
         }
-        EngineCmd::RemovePeer { peer_id } => ctx.mixer.remove_peer(peer_id),
-        EngineCmd::ClearPeers => ctx.mixer.clear_peers(),
+        EngineCmd::RemovePeer { peer_id } => {
+            ctx.mixer.remove_peer(peer_id);
+            ctx.peer_stats.remove(&peer_id);
+        }
+        EngineCmd::ClearPeers => {
+            ctx.mixer.clear_peers();
+            ctx.peer_stats.clear();
+        }
         EngineCmd::SetAec(enabled) => ctx.aec.set_enabled(enabled),
         EngineCmd::SetNsMode(mode) => ctx.suppressor.set_mode(mode),
         EngineCmd::SetOpusBitrate(bitrate_bps) => {
@@ -1077,6 +1105,7 @@ fn run_audio_worker(
                     let mut ctx = WorkerAudioCtx {
                         host: &host,
                         atomics: &atomics,
+                        peer_stats: &peer_stats,
                         suppressor: &mut suppressor,
                         aec: &mut aec,
                         encoder: &mut encoder,
@@ -1104,6 +1133,7 @@ fn run_audio_worker(
             let mut ctx = WorkerAudioCtx {
                 host: &host,
                 atomics: &atomics,
+                peer_stats: &peer_stats,
                 suppressor: &mut suppressor,
                 aec: &mut aec,
                 encoder: &mut encoder,

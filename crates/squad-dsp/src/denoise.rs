@@ -60,8 +60,11 @@ impl NoiseSuppressor {
     }
 
     fn try_load_df3_model() -> Option<TractRunnable> {
+        const MAX_DF3_MODEL_BYTES: u64 = 64 * 1024 * 1024;
         for path in Self::candidate_model_paths() {
-            if path.exists() {
+            if std::fs::metadata(&path)
+                .is_ok_and(|m| m.is_file() && m.len() <= MAX_DF3_MODEL_BYTES)
+            {
                 match Self::load_onnx(&path) {
                     Ok(plan) => {
                         info!("Loaded DeepFilterNet3 ONNX model from {}", path.display());
@@ -119,29 +122,41 @@ impl NoiseSuppressor {
     #[inline]
     fn run_rnnoise(&mut self, frame: &mut [f32; FRAME_SAMPLES]) {
         for (dst, &src) in self.scaled_in.iter_mut().zip(frame.iter()) {
-            *dst = (src * PCM16_SCALE).clamp(-32768.0, 32767.0);
+            let clean = if !src.is_finite() { 0.0 } else { src };
+            *dst = (clean * PCM16_SCALE).clamp(-32768.0, 32767.0);
         }
         self.rnnoise
             .process_frame(&mut self.scaled_out, &self.scaled_in);
         for (dst, &src) in frame.iter_mut().zip(self.scaled_out.iter()) {
-            *dst = (src * INV_PCM16_SCALE).clamp(-1.0, 1.0);
+            let clean = if !src.is_finite() { 0.0 } else { src };
+            *dst = (clean * INV_PCM16_SCALE).clamp(-1.0, 1.0);
         }
     }
 
     fn run_df3_tract(plan: &TractRunnable, frame: &mut [f32; FRAME_SAMPLES]) -> TractResult<()> {
+        let clean_in: Vec<f32> = frame
+            .iter()
+            .map(|&src| if !src.is_finite() { 0.0 } else { src })
+            .collect();
         let input_tensor =
-            tract_ndarray::Array2::from_shape_vec((1, FRAME_SAMPLES), frame.to_vec())?
-                .into_tensor();
+            tract_ndarray::Array2::from_shape_vec((1, FRAME_SAMPLES), clean_in)?.into_tensor();
         let mut outputs = plan.run(tvec!(input_tensor.into()))?;
-        if let Some(first) = outputs.pop() {
-            let view = first.to_array_view::<f32>()?;
-            if let Some(slice) = view.as_slice() {
-                if slice.len() >= FRAME_SAMPLES {
-                    for (dst, &src) in frame.iter_mut().zip(slice[..FRAME_SAMPLES].iter()) {
-                        *dst = src.clamp(-1.0, 1.0);
-                    }
-                }
-            }
+        let first = outputs
+            .pop()
+            .ok_or_else(|| anyhow::anyhow!("DeepFilterNet3 produced no output tensor"))?;
+        let view = first.to_array_view::<f32>()?;
+        let slice = view
+            .as_slice()
+            .ok_or_else(|| anyhow::anyhow!("DeepFilterNet3 output tensor is non-contiguous"))?;
+        if slice.len() < FRAME_SAMPLES {
+            return Err(anyhow::anyhow!(
+                "DeepFilterNet3 output shorter than frame: {}",
+                slice.len()
+            ));
+        }
+        for (dst, &src) in frame.iter_mut().zip(slice[..FRAME_SAMPLES].iter()) {
+            let clean = if !src.is_finite() { 0.0 } else { src };
+            *dst = clean.clamp(-1.0, 1.0);
         }
         Ok(())
     }

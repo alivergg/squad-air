@@ -108,7 +108,7 @@ impl JitterBuffer {
         while self.packets.len() > self.max_frames {
             if let Some((&oldest_seq, _)) = self.packets.iter().next() {
                 self.packets.remove(&oldest_seq);
-                self.next_expected_seq = Some(oldest_seq + 1);
+                self.next_expected_seq = Some(oldest_seq.saturating_add(1));
             }
         }
 
@@ -118,6 +118,10 @@ impl JitterBuffer {
     }
 
     pub fn push_packet(&mut self, seq_num: u64, opus_payload: Vec<u8>) {
+        if opus_payload.is_empty() || opus_payload.len() > 1024 {
+            return;
+        }
+
         if let Some(expected) = self.next_expected_seq {
             if seq_num < expected {
                 // Пакет опоздал сильнее текущего окна воспроизведения — отбрасываем
@@ -129,6 +133,11 @@ impl JitterBuffer {
                 self.next_expected_seq = Some(seq_num);
                 self.primed = false;
             }
+        } else if let Some(&first_seq) = self.packets.keys().next() {
+            if seq_num < first_seq || seq_num.saturating_sub(first_seq) > 25 {
+                self.packets.clear();
+                self.primed = false;
+            }
         }
 
         self.packets.insert(seq_num, opus_payload);
@@ -137,7 +146,7 @@ impl JitterBuffer {
         while self.packets.len() > self.max_frames {
             if let Some((&oldest_seq, _)) = self.packets.iter().next() {
                 self.packets.remove(&oldest_seq);
-                self.next_expected_seq = Some(oldest_seq + 1);
+                self.next_expected_seq = Some(oldest_seq.saturating_add(1));
             }
         }
 
@@ -171,7 +180,7 @@ impl JitterBuffer {
         };
 
         if let Some(opus_bytes) = self.packets.remove(&seq) {
-            self.next_expected_seq = Some(seq + 1);
+            self.next_expected_seq = Some(seq.saturating_add(1));
             self.consecutive_missing = 0;
             self.received_window += 1;
             self.update_loss_stats();
@@ -185,10 +194,20 @@ impl JitterBuffer {
         } else {
             self.consecutive_missing += 1;
             if !self.packets.is_empty() {
-                self.next_expected_seq = Some(seq + 1);
+                if self.consecutive_missing > MAX_PLC_CONSECUTIVE {
+                    self.next_expected_seq = self.packets.keys().next().copied();
+                    self.consecutive_missing = 0;
+                    out_pcm.fill(0.0);
+                    if self.speaking_hold_frames > 0 {
+                        self.speaking_hold_frames -= 1;
+                    }
+                    return false;
+                }
+                let next_seq = seq.saturating_add(1);
+                self.next_expected_seq = Some(next_seq);
                 self.lost_window += 1;
                 self.update_loss_stats();
-                let next_pkt = self.packets.get(&(seq + 1)).map(|v| v.as_slice());
+                let next_pkt = self.packets.get(&next_seq).map(|v| v.as_slice());
                 if self.decoder.decode_missing(next_pkt, out_pcm).is_err() {
                     out_pcm.fill(0.0);
                     return false;
@@ -333,5 +352,59 @@ mod tests {
         assert_eq!(JitterProfile::LowLatency.target_ms(), 20);
         assert_eq!(JitterProfile::Balanced.target_ms(), 30);
         assert_eq!(JitterProfile::StableWifi.target_ms(), 50);
+    }
+
+    #[test]
+    fn test_jitter_u64_max_and_large_gap_bounded_plc() {
+        let mut encoder = OpusEncoder10ms::new(40_000).unwrap();
+        let mut pcm = [0.0f32; FRAME_SAMPLES];
+        for (i, sample) in pcm.iter_mut().enumerate() {
+            let t = i as f32 / 48_000.0;
+            *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.5;
+        }
+        let pkt = encoder.encode_speech_frame(&pcm).unwrap();
+        let mut out = [0.0f32; FRAME_SAMPLES];
+
+        // u64::MAX sequence numbers must not overflow or panic.
+        let mut jb_max = JitterBuffer::with_profile(JitterProfile::LanUltraLow);
+        jb_max.push_packet(u64::MAX - 1, pkt.clone());
+        jb_max.push_packet(u64::MAX, pkt.clone());
+        assert!(jb_max.pop_pcm_frame(&mut out));
+        assert_eq!(jb_max.next_expected_seq, Some(u64::MAX));
+        assert!(jb_max.pop_pcm_frame(&mut out));
+        assert_eq!(jb_max.next_expected_seq, Some(u64::MAX));
+        for _ in 0..=MAX_PLC_CONSECUTIVE {
+            let _ = jb_max.pop_pcm_frame(&mut out);
+        }
+
+        // Empty or oversized payloads are ignored.
+        let mut jb_bounds = JitterBuffer::with_profile(JitterProfile::LanUltraLow);
+        jb_bounds.push_packet(1, Vec::new());
+        jb_bounds.push_packet(2, vec![0u8; 1025]);
+        assert!(!jb_bounds.pop_pcm_frame(&mut out));
+
+        // Large gap while next_expected_seq is None clears stale packets without spinning PLC.
+        let mut jb_gap = JitterBuffer::with_profile(JitterProfile::Balanced);
+        jb_gap.push_packet(1, pkt.clone());
+        jb_gap.push_packet(1_000_000, pkt.clone());
+        jb_gap.push_packet(1_000_001, pkt.clone());
+        jb_gap.push_packet(1_000_002, pkt.clone());
+        assert!(jb_gap.pop_pcm_frame(&mut out));
+        assert_eq!(jb_gap.next_expected_seq, Some(1_000_001));
+
+        // In-window gap snaps forward after at most MAX_PLC_CONSECUTIVE PLC frames.
+        let mut jb_snap = JitterBuffer::with_profile(JitterProfile::Balanced);
+        jb_snap.push_packet(1, pkt.clone());
+        jb_snap.push_packet(20, pkt.clone());
+        jb_snap.push_packet(21, pkt);
+        assert!(jb_snap.pop_pcm_frame(&mut out));
+        assert_eq!(jb_snap.next_expected_seq, Some(2));
+        for _ in 0..MAX_PLC_CONSECUTIVE {
+            assert!(jb_snap.pop_pcm_frame(&mut out));
+        }
+        assert!(!jb_snap.pop_pcm_frame(&mut out));
+        assert_eq!(jb_snap.next_expected_seq, Some(20));
+        assert!(jb_snap.pop_pcm_frame(&mut out));
+        assert_eq!(jb_snap.next_expected_seq, Some(21));
     }
 }

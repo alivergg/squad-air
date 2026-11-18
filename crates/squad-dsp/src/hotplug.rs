@@ -201,7 +201,13 @@ pub(crate) enum WatcherSignal {
 #[cfg(target_os = "macos")]
 mod macos_ca {
     use std::ffi::c_void;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::Thread;
+
+    struct CoreAudioCallbackCtx {
+        active: AtomicBool,
+        thread: Thread,
+    }
 
     #[repr(C)]
     #[derive(Clone, Copy)]
@@ -246,20 +252,25 @@ mod macos_ca {
     ) -> i32 {
         if !in_client_data.is_null() {
             // Only unpark the dedicated watcher thread; never call CoreAudio APIs inside HAL callback.
-            let th = unsafe { &*(in_client_data as *const Thread) };
-            th.unpark();
+            let ctx = unsafe { &*(in_client_data as *const CoreAudioCallbackCtx) };
+            if ctx.active.load(Ordering::Acquire) {
+                ctx.thread.unpark();
+            }
         }
         0
     }
 
     pub struct CoreAudioListenerGuard {
-        client_data: *mut Thread,
+        client_data: *mut CoreAudioCallbackCtx,
         addrs: [AudioObjectPropertyAddress; 3],
     }
 
     impl CoreAudioListenerGuard {
         pub fn register(thread: Thread) -> Self {
-            let client_data = Box::into_raw(Box::new(thread));
+            let client_data = Box::into_raw(Box::new(CoreAudioCallbackCtx {
+                active: AtomicBool::new(true),
+                thread,
+            }));
             let addrs = [
                 AudioObjectPropertyAddress {
                     m_selector: K_AUDIO_HARDWARE_PROPERTY_DEVICES,
@@ -293,6 +304,9 @@ mod macos_ca {
 
     impl Drop for CoreAudioListenerGuard {
         fn drop(&mut self) {
+            unsafe {
+                (*self.client_data).active.store(false, Ordering::Release);
+            }
             for addr in &self.addrs {
                 unsafe {
                     AudioObjectRemovePropertyListener(
@@ -302,10 +316,6 @@ mod macos_ca {
                         self.client_data as *mut c_void,
                     );
                 }
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-            unsafe {
-                drop(Box::from_raw(self.client_data));
             }
         }
     }
