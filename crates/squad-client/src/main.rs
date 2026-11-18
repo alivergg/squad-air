@@ -5,6 +5,7 @@ mod hotkeys;
 mod net;
 mod tray;
 mod ui;
+mod updater;
 
 use ui::SquadApp;
 

@@ -392,9 +392,31 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
         .style(surface_card_style);
 
     let min_to_tray = app.config.minimize_to_tray;
+    let current_ver = crate::updater::current_app_version();
+    let update_subtitle = if let Some(ref info) = app.available_update {
+        format!("Update available: {} ({})", info.tag_name, info.asset_name)
+    } else if let Some(ref status) = app.update_status_text {
+        status.clone()
+    } else {
+        "Checks GitHub Releases on startup and verifies SHA-256 checksums".to_string()
+    };
+    let mut app_actions = row![button(text("Check for Updates").size(12))
+        .padding([6, 12])
+        .style(pill_tonal_button)
+        .on_press(Message::CheckForUpdatesManual),]
+    .spacing(8);
+    if let Some(ref info) = app.available_update {
+        app_actions = app_actions.push(
+            button(text(format!("Update to {}", info.tag_name)).size(12))
+                .padding([6, 12])
+                .style(pill_primary_button)
+                .on_press(Message::OpenUpdateModal),
+        );
+    }
+
     let behavior_section = container(
         column![
-            text("Behavior & System Tray").size(16).color(M3_PRIMARY),
+            text("Behavior, Tray & Updates").size(16).color(M3_PRIMARY),
             row![
                 column![
                     text("Minimize to System Tray on Close").size(13),
@@ -415,6 +437,16 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                         .on_press(Message::SetMinimizeToTray(true)),
                 ]
                 .spacing(6),
+            ]
+            .align_y(Vertical::Center),
+            row![
+                column![
+                    text(format!("App Version: v{current_ver}")).size(13),
+                    text(update_subtitle).size(11).color(M3_ON_SURFACE_VARIANT),
+                ]
+                .spacing(2),
+                horizontal_space(),
+                app_actions,
             ]
             .align_y(Vertical::Center),
         ]

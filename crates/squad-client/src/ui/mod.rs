@@ -23,8 +23,9 @@ use crate::ui::avatar::{
 };
 use crate::ui::share_modal::ShareSourceTab;
 use crate::ui::theme::{
-    material_dark_theme, pill_danger_button, pill_primary_button, pill_tonal_button,
-    root_container_style, M3_ON_SURFACE, M3_OUTLINE, M3_SURFACE_CONTAINER,
+    material_dark_theme, pill_danger_button, pill_primary_button, pill_success_button,
+    pill_tonal_button, root_container_style, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_OUTLINE,
+    M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SURFACE_CONTAINER, M3_SURFACE_HIGH,
 };
 use iced::{
     advanced::subscription::{from_recipe, EventStream, Hasher, Recipe},
@@ -33,8 +34,8 @@ use iced::{
     futures::{stream::BoxStream, SinkExt},
     keyboard, mouse, stream,
     widget::{
-        button, column, container, horizontal_space, image as iced_image, row, stack, text,
-        text_editor,
+        button, column, container, horizontal_space, image as iced_image, row, scrollable, stack,
+        text, text_editor,
     },
     Background, Border, Color, ContentFit, Element, Length, Point, Size, Subscription, Task, Theme,
 };
@@ -181,6 +182,13 @@ pub enum Message {
     OverlayWindowOpened(iced::window::Id),
     OverlayConfigured,
     WindowCloseRequested(iced::window::Id),
+    CheckForUpdatesManual,
+    UpdateCheckCompleted(Result<Option<crate::updater::ReleaseInfo>, String>),
+    OpenUpdateModal,
+    DismissUpdateModal,
+    SkipUpdateVersion,
+    StartOneClickUpdate,
+    UpdateInstallFinished(Result<String, String>),
 }
 
 struct UiSyncState {
@@ -344,6 +352,11 @@ pub struct SquadApp {
     pub recording_hotkey: Option<HotkeySlot>,
     pub lan_rooms: Vec<DiscoveredLanRoom>,
     pub lan_room_name_input: String,
+    pub available_update: Option<crate::updater::ReleaseInfo>,
+    pub update_modal_open: bool,
+    pub update_in_progress: bool,
+    pub update_status_text: Option<String>,
+    update_manual_check: bool,
     ui_sync: Arc<UiSyncState>,
 }
 
@@ -473,10 +486,28 @@ impl SquadApp {
             recording_hotkey: None,
             lan_rooms: Vec::new(),
             lan_room_name_input: String::new(),
+            available_update: None,
+            update_modal_open: false,
+            update_in_progress: false,
+            update_status_text: None,
+            update_manual_check: false,
             ui_sync,
         };
 
-        (app, open_main_task.map(Message::WindowOpened))
+        let update_task = Task::perform(
+            async {
+                tokio::task::spawn_blocking(crate::updater::check_latest_release)
+                    .await
+                    .map_err(|e| format!("Update check failed: {e}"))
+                    .and_then(|res| res)
+            },
+            Message::UpdateCheckCompleted,
+        );
+
+        (
+            app,
+            Task::batch([open_main_task.map(Message::WindowOpened), update_task]),
+        )
     }
 
     pub fn title(&self, window_id: iced::window::Id) -> String {
@@ -1350,6 +1381,9 @@ impl SquadApp {
             Message::EscapePressed => {
                 self.lightbox_blob_id = None;
                 self.share_modal_open = false;
+                if !self.update_in_progress {
+                    self.update_modal_open = false;
+                }
                 if self.stream_fullscreen {
                     self.stream_fullscreen = false;
                     if let Some(id) = self.main_window_id {
@@ -1707,6 +1741,109 @@ impl SquadApp {
                     .try_send(MeshCommand::SetLocalAvatar { avatar: None });
                 Task::none()
             }
+            Message::CheckForUpdatesManual => {
+                self.update_manual_check = true;
+                self.update_status_text = Some("Checking GitHub Releases...".to_string());
+                Task::perform(
+                    async {
+                        tokio::task::spawn_blocking(crate::updater::check_latest_release)
+                            .await
+                            .map_err(|e| format!("Update check failed: {e}"))
+                            .and_then(|res| res)
+                    },
+                    Message::UpdateCheckCompleted,
+                )
+            }
+            Message::UpdateCheckCompleted(result) => {
+                let is_manual = self.update_manual_check;
+                self.update_manual_check = false;
+                match result {
+                    Ok(Some(info)) => {
+                        let skipped = self.config.skipped_update_version.as_deref()
+                            == Some(info.tag_name.as_str());
+                        self.available_update = Some(info);
+                        self.update_status_text = None;
+                        if is_manual || !skipped {
+                            self.update_modal_open = true;
+                        }
+                    }
+                    Ok(None) => {
+                        self.available_update = None;
+                        if is_manual {
+                            self.update_status_text = Some(format!(
+                                "You are up to date (v{}).",
+                                crate::updater::current_app_version()
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        if is_manual {
+                            self.update_status_text = Some(err);
+                        }
+                    }
+                }
+                Task::none()
+            }
+            Message::OpenUpdateModal => {
+                if self.available_update.is_some() {
+                    self.update_modal_open = true;
+                    if !self.update_in_progress {
+                        self.update_status_text = None;
+                    }
+                }
+                Task::none()
+            }
+            Message::DismissUpdateModal => {
+                if !self.update_in_progress {
+                    self.update_modal_open = false;
+                }
+                Task::none()
+            }
+            Message::SkipUpdateVersion => {
+                if !self.update_in_progress {
+                    if let Some(ref info) = self.available_update {
+                        self.config.skipped_update_version = Some(info.tag_name.clone());
+                        let _ = self.config.save();
+                    }
+                    self.update_modal_open = false;
+                }
+                Task::none()
+            }
+            Message::StartOneClickUpdate => {
+                if !self.update_in_progress {
+                    if let Some(info) = self.available_update.clone() {
+                        self.update_in_progress = true;
+                        self.update_status_text =
+                            Some("Downloading installer & verifying SHA-256...".to_string());
+                        return Task::perform(
+                            async move {
+                                tokio::task::spawn_blocking(move || {
+                                    crate::updater::download_verify_and_launch(info)
+                                })
+                                .await
+                                .map_err(|e| format!("Update installer task failed: {e}"))
+                                .and_then(|res| res)
+                            },
+                            Message::UpdateInstallFinished,
+                        );
+                    }
+                }
+                Task::none()
+            }
+            Message::UpdateInstallFinished(result) => {
+                self.update_in_progress = false;
+                match result {
+                    Ok(msg) => {
+                        self.update_status_text = Some(msg.clone());
+                        self.status_banner = Some(msg);
+                    }
+                    Err(err) => {
+                        self.update_status_text = Some(err.clone());
+                        self.status_banner = Some(err);
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1742,6 +1879,20 @@ impl SquadApp {
 
         if self.share_modal_open {
             stack![base, share_modal::view_share_modal(self)].into()
+        } else if self.update_modal_open {
+            if let Some(ref info) = self.available_update {
+                stack![
+                    base,
+                    view_update_modal(
+                        info,
+                        self.update_in_progress,
+                        self.update_status_text.as_deref()
+                    )
+                ]
+                .into()
+            } else {
+                base.into()
+            }
         } else {
             base.into()
         }
@@ -1952,6 +2103,98 @@ fn view_image_lightbox<'a>(
         .padding(32)
         .style(|_t: &Theme| container::Style {
             background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.84))),
+            ..Default::default()
+        })
+        .into()
+}
+
+fn view_update_modal<'a>(
+    info: &'a crate::updater::ReleaseInfo,
+    in_progress: bool,
+    status_text: Option<&'a str>,
+) -> Element<'a, Message> {
+    let current = crate::updater::current_app_version();
+    let header = column![
+        text(format!("Update Available: SquadAir {}", info.tag_name))
+            .size(19)
+            .color(M3_PRIMARY),
+        text(format!(
+            "Current version: v{current} • Verified SHA-256 1-Click Installer ({})",
+            info.asset_name
+        ))
+        .size(12)
+        .color(M3_ON_SURFACE_VARIANT),
+    ]
+    .spacing(4);
+
+    let notes_box = container(
+        scrollable(text(&info.notes).size(13).color(M3_ON_SURFACE))
+            .height(Length::Fixed(180.0))
+            .width(Length::Fill),
+    )
+    .width(Length::Fill)
+    .padding(12)
+    .style(|_t: &Theme| container::Style {
+        background: Some(Background::Color(M3_SURFACE_HIGH)),
+        border: Border {
+            color: M3_OUTLINE_VARIANT,
+            width: 1.0,
+            radius: 12.0.into(),
+        },
+        ..Default::default()
+    });
+
+    let mut content_col = column![header, notes_box].spacing(14);
+    if let Some(status) = status_text {
+        content_col = content_col.push(text(status).size(12).color(M3_ON_SURFACE_VARIANT));
+    }
+
+    let mut skip_btn = button(text("Skip This Version").size(12))
+        .padding([9, 14])
+        .style(pill_tonal_button);
+    let mut later_btn = button(text("Later").size(12))
+        .padding([9, 14])
+        .style(pill_tonal_button);
+    let update_label = if in_progress {
+        "Downloading & Verifying..."
+    } else {
+        "Update Now (1-Click)"
+    };
+    let mut update_btn = button(text(update_label).size(13))
+        .padding([10, 18])
+        .style(pill_success_button);
+
+    if !in_progress {
+        skip_btn = skip_btn.on_press(Message::SkipUpdateVersion);
+        later_btn = later_btn.on_press(Message::DismissUpdateModal);
+        update_btn = update_btn.on_press(Message::StartOneClickUpdate);
+    }
+
+    let actions = row![skip_btn, horizontal_space(), later_btn, update_btn]
+        .spacing(8)
+        .align_y(Vertical::Center);
+
+    let card = container(content_col.push(actions))
+        .width(Length::Fixed(540.0))
+        .padding(24)
+        .style(|_t: &Theme| container::Style {
+            background: Some(Background::Color(M3_SURFACE_CONTAINER)),
+            text_color: Some(M3_ON_SURFACE),
+            border: Border {
+                color: M3_OUTLINE,
+                width: 1.0,
+                radius: 20.0.into(),
+            },
+            ..Default::default()
+        });
+
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .style(|_t: &Theme| container::Style {
+            background: Some(Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.68))),
             ..Default::default()
         })
         .into()

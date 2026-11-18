@@ -85,15 +85,34 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(canvas_panel_style);
 
+    let mut sidebar_head = column![
+        text("SquadAir").size(20).color(M3_PRIMARY),
+        text("Private Voice & Screen Share")
+            .size(11)
+            .color(M3_ON_SURFACE_VARIANT),
+    ]
+    .spacing(2);
+
+    if let Some(ref info) = app.available_update {
+        sidebar_head = sidebar_head.push(
+            container(
+                button(
+                    text(format!("Update Available ({})", info.tag_name))
+                        .size(12)
+                        .align_x(Horizontal::Center),
+                )
+                .width(Length::Fill)
+                .padding([8, 12])
+                .style(pill_primary_button)
+                .on_press(Message::OpenUpdateModal),
+            )
+            .padding([8, 0]),
+        );
+    }
+
     let sidebar = container(
         column![
-            column![
-                text("SquadAir").size(20).color(M3_PRIMARY),
-                text("Private Voice & Screen Share")
-                    .size(11)
-                    .color(M3_ON_SURFACE_VARIANT),
-            ]
-            .spacing(2),
+            sidebar_head,
             text("SAVED ROOMS").size(11).color(M3_ON_SURFACE_VARIANT),
             scrollable(channel_list).height(Length::Fill),
             user_footer,

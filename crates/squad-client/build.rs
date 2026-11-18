@@ -2,6 +2,14 @@ use std::path::PathBuf;
 use std::process::Command;
 
 fn main() {
+    println!("cargo:rerun-if-env-changed=SQUADAIR_VERSION");
+    if let Ok(ver) = std::env::var("SQUADAIR_VERSION") {
+        let clean = ver.trim().trim_start_matches(['v', 'V']);
+        if !clean.is_empty() {
+            println!("cargo:rustc-env=SQUADAIR_BUILD_VERSION={clean}");
+        }
+    }
+
     println!("cargo:rerun-if-changed=app.rc");
     println!("cargo:rerun-if-changed=../../assets/icons/squad-air.ico");
 

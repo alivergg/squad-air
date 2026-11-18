@@ -61,6 +61,8 @@ pub struct AppConfig {
     pub overlay_speaking_only: bool,
     #[serde(default = "default_overlay_opacity")]
     pub overlay_opacity: f32,
+    #[serde(default)]
+    pub skipped_update_version: Option<String>,
 }
 
 impl Default for AppConfig {
@@ -90,6 +92,7 @@ impl Default for AppConfig {
             overlay_enabled: default_overlay_enabled(),
             overlay_speaking_only: false,
             overlay_opacity: default_overlay_opacity(),
+            skipped_update_version: None,
         }
     }
 }

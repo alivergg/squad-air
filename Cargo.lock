@@ -5223,7 +5223,7 @@ dependencies = [
 
 [[package]]
 name = "squad-client"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -5253,7 +5253,7 @@ dependencies = [
 
 [[package]]
 name = "squad-dsp"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "aec3",
  "anyhow",
@@ -5277,7 +5277,7 @@ dependencies = [
 
 [[package]]
 name = "squad-proto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "blake3",
  "bs58",
@@ -5288,7 +5288,7 @@ dependencies = [
 
 [[package]]
 name = "squad-rendezvous"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "dashmap",
@@ -5300,7 +5300,7 @@ dependencies = [
 
 [[package]]
 name = "squad-video"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "flate2",
  "image 0.25.10",

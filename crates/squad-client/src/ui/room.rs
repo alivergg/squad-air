@@ -62,47 +62,62 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             .style(canvas_panel_style),
         );
 
-    let header = container(
-        row![
-            left_header,
-            horizontal_space(),
-            text_input("Room name...", &app.save_channel_name_input)
-                .on_input(Message::SaveChannelNameChanged)
-                .on_submit(Message::SaveActiveChannel)
-                .width(Length::Fixed(165.0))
-                .padding([8, 10])
-                .size(12)
-                .style(m3_text_input_style),
-            button(
-                text(if already_saved {
-                    "Saved ✓"
-                } else {
-                    "Save Channel"
-                })
-                .size(12)
-            )
-            .padding([9, 14])
-            .style(if already_saved {
-                pill_success_button
+    let mut header_row = row![
+        left_header,
+        horizontal_space(),
+        text_input("Room name...", &app.save_channel_name_input)
+            .on_input(Message::SaveChannelNameChanged)
+            .on_submit(Message::SaveActiveChannel)
+            .width(Length::Fixed(165.0))
+            .padding([8, 10])
+            .size(12)
+            .style(m3_text_input_style),
+        button(
+            text(if already_saved {
+                "Saved ✓"
             } else {
-                pill_tonal_button
+                "Save Channel"
             })
-            .on_press(Message::SaveActiveChannel),
-            button(text(copy_label).size(12))
+            .size(12)
+        )
+        .padding([9, 14])
+        .style(if already_saved {
+            pill_success_button
+        } else {
+            pill_tonal_button
+        })
+        .on_press(Message::SaveActiveChannel),
+        button(text(copy_label).size(12))
+            .padding([9, 14])
+            .style(pill_primary_button)
+            .on_press(Message::CopyInviteUri),
+    ]
+    .spacing(8)
+    .align_y(Vertical::Center);
+
+    if let Some(ref info) = app.available_update {
+        header_row = header_row.push(
+            button(text(format!("Update {}", info.tag_name)).size(12))
                 .padding([9, 14])
-                .style(pill_primary_button)
-                .on_press(Message::CopyInviteUri),
-            button(text("Settings").size(12))
-                .padding([9, 14])
-                .style(pill_tonal_button)
-                .on_press(Message::OpenSettings),
-            button(text("Leave").size(12))
-                .padding([9, 14])
-                .style(pill_danger_button)
-                .on_press(Message::LeaveRoom),
-        ]
-        .spacing(8)
-        .align_y(Vertical::Center),
+                .style(pill_success_button)
+                .on_press(Message::OpenUpdateModal),
+        );
+    }
+
+    let header = container(
+        header_row
+            .push(
+                button(text("Settings").size(12))
+                    .padding([9, 14])
+                    .style(pill_tonal_button)
+                    .on_press(Message::OpenSettings),
+            )
+            .push(
+                button(text("Leave").size(12))
+                    .padding([9, 14])
+                    .style(pill_danger_button)
+                    .on_press(Message::LeaveRoom),
+            ),
     )
     .padding([12, 16])
     .width(Length::Fill)
