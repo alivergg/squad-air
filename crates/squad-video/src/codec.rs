@@ -27,6 +27,8 @@ const P_TILE_SIZE: usize = 64;
 const TILE_SAD_NOISE_FLOOR: u64 = 96;
 const MAX_IDR_PAYLOAD_BYTES: usize = 160 * 1024;
 const FLAT_IDR_DEFLATE_LIMIT: usize = 48 * 1024;
+const MAX_VIDEO_DIM: u32 = 4096;
+const MAX_VIDEO_PIXELS: usize = 3840 * 2160;
 
 #[derive(Debug, Clone)]
 pub struct EncodedVideoFrame {
@@ -617,6 +619,26 @@ impl H264Decoder {
             return Err(DecoderError::CorruptBitstream);
         }
 
+        let mut prev_state = (self.width, self.height, self.fps, self.has_idr);
+        match self.decode_nals(&nals, &mut prev_state) {
+            Ok(true) => Ok(Some(RawRgbaFrame {
+                width: self.width,
+                height: self.height,
+                rgba: self.frame_rgba.clone(),
+            })),
+            Ok(false) => Ok(None),
+            Err(err) => {
+                (self.width, self.height, self.fps, self.has_idr) = prev_state;
+                Err(err)
+            }
+        }
+    }
+
+    fn decode_nals(
+        &mut self,
+        nals: &[&[u8]],
+        prev_state: &mut (u32, u32, u8, bool),
+    ) -> Result<bool, DecoderError> {
         let mut produced = false;
         for nal in nals {
             if nal.is_empty() {
@@ -637,14 +659,15 @@ impl H264Decoder {
             match nal_type {
                 NAL_HEVC_VPS => {}
                 NAL_SPS | NAL_HEVC_SPS => {
-                    if let Some((w, h, fps)) = decode_sps(&rbsp) {
-                        if w != self.width || h != self.height {
-                            self.has_idr = false;
-                        }
-                        self.width = w;
-                        self.height = h;
-                        self.fps = fps;
+                    let Some((w, h, fps)) = decode_sps(&rbsp) else {
+                        return Err(DecoderError::CorruptBitstream);
+                    };
+                    if w != self.width || h != self.height {
+                        self.has_idr = false;
                     }
+                    self.width = w;
+                    self.height = h;
+                    self.fps = fps;
                 }
                 NAL_PPS | NAL_HEVC_PPS => {}
                 NAL_IDR | NAL_HEVC_IDR => {
@@ -652,6 +675,7 @@ impl H264Decoder {
                         if self.decode_idr(&rbsp) {
                             self.has_idr = true;
                             produced = true;
+                            *prev_state = (self.width, self.height, self.fps, true);
                         } else {
                             return Err(DecoderError::CorruptBitstream);
                         }
@@ -667,16 +691,7 @@ impl H264Decoder {
                 _ => {}
             }
         }
-
-        if produced {
-            Ok(Some(RawRgbaFrame {
-                width: self.width,
-                height: self.height,
-                rgba: self.frame_rgba.clone(),
-            }))
-        } else {
-            Ok(None)
-        }
+        Ok(produced)
     }
 
     fn decode_idr(&mut self, payload: &[u8]) -> bool {
@@ -687,8 +702,15 @@ impl H264Decoder {
         let body = &payload[1..];
         let w = self.width as usize;
         let h = self.height as usize;
-        let expected_rgb = w * h * 3;
-        let expected_rgba = w * h * 4;
+        let Some(pixels) = w.checked_mul(h) else {
+            return false;
+        };
+        let Some(expected_rgb) = pixels.checked_mul(3) else {
+            return false;
+        };
+        let Some(expected_rgba) = pixels.checked_mul(4) else {
+            return false;
+        };
 
         match mode {
             IDR_MODE_DEFLATE_RGB => {
@@ -703,20 +725,24 @@ impl H264Decoder {
                 true
             }
             IDR_MODE_JPEG_FULL => {
-                let Ok(img) = image::load_from_memory_with_format(body, ImageFormat::Jpeg) else {
+                let Some(img) = decode_jpeg_bounded(body, MAX_VIDEO_DIM, MAX_VIDEO_DIM) else {
                     return false;
                 };
-                if img.width() != self.width || img.height() != self.height {
+                let rgba = if img.width() != self.width || img.height() != self.height {
                     let resized = img.resize_exact(
                         self.width,
                         self.height,
                         image::imageops::FilterType::Triangle,
                     );
-                    self.frame_rgba = resized.to_rgba8().into_raw();
+                    resized.to_rgba8().into_raw()
                 } else {
-                    self.frame_rgba = img.to_rgba8().into_raw();
+                    img.to_rgba8().into_raw()
+                };
+                if rgba.len() != expected_rgba {
+                    return false;
                 }
-                self.frame_rgba.len() == expected_rgba
+                self.frame_rgba = rgba;
+                true
             }
             _ => false,
         }
@@ -731,16 +757,27 @@ impl H264Decoder {
             return true;
         }
         let mode = payload[2];
-        let header_bytes = 3 + count * 2;
-        if payload.len() < header_bytes {
-            return false;
-        }
 
         let w = self.width as usize;
         let h = self.height as usize;
         let tiles_x = w.div_ceil(P_TILE_SIZE);
         let tiles_y = h.div_ceil(P_TILE_SIZE);
-        if self.frame_rgba.len() < w * h * 4 {
+        if tiles_x == 0 || tiles_y == 0 {
+            return false;
+        }
+        let max_tiles = tiles_x.saturating_mul(tiles_y);
+        if count > max_tiles || count > 256 {
+            return false;
+        }
+
+        let header_bytes = 3 + count * 2;
+        if payload.len() < header_bytes {
+            return false;
+        }
+        let Some(expected_rgba) = w.checked_mul(h).and_then(|px| px.checked_mul(4)) else {
+            return false;
+        };
+        if self.frame_rgba.len() < expected_rgba {
             return false;
         }
 
@@ -760,7 +797,10 @@ impl H264Decoder {
 
         let strip_rgb: Vec<u8> = match mode {
             P_MODE_DEFLATE_TILES => {
-                let expected = strip_w * strip_h * 3;
+                let Some(expected) = strip_w.checked_mul(strip_h).and_then(|px| px.checked_mul(3))
+                else {
+                    return false;
+                };
                 let Ok(dpcm) = inflate_bounded(compressed, expected) else {
                     return false;
                 };
@@ -770,7 +810,7 @@ impl H264Decoder {
                 dpcm_row_unsub_rgb(&dpcm[..expected], strip_w)
             }
             P_MODE_JPEG_TILES => {
-                let Ok(img) = image::load_from_memory_with_format(compressed, ImageFormat::Jpeg)
+                let Some(img) = decode_jpeg_bounded(compressed, strip_w as u32, strip_h as u32)
                 else {
                     return false;
                 };
@@ -865,10 +905,30 @@ fn deflate_fast(input: &[u8]) -> Option<Vec<u8>> {
     enc.finish().ok()
 }
 
+fn decode_jpeg_bounded(
+    bytes: &[u8],
+    max_width: u32,
+    max_height: u32,
+) -> Option<image::DynamicImage> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_width);
+    limits.max_image_height = Some(max_height);
+    limits.max_alloc = Some(64 * 1024 * 1024);
+    let mut reader = image::ImageReader::with_format(Cursor::new(bytes), ImageFormat::Jpeg);
+    reader.limits(limits);
+    reader.decode().ok()
+}
+
 fn inflate_bounded(input: &[u8], expected_len: usize) -> Result<Vec<u8>, ()> {
-    let mut dec = DeflateDecoder::new(Cursor::new(input));
-    let mut out = vec![0u8; expected_len];
-    dec.read_exact(&mut out).map_err(|_| ())?;
+    if expected_len > MAX_VIDEO_PIXELS * 3 {
+        return Err(());
+    }
+    let mut dec = DeflateDecoder::new(Cursor::new(input)).take((expected_len as u64) + 1);
+    let mut out = Vec::with_capacity(expected_len.min(64 * 1024));
+    dec.read_to_end(&mut out).map_err(|_| ())?;
+    if out.len() != expected_len {
+        return Err(());
+    }
     Ok(out)
 }
 
@@ -1024,6 +1084,14 @@ fn decode_sps(rbsp: &[u8]) -> Option<(u32, u32, u8)> {
     }
     let width = u32::from(u16::from_be_bytes([rbsp[3], rbsp[4]]));
     let height = u32::from(u16::from_be_bytes([rbsp[5], rbsp[6]]));
+    if width == 0
+        || height == 0
+        || width > MAX_VIDEO_DIM
+        || height > MAX_VIDEO_DIM
+        || (width as usize).saturating_mul(height as usize) > MAX_VIDEO_PIXELS
+    {
+        return None;
+    }
     let fps = rbsp[7].max(1);
     Some((width, height, fps))
 }
@@ -1152,5 +1220,69 @@ mod tests {
             assert_eq!(px[0], px[1], "neutral gray must not shift green/magenta");
             assert_eq!(px[1], px[2], "neutral gray must not shift purple/blue");
         }
+    }
+
+    #[test]
+    fn test_decoder_rejects_oversized_sps() {
+        assert!(decode_sps(&encode_sps(0, 1080, 60)).is_none());
+        assert!(decode_sps(&encode_sps(4097, 64, 60)).is_none());
+        assert!(decode_sps(&encode_sps(4096, 4096, 60)).is_none());
+        assert!(decode_sps(&encode_sps(3840, 2160, 60)).is_some());
+
+        let mut dec = H264Decoder::new();
+        let mut annex_b = Vec::new();
+        write_nal(&mut annex_b, NAL_SPS, &encode_sps(65535, 65535, 60));
+        write_nal(&mut annex_b, NAL_IDR, &[IDR_MODE_DEFLATE_RGB, 0x00]);
+
+        assert!(dec.decode(&annex_b).is_none());
+        assert_eq!(dec.width, 0);
+        assert_eq!(dec.height, 0);
+        assert!(!dec.has_idr);
+    }
+
+    #[test]
+    fn test_decoder_rejects_truncated_and_oversized_deflate_payloads() {
+        let short_deflate = deflate_fast(&[0u8; 32]).expect("deflate short");
+        assert!(inflate_bounded(&short_deflate, MAX_VIDEO_PIXELS * 3 + 1).is_err());
+        assert!(inflate_bounded(&short_deflate, MAX_VIDEO_PIXELS * 3).is_err());
+
+        let mut dec = H264Decoder::new();
+        let mut truncated_idr = Vec::with_capacity(1 + short_deflate.len());
+        truncated_idr.push(IDR_MODE_DEFLATE_RGB);
+        truncated_idr.extend_from_slice(&short_deflate);
+
+        let mut truncated_annex_b = Vec::new();
+        write_nal(&mut truncated_annex_b, NAL_SPS, &encode_sps(1920, 1080, 60));
+        write_nal(&mut truncated_annex_b, NAL_IDR, &truncated_idr);
+        assert!(dec.decode(&truncated_annex_b).is_none());
+        assert_eq!(dec.width, 0);
+        assert_eq!(dec.height, 0);
+        assert!(!dec.has_idr);
+
+        let oversized_deflate = deflate_fast(&vec![0xAA; 64 * 64 * 3 + 128]).expect("deflate big");
+        let mut oversized_idr = Vec::with_capacity(1 + oversized_deflate.len());
+        oversized_idr.push(IDR_MODE_DEFLATE_RGB);
+        oversized_idr.extend_from_slice(&oversized_deflate);
+
+        let mut oversized_annex_b = Vec::new();
+        write_nal(&mut oversized_annex_b, NAL_SPS, &encode_sps(64, 64, 60));
+        write_nal(&mut oversized_annex_b, NAL_IDR, &oversized_idr);
+        assert!(dec.decode(&oversized_annex_b).is_none());
+        assert_eq!(dec.width, 0);
+        assert_eq!(dec.height, 0);
+
+        // Failed keyframe must not corrupt previously decoded dimensions.
+        let mut cap = SyntheticPatternCapture::new(64, 64);
+        let mut enc = H264Encoder::new(60, 8_000_000);
+        let valid = enc.encode(&cap.next_frame());
+        assert!(dec.decode(&valid.annex_b).is_some());
+        assert_eq!((dec.width, dec.height, dec.has_idr), (64, 64, true));
+
+        assert!(dec.decode(&truncated_annex_b).is_none());
+        assert_eq!((dec.width, dec.height, dec.has_idr), (64, 64, true));
+
+        let mut bad_p_annex_b = Vec::new();
+        write_nal(&mut bad_p_annex_b, NAL_SLICE, &[1, 1, P_MODE_DEFLATE_TILES]);
+        assert!(dec.decode(&bad_p_annex_b).is_none());
     }
 }

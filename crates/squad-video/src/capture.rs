@@ -162,8 +162,8 @@ pub struct SyntheticPatternCapture {
 
 impl SyntheticPatternCapture {
     pub fn new(width: u32, height: u32) -> Self {
-        let w = align_even(width);
-        let h = align_even(height);
+        let w = align_even(width).clamp(2, 4096);
+        let h = align_even(height).clamp(2, 4096);
         Self {
             width: w,
             height: h,
@@ -407,12 +407,15 @@ mod macos_impl {
         fn CFArrayGetCount(array: CFArrayRef) -> isize;
         fn CFArrayGetValueAtIndex(array: CFArrayRef, idx: isize) -> *const c_void;
         fn CFDictionaryGetValue(dict: CFDictionaryRef, key: *const c_void) -> *const c_void;
+        fn CFGetTypeID(cf: *const c_void) -> usize;
+        fn CFStringGetTypeID() -> usize;
         fn CFStringGetCString(
             s: CFStringRef,
             buffer: *mut c_char,
             buffer_size: isize,
             encoding: u32,
         ) -> bool;
+        fn CFNumberGetTypeID() -> usize;
         fn CFNumberGetValue(number: CFNumberRef, the_type: isize, value_ptr: *mut c_void) -> bool;
         fn CFRelease(cf: CFTypeRef);
     }
@@ -589,6 +592,9 @@ mod macos_impl {
         if val.is_null() {
             return None;
         }
+        if CFGetTypeID(val) != CFStringGetTypeID() {
+            return None;
+        }
         let mut buf: [c_char; 512] = [0; 512];
         if CFStringGetCString(
             val,
@@ -607,6 +613,9 @@ mod macos_impl {
         if val.is_null() {
             return None;
         }
+        if CFGetTypeID(val) != CFNumberGetTypeID() {
+            return None;
+        }
         let mut num = 0i32;
         if CFNumberGetValue(
             val,
@@ -622,6 +631,9 @@ mod macos_impl {
     unsafe fn dict_i64(dict: CFDictionaryRef, key: CFStringRef) -> Option<i64> {
         let val = CFDictionaryGetValue(dict, key);
         if val.is_null() {
+            return None;
+        }
+        if CFGetTypeID(val) != CFNumberGetTypeID() {
             return None;
         }
         let mut num = 0i64;
@@ -647,9 +659,9 @@ mod windows_impl {
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC,
-        DeleteObject, EnumDisplayMonitors, GetDC, GetMonitorInfoW, ReleaseDC, SelectObject,
-        SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, COLORONCOLOR,
-        DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
+        DeleteObject, EnumDisplayMonitors, GdiFlush, GetDC, GetMonitorInfoW, ReleaseDC,
+        SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
+        COLORONCOLOR, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
     };
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
@@ -875,6 +887,10 @@ mod windows_impl {
         out_w: u32,
         out_h: u32,
     ) -> Option<RawRgbaFrame> {
+        if out_w == 0 || out_h == 0 || out_w > 4096 || out_h > 4096 {
+            return None;
+        }
+
         let mem_dc = CreateCompatibleDC(src_dc);
         if mem_dc.is_invalid() {
             return None;
@@ -894,8 +910,15 @@ mod windows_impl {
         };
 
         let mut bits_ptr: *mut c_void = std::ptr::null_mut();
-        let dib = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0).ok()?;
+        let Ok(dib) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0)
+        else {
+            let _ = DeleteDC(mem_dc);
+            return None;
+        };
         if dib.is_invalid() || bits_ptr.is_null() {
+            if !dib.is_invalid() {
+                let _ = DeleteObject(dib);
+            }
             let _ = DeleteDC(mem_dc);
             return None;
         }
@@ -920,6 +943,8 @@ mod windows_impl {
             )
             .as_bool()
         };
+
+        let _ = GdiFlush();
 
         let row_bytes = (out_w as usize) * 4;
         let src_stride = (row_bytes + 3) & !3;

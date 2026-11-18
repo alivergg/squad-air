@@ -4,7 +4,14 @@ use std::time::{Duration, Instant};
 
 pub const VIDEO_FEC_GROUP_SIZE: usize = 5;
 pub const VIDEO_DATA_SHARD_SIZE: usize = MAX_VIDEO_FRAG_BYTES - 2; // 1098B leaves 2B length metadata in parity
+pub const MAX_VIDEO_FRAGS: usize = 2048;
 const FRAME_TIMEOUT: Duration = Duration::from_millis(350);
+
+#[inline]
+fn is_serial_older(candidate: u32, reference: u32) -> bool {
+    let d = reference.wrapping_sub(candidate);
+    d != 0 && d <= 0x8000_0000
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VideoPacketOut {
@@ -130,11 +137,11 @@ pub fn fragment_frame(
         return Vec::new();
     }
 
-    let chunks: Vec<&[u8]> = annex_b_bytes.chunks(VIDEO_DATA_SHARD_SIZE).collect();
-    let total_data = chunks.len();
-    if total_data > u16::MAX as usize {
+    let total_data = annex_b_bytes.len().div_ceil(VIDEO_DATA_SHARD_SIZE);
+    if total_data > MAX_VIDEO_FRAGS {
         return Vec::new();
     }
+    let chunks: Vec<&[u8]> = annex_b_bytes.chunks(VIDEO_DATA_SHARD_SIZE).collect();
 
     let key_flag = if is_keyframe { VIDEO_FLAG_KEYFRAME } else { 0 };
     let num_groups = total_data.div_ceil(VIDEO_FEC_GROUP_SIZE);
@@ -217,13 +224,16 @@ impl FrameReassembler {
         flags: u8,
         data: Vec<u8>,
     ) -> (Option<ReassembledFrame>, bool) {
-        if frag_count == 0 || frag_count as usize > 2048 || data.len() > MAX_VIDEO_FRAG_BYTES {
+        if frag_count == 0
+            || frag_count as usize > MAX_VIDEO_FRAGS
+            || data.len() > MAX_VIDEO_FRAG_BYTES
+        {
             return (None, false);
         }
-        if self
-            .last_completed_frame_id
-            .is_some_and(|done| frame_id <= done)
-        {
+        if self.last_completed_frame_id.is_some_and(|done| {
+            let d = frame_id.wrapping_sub(done);
+            d == 0 || d > 0x8000_0000
+        }) {
             return (None, false);
         }
 
@@ -231,16 +241,33 @@ impl FrameReassembler {
         let is_keyframe = (flags & VIDEO_FLAG_KEYFRAME) != 0;
         let count = frag_count as usize;
         let idx = frag_idx as usize;
+        let num_groups = count.div_ceil(VIDEO_FEC_GROUP_SIZE);
+        if (is_fec && idx >= num_groups) || (!is_fec && idx >= count) {
+            return (None, false);
+        }
+
+        let mut need_pli = false;
+        if !self.pending.contains_key(&frame_id) && self.pending.len() >= 8 {
+            if let Some(oldest_fid) = self
+                .pending
+                .iter()
+                .min_by_key(|(_, st)| st.created_at)
+                .map(|(&fid, _)| fid)
+            {
+                self.pending.remove(&oldest_fid);
+                self.awaiting_idr = true;
+                need_pli = true;
+            }
+        }
 
         let entry = self
             .pending
             .entry(frame_id)
             .or_insert_with(|| PendingVideoFrame::new(count, is_keyframe));
 
-        if entry.frag_count != count {
+        if entry.frag_count != count || entry.is_keyframe != is_keyframe {
             return (None, false);
         }
-        entry.is_keyframe |= is_keyframe;
 
         if is_fec {
             if idx < entry.parity_shards.len() && entry.parity_shards[idx].is_none() {
@@ -258,7 +285,7 @@ impl FrameReassembler {
                 .pending
                 .keys()
                 .copied()
-                .filter(|&k| k < frame_id)
+                .filter(|&k| is_serial_older(k, frame_id))
                 .collect();
             let dropped_older = !stale_keys.is_empty();
             for k in stale_keys {
@@ -266,7 +293,7 @@ impl FrameReassembler {
             }
             let gap = self
                 .last_completed_frame_id
-                .is_some_and(|prev| frame_id > prev + 1);
+                .is_some_and(|prev| frame_id.wrapping_sub(prev) > 1);
             self.last_completed_frame_id = Some(frame_id);
 
             if completed.is_keyframe {
@@ -282,13 +309,14 @@ impl FrameReassembler {
             return (Some(completed), false);
         }
 
-        let mut need_pli = false;
         let now = Instant::now();
         let expired: Vec<u32> = self
             .pending
             .iter()
             .filter_map(|(&fid, st)| {
-                if fid < frame_id && now.duration_since(st.created_at) >= FRAME_TIMEOUT {
+                if is_serial_older(fid, frame_id)
+                    && now.duration_since(st.created_at) >= FRAME_TIMEOUT
+                {
                     Some(fid)
                 } else {
                     None
@@ -299,17 +327,6 @@ impl FrameReassembler {
             self.pending.remove(&fid);
             self.awaiting_idr = true;
             need_pli = true;
-        }
-
-        while self.pending.len() > 8 {
-            if let Some((&oldest, _)) = self.pending.iter().next() {
-                if oldest == frame_id {
-                    break;
-                }
-                self.pending.remove(&oldest);
-                self.awaiting_idr = true;
-                need_pli = true;
-            }
         }
 
         if self.awaiting_idr && !is_keyframe {
@@ -464,5 +481,113 @@ mod tests {
             p5_pli |= pli;
         }
         assert!(p5_pli);
+    }
+
+    #[test]
+    fn test_decreasing_frame_id_pending_cap_evicts_oldest() {
+        let mut reassembler = FrameReassembler::new();
+        for fid in (80..=100).rev() {
+            let (out, _) = reassembler.push_fragment(fid, 0, 2, VIDEO_FLAG_KEYFRAME, vec![1; 16]);
+            assert!(out.is_none());
+            assert!(reassembler.pending.len() <= 8);
+        }
+        assert_eq!(reassembler.pending.len(), 8);
+    }
+
+    #[test]
+    fn test_invalid_frag_idx_rejected_without_pending() {
+        let mut reassembler = FrameReassembler::new();
+        assert_eq!(
+            reassembler.push_fragment(1, 3, 3, VIDEO_FLAG_KEYFRAME, vec![1; 16]),
+            (None, false)
+        );
+        assert!(reassembler.pending.is_empty());
+
+        assert_eq!(
+            reassembler.push_fragment(
+                2,
+                1,
+                5,
+                VIDEO_FLAG_KEYFRAME | VIDEO_FLAG_XOR_FEC,
+                vec![1; 16]
+            ),
+            (None, false)
+        );
+        assert!(reassembler.pending.is_empty());
+
+        assert_eq!(
+            reassembler.push_fragment(
+                3,
+                0,
+                (MAX_VIDEO_FRAGS + 1) as u16,
+                VIDEO_FLAG_KEYFRAME,
+                vec![1; 16]
+            ),
+            (None, false)
+        );
+        assert!(reassembler.pending.is_empty());
+
+        let too_large = vec![0u8; MAX_VIDEO_FRAGS * VIDEO_DATA_SHARD_SIZE + 1];
+        assert!(fragment_frame(4, true, &too_large).is_empty());
+
+        assert_eq!(
+            reassembler.push_fragment(5, 0, 2, VIDEO_FLAG_KEYFRAME, vec![1; 16]),
+            (None, false)
+        );
+        assert_eq!(
+            reassembler.push_fragment(5, 1, 2, 0, vec![2; 16]),
+            (None, false)
+        );
+        assert_eq!(reassembler.pending.len(), 1);
+    }
+
+    #[test]
+    fn test_u32_max_wraparound_continuity() {
+        let payload: Vec<u8> = (0..1_500).map(|i| (i % 211) as u8).collect();
+        let mut reassembler = FrameReassembler::new();
+
+        for (fid, is_key) in [
+            (u32::MAX - 1, true),
+            (u32::MAX, false),
+            (0, false),
+            (1, false),
+        ] {
+            let mut completed = None;
+            for pkt in fragment_frame(fid, is_key, &payload) {
+                let (out, pli) = reassembler.push_fragment(
+                    pkt.frame_id,
+                    pkt.frag_idx,
+                    pkt.frag_count,
+                    pkt.flags,
+                    pkt.data,
+                );
+                assert!(!pli);
+                if let Some(frame) = out {
+                    completed = Some(frame);
+                }
+            }
+            let frame = completed.expect("contiguous frame across u32::MAX must assemble");
+            assert_eq!(frame.frame_id, fid);
+            assert_eq!(frame.annex_b_bytes, payload);
+        }
+
+        assert_eq!(
+            reassembler.push_fragment(u32::MAX, 0, 1, 0, vec![0; 16]),
+            (None, false)
+        );
+
+        let mut gap_pli = false;
+        for pkt in fragment_frame(3, false, &payload) {
+            let (out, pli) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data,
+            );
+            assert!(out.is_none());
+            gap_pli |= pli;
+        }
+        assert!(gap_pli);
     }
 }
