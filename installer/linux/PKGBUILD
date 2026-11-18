@@ -1,0 +1,35 @@
+# Maintainer: SquadAir Contributors
+pkgname=squad-air
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="Lightweight E2EE P2P voice chat, screen sharing, and squad messaging desktop app"
+arch=('x86_64')
+url="https://github.com/alivergg/squad-air"
+license=('MIT')
+depends=(
+  'alsa-lib'
+  'gtk3'
+  'libx11'
+  'libxcb'
+  'libxkbcommon'
+  'libayatana-appindicator'
+  'opus'
+)
+makedepends=('rust' 'cargo' 'cmake' 'nasm' 'pkgconf')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export CARGO_TARGET_DIR=target
+  cargo build --release --locked -p squad-client -p squad-rendezvous
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  install -Dm755 target/release/squad-client "${pkgdir}/usr/bin/squad-client"
+  install -Dm755 target/release/squad-rendezvous "${pkgdir}/usr/bin/squad-rendezvous"
+  install -Dm644 installer/linux/squad-air.desktop "${pkgdir}/usr/share/applications/squad-air.desktop"
+  install -Dm644 assets/icons/icon.png "${pkgdir}/usr/share/icons/hicolor/256x256/apps/squad-air.png"
+  install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+}

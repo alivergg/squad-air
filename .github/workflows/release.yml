@@ -2,24 +2,65 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*.*.*"
+    branches:
+      - main
   workflow_dispatch:
     inputs:
       tag:
-        description: "Optional release tag (e.g. v0.1.0). Leave empty for a dry-run artifact build."
+        description: "Optional explicit release tag (e.g. v1.0). Leave empty to auto-increment vX.X."
         required: false
         type: string
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-main
+  cancel-in-progress: false
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  prepare-version:
+    name: Determine Release Version
+    runs-on: ubuntu-latest
+    outputs:
+      version_tag: ${{ steps.version.outputs.version_tag }}
+      version_num: ${{ steps.version.outputs.version_num }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Compute next vX.X release tag
+        id: version
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          git fetch --tags --force >/dev/null 2>&1 || true
+          if [[ -n "${INPUT_TAG}" ]]; then
+            NUM="${INPUT_TAG#v}"
+            TAG="v${NUM}"
+          else
+            LATEST="$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+$' | sort -V | tail -n 1 || true)"
+            if [[ -z "${LATEST}" ]]; then
+              NUM="1.0"
+            else
+              MAJOR="$(echo "${LATEST#v}" | cut -d. -f1)"
+              MINOR="$(echo "${LATEST#v}" | cut -d. -f2)"
+              NUM="${MAJOR}.$((MINOR + 1))"
+            fi
+            TAG="v${NUM}"
+          fi
+          echo "version_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "version_num=${NUM}" >> "$GITHUB_OUTPUT"
+          echo "Selected release version: ${TAG} (${NUM})"
+
   build-macos-and-windows:
     name: Build macOS ARM64 & Windows x86_64 Installers
+    needs: prepare-version
     runs-on: macos-latest
     steps:
       - name: Checkout repository
@@ -56,13 +97,14 @@ jobs:
             dist/squad-rendezvous-macos-arm64.tar.gz
 
   build-linux:
-    name: Build Linux x86_64 Binaries
+    name: Build Linux Packages (.deb, .rpm, Arch, .tar.gz)
+    needs: prepare-version
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Linux system dependencies
+      - name: Install Linux system and packaging dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
@@ -77,7 +119,12 @@ jobs:
             libxcb-shape0-dev \
             libxcb-xfixes0-dev \
             libxdo-dev \
-            libxkbcommon-dev
+            libxkbcommon-dev \
+            dpkg-dev \
+            rpm \
+            fakeroot \
+            libarchive-tools \
+            zstd
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -88,22 +135,26 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked -p squad-rendezvous -p squad-client
 
-      - name: Package Linux tarballs
+      - name: Package Linux distributions (.deb, .rpm, .pkg.tar.zst, .tar.gz)
         run: |
-          mkdir -p dist
-          tar -C target/release -czf dist/squad-rendezvous-linux-x86_64.tar.gz squad-rendezvous
-          tar -C target/release -czf dist/squad-client-linux-x86_64.tar.gz squad-client
+          chmod +x scripts/package_linux.sh
+          ./scripts/package_linux.sh "${{ needs.prepare-version.outputs.version_num }}"
 
       - name: Upload Linux artifacts
         uses: actions/upload-artifact@v4
         with:
           name: release-linux
           path: |
+            dist/squad-air_*.deb
+            dist/squad-air-*.rpm
+            dist/squad-air-*.pkg.tar.zst
+            dist/PKGBUILD
             dist/squad-rendezvous-linux-x86_64.tar.gz
             dist/squad-client-linux-x86_64.tar.gz
 
   build-windows-rendezvous:
     name: Build Windows x86_64 Rendezvous Binary
+    needs: prepare-version
     runs-on: windows-latest
     steps:
       - name: Checkout repository
@@ -132,9 +183,12 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build-macos-and-windows, build-linux, build-windows-rendezvous]
+    needs:
+      - prepare-version
+      - build-macos-and-windows
+      - build-linux
+      - build-windows-rendezvous
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v') || inputs.tag != ''
     steps:
       - name: Download release artifacts
         uses: actions/download-artifact@v4
@@ -149,6 +203,8 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.prepare-version.outputs.version_tag }}
+          name: "SquadAir ${{ needs.prepare-version.outputs.version_tag }}"
+          target_commitish: ${{ github.sha }}
           generate_release_notes: true
           files: release-assets/*
