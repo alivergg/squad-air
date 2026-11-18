@@ -107,6 +107,9 @@ impl HotkeyController {
 impl Drop for HotkeyController {
     fn drop(&mut self) {
         self.shutdown();
+        if let Some(h) = self.worker.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -221,16 +224,18 @@ fn is_input_pressed(input: PhysicalInput) -> bool {
     #[cfg(target_os = "macos")]
     {
         match input {
-            PhysicalInput::MacKey(kc) => unsafe { CGEventSourceKeyState(1, kc) },
-            PhysicalInput::MacMouseButton(btn) => unsafe { CGEventSourceButtonState(1, btn) },
+            PhysicalInput::MacKey(kc) => unsafe { CGEventSourceKeyState(1, kc) != 0 },
+            PhysicalInput::MacMouseButton(btn) => unsafe {
+                CGEventSourceButtonState(1, btn) != 0
+            },
             PhysicalInput::Shift => unsafe {
-                CGEventSourceKeyState(1, 0x38) || CGEventSourceKeyState(1, 0x3C)
+                CGEventSourceKeyState(1, 0x38) != 0 || CGEventSourceKeyState(1, 0x3C) != 0
             },
             PhysicalInput::Ctrl => unsafe {
-                CGEventSourceKeyState(1, 0x3B) || CGEventSourceKeyState(1, 0x3E)
+                CGEventSourceKeyState(1, 0x3B) != 0 || CGEventSourceKeyState(1, 0x3E) != 0
             },
             PhysicalInput::Alt => unsafe {
-                CGEventSourceKeyState(1, 0x3A) || CGEventSourceKeyState(1, 0x3D)
+                CGEventSourceKeyState(1, 0x3A) != 0 || CGEventSourceKeyState(1, 0x3D) != 0
             },
         }
     }
@@ -253,18 +258,18 @@ fn is_input_pressed(input: PhysicalInput) -> bool {
 #[cfg(target_os = "macos")]
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
-    fn CGEventSourceKeyState(state_id: u32, key: u16) -> bool;
-    fn CGEventSourceButtonState(state_id: u32, button: u32) -> bool;
-    fn CGPreflightListenEventAccess() -> bool;
-    fn CGRequestListenEventAccess() -> bool;
+    fn CGEventSourceKeyState(state_id: u32, key: u16) -> u8;
+    fn CGEventSourceButtonState(state_id: u32, button: u32) -> u8;
+    fn CGPreflightListenEventAccess() -> u8;
+    fn CGRequestListenEventAccess() -> u8;
 }
 
 #[cfg(target_os = "macos")]
 #[link(name = "ApplicationServices", kind = "framework")]
 extern "C" {
     static kAXTrustedCheckOptionPrompt: *const std::ffi::c_void;
-    fn AXIsProcessTrusted() -> bool;
-    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> bool;
+    fn AXIsProcessTrusted() -> u8;
+    fn AXIsProcessTrustedWithOptions(options: *const std::ffi::c_void) -> u8;
 }
 
 #[cfg(target_os = "macos")]
@@ -491,7 +496,7 @@ fn win_vkey(norm: &str) -> Option<i32> {
 pub fn is_macos_accessibility_trusted() -> bool {
     #[cfg(target_os = "macos")]
     {
-        unsafe { AXIsProcessTrusted() }
+        unsafe { AXIsProcessTrusted() != 0 }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -502,7 +507,7 @@ pub fn is_macos_accessibility_trusted() -> bool {
 pub fn is_macos_input_monitoring_trusted() -> bool {
     #[cfg(target_os = "macos")]
     {
-        unsafe { CGPreflightListenEventAccess() }
+        unsafe { CGPreflightListenEventAccess() != 0 }
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -525,13 +530,13 @@ pub fn request_macos_permissions() -> (bool, bool) {
                 &kCFTypeDictionaryKeyCallBacks as *const u8 as *const std::ffi::c_void,
                 &kCFTypeDictionaryValueCallBacks as *const u8 as *const std::ffi::c_void,
             );
-            let trusted = AXIsProcessTrustedWithOptions(opts);
+            let trusted = AXIsProcessTrustedWithOptions(opts) != 0;
             if !opts.is_null() {
                 CFRelease(opts);
             }
             trusted
         };
-        let input_trusted = unsafe { CGRequestListenEventAccess() };
+        let input_trusted = unsafe { CGRequestListenEventAccess() != 0 };
         (ax_trusted, input_trusted)
     }
     #[cfg(not(target_os = "macos"))]

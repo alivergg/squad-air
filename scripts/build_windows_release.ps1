@@ -14,7 +14,7 @@ if (-not (Test-Path $IconPath)) {
 }
 
 Write-Host "==> [1/4] Building squad-client (release)..." -ForegroundColor Cyan
-cargo build --release -p squad-client
+cargo build --release --locked -p squad-client
 if ($LASTEXITCODE -ne 0) {
     throw "cargo build --release failed with exit code $LASTEXITCODE"
 }
@@ -43,7 +43,7 @@ if ($SelfSign) {
 
     if ($SignTool) {
         Write-Host "==> Signing $ExePath..." -ForegroundColor Cyan
-        & $SignTool.Source sign /fd SHA256 /sha1 $CertThumbprint /t http://timestamp.digicert.com $ExePath
+        & $SignTool.Source sign /fd SHA256 /sha1 $CertThumbprint /tr https://timestamp.digicert.com /td SHA256 $ExePath
     } else {
         Write-Warning "signtool.exe not found in PATH; skipping binary signing."
     }
@@ -71,7 +71,7 @@ if ($Iscc) {
 
     if ($SelfSign -and $SignTool -and $CertThumbprint -and (Test-Path $SetupPath)) {
         Write-Host "==> Signing $SetupPath..." -ForegroundColor Cyan
-        & $SignTool.Source sign /fd SHA256 /sha1 $CertThumbprint /t http://timestamp.digicert.com $SetupPath
+        & $SignTool.Source sign /fd SHA256 /sha1 $CertThumbprint /tr https://timestamp.digicert.com /td SHA256 $SetupPath
     }
 } else {
     Write-Warning "ISCC.exe (Inno Setup 6) not found; skipped installer packaging."

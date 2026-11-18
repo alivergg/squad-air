@@ -5,6 +5,7 @@ use squad_dsp::{JitterProfile, MicActivationMode, NoiseSuppressionMode};
 use squad_proto::ClientUuid;
 use std::collections::HashMap;
 use std::fs;
+use std::io::Write;
 use std::path::PathBuf;
 use uuid::Uuid;
 
@@ -112,6 +113,9 @@ impl AppConfig {
                 if let Ok(cfg) = toml::from_str::<Self>(&contents) {
                     return cfg;
                 }
+                if !contents.trim().is_empty() {
+                    let _ = fs::copy(&path, path.with_extension("toml.bak"));
+                }
             }
         }
 
@@ -125,10 +129,49 @@ impl AppConfig {
             return Ok(());
         };
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+                fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(parent)?;
+                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            }
+            #[cfg(not(unix))]
+            {
+                fs::create_dir_all(parent)?;
+            }
         }
         let body = toml::to_string_pretty(self)?;
-        fs::write(path, body)?;
+        let tmp_path = path.with_extension("toml.tmp");
+        let mut opts = fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut file = opts.open(&tmp_path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+        }
+        let write_res = (|| -> Result<()> {
+            file.write_all(body.as_bytes())?;
+            file.sync_all()?;
+            Ok(())
+        })();
+        drop(file);
+        if let Err(err) = write_res {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err);
+        }
+        if let Err(err) = fs::rename(&tmp_path, &path) {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(err.into());
+        }
         Ok(())
     }
 

@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT_DIR"
 
-CARGO_BIN="${CARGO:-/Users/aliver/.cargo/bin/cargo}"
+CARGO_BIN="${CARGO:-${HOME}/.cargo/bin/cargo}"
 if [[ ! -x "$CARGO_BIN" ]]; then
     CARGO_BIN="$(command -v cargo)"
 fi
@@ -34,10 +34,10 @@ MAC_PKG="$DIST_DIR/SquadAir-Installer-macos-arm64.pkg"
 WIN_SETUP="$DIST_DIR/SquadAir-Setup-windows-x86_64.exe"
 
 echo "==> [1/4] Building macOS release binary (v${VERSION})..."
-"$CARGO_BIN" build --release -p squad-client
+"$CARGO_BIN" build --release --locked -p squad-client
 
 echo "==> [2/4] Building Windows x86_64 release binary (v${VERSION})..."
-"$CARGO_BIN" build --release --target x86_64-pc-windows-gnu -p squad-client
+"$CARGO_BIN" build --release --locked --target x86_64-pc-windows-gnu -p squad-client
 
 rm -rf "$STAGING_DIR"
 mkdir -p "$DIST_DIR" "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources/assets/sounds" "$MAC_SCRIPTS"
@@ -147,6 +147,9 @@ rm -f "$WIN_SETUP"
     "$ROOT_DIR/scripts/windows_installer.c" \
     "$STAGING_DIR/win_payload.o" \
     -o "$WIN_SETUP" \
+    -Wl,--nxcompat \
+    -Wl,--dynamicbase \
+    -Wl,--high-entropy-va \
     -lole32 \
     -luuid \
     -lshell32 \

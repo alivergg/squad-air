@@ -17,6 +17,10 @@
 #define IDC_CANCEL_BTN 1002
 #define IDC_STATUS_LBL 1003
 
+#ifndef LOAD_LIBRARY_SEARCH_SYSTEM32
+#define LOAD_LIBRARY_SEARCH_SYSTEM32 0x00000800
+#endif
+
 static HINSTANCE g_hinst = NULL;
 static HWND g_hwnd_main = NULL;
 static HWND g_hwnd_install = NULL;
@@ -28,27 +32,66 @@ static wchar_t g_install_dir[MAX_PATH] = {0};
 static wchar_t g_exe_path[MAX_PATH] = {0};
 static BOOL g_is_upgrade = FALSE;
 
-static void init_install_paths(void) {
-    wchar_t local_appdata[MAX_PATH] = {0};
-    if (!SHGetSpecialFolderPathW(NULL, local_appdata, CSIDL_LOCAL_APPDATA, TRUE)) {
-        GetEnvironmentVariableW(L"LOCALAPPDATA", local_appdata, MAX_PATH);
+static void harden_dll_search_path(void) {
+    typedef BOOL (WINAPI *PFN_SetDefaultDllDirectories)(DWORD);
+    HMODULE kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (kernel32) {
+        PFN_SetDefaultDllDirectories pfn =
+            (PFN_SetDefaultDllDirectories)(void *)GetProcAddress(
+                kernel32, "SetDefaultDllDirectories"
+            );
+        if (pfn) {
+            pfn(LOAD_LIBRARY_SEARCH_SYSTEM32);
+        }
     }
-    swprintf(g_install_dir, MAX_PATH, L"%ls\\Programs\\%ls", local_appdata, APP_NAME);
-    swprintf(g_exe_path, MAX_PATH, L"%ls\\SquadAir.exe", g_install_dir);
+}
+
+static BOOL resolve_local_appdata(wchar_t *out, DWORD out_len) {
+    if (SHGetSpecialFolderPathW(NULL, out, CSIDL_LOCAL_APPDATA, TRUE) && out[0] != L'\0') {
+        return TRUE;
+    }
+    DWORD len = GetEnvironmentVariableW(L"LOCALAPPDATA", out, out_len);
+    if (len > 0 && len < out_len && out[0] != L'\0') {
+        return TRUE;
+    }
+    out[0] = L'\0';
+    return FALSE;
+}
+
+static BOOL init_install_paths(void) {
+    wchar_t local_appdata[MAX_PATH] = {0};
+    if (!resolve_local_appdata(local_appdata, MAX_PATH)) {
+        return FALSE;
+    }
+    if (swprintf(g_install_dir, MAX_PATH, L"%ls\\Programs\\%ls", local_appdata, APP_NAME) < 0 ||
+        swprintf(g_exe_path, MAX_PATH, L"%ls\\SquadAir.exe", g_install_dir) < 0) {
+        g_install_dir[0] = L'\0';
+        g_exe_path[0] = L'\0';
+        return FALSE;
+    }
 
     DWORD attrs = GetFileAttributesW(g_exe_path);
     g_is_upgrade = (attrs != INVALID_FILE_ATTRIBUTES && !(attrs & FILE_ATTRIBUTE_DIRECTORY));
+    return TRUE;
 }
 
-static void ensure_install_dir(void) {
+static BOOL ensure_install_dir(void) {
+    if (g_install_dir[0] == L'\0') {
+        return FALSE;
+    }
     wchar_t local_appdata[MAX_PATH] = {0};
-    if (!SHGetSpecialFolderPathW(NULL, local_appdata, CSIDL_LOCAL_APPDATA, TRUE)) {
-        GetEnvironmentVariableW(L"LOCALAPPDATA", local_appdata, MAX_PATH);
+    if (!resolve_local_appdata(local_appdata, MAX_PATH)) {
+        return FALSE;
     }
     wchar_t programs_dir[MAX_PATH] = {0};
-    swprintf(programs_dir, MAX_PATH, L"%ls\\Programs", local_appdata);
+    if (swprintf(programs_dir, MAX_PATH, L"%ls\\Programs", local_appdata) < 0) {
+        return FALSE;
+    }
     CreateDirectoryW(programs_dir, NULL);
-    CreateDirectoryW(g_install_dir, NULL);
+    if (!CreateDirectoryW(g_install_dir, NULL) && GetLastError() != ERROR_ALREADY_EXISTS) {
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void kill_running_instances(void) {
@@ -221,9 +264,7 @@ static void run_installation(HWND hwnd) {
     }
 
     kill_running_instances();
-    ensure_install_dir();
-
-    if (!extract_payload_atomically()) {
+    if (!ensure_install_dir() || !extract_payload_atomically()) {
         MessageBoxW(
             hwnd,
             L"Failed to write SquadAir.exe. Please close the running application manually and try again.",
@@ -234,8 +275,10 @@ static void run_installation(HWND hwnd) {
         return;
     }
 
-    CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    create_start_menu_shortcut();
+    HRESULT hr_co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(hr_co)) {
+        create_start_menu_shortcut();
+    }
     write_uninstall_registry();
 
     const wchar_t *done_msg = g_is_upgrade
@@ -248,10 +291,12 @@ static void run_installation(HWND hwnd) {
         L"SquadAir Setup",
         MB_YESNO | MB_ICONQUESTION
     );
-    if (add_desktop == IDYES) {
+    if (add_desktop == IDYES && SUCCEEDED(hr_co)) {
         create_desktop_shortcut();
     }
-    CoUninitialize();
+    if (SUCCEEDED(hr_co)) {
+        CoUninitialize();
+    }
 
     int launch_now = MessageBoxW(
         hwnd,
@@ -346,9 +391,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
     (void)lpCmdLine;
+    harden_dll_search_path();
     g_hinst = hInstance;
 
-    init_install_paths();
+    if (!init_install_paths()) {
+        MessageBoxW(
+            NULL,
+            L"Could not locate the Local AppData directory.",
+            L"SquadAir Setup Error",
+            MB_OK | MB_ICONERROR
+        );
+        return 1;
+    }
 
     const wchar_t *cls_name = L"SquadAirSetupWindow";
     WNDCLASSW wc = {0};

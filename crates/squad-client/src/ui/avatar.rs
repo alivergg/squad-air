@@ -107,8 +107,24 @@ pub fn generate_room_avatar_rgba(room_id: &RoomId) -> Vec<u8> {
 
 pub type ProcessedAvatar = (Vec<u8>, [u8; 32], Vec<u8>);
 
+pub fn decode_bounded_image(
+    raw_bytes: &[u8],
+    max_dim: u32,
+    max_alloc_bytes: u64,
+) -> Result<image::DynamicImage, String> {
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(max_dim);
+    limits.max_image_height = Some(max_dim);
+    limits.max_alloc = Some(max_alloc_bytes);
+    let mut reader = image::ImageReader::new(std::io::Cursor::new(raw_bytes))
+        .with_guessed_format()
+        .map_err(|e| e.to_string())?;
+    reader.limits(limits);
+    reader.decode().map_err(|e| e.to_string())
+}
+
 pub fn process_custom_avatar_image(raw_bytes: &[u8]) -> Result<ProcessedAvatar, String> {
-    let img = image::load_from_memory(raw_bytes)
+    let img = decode_bounded_image(raw_bytes, 4096, 64 * 1024 * 1024)
         .map_err(|e| format!("Failed to decode avatar image: {e}"))?;
     let w = img.width();
     let h = img.height();
@@ -144,7 +160,7 @@ pub fn process_custom_avatar_image(raw_bytes: &[u8]) -> Result<ProcessedAvatar, 
 }
 
 pub fn decode_avatar_jpeg_to_circular_rgba(jpeg_bytes: &[u8]) -> Result<Vec<u8>, String> {
-    let img = image::load_from_memory(jpeg_bytes)
+    let img = decode_bounded_image(jpeg_bytes, 1024, 16 * 1024 * 1024)
         .map_err(|e| format!("Invalid cached avatar JPEG: {e}"))?;
     let resized = if img.width() == AVATAR_SIZE && img.height() == AVATAR_SIZE {
         img
@@ -244,6 +260,19 @@ pub fn prune_expired_avatars() {
     }
 }
 
+const MAX_AVATAR_CACHE_ENTRIES: usize = 256;
+
+fn insert_bounded_handle<K: Eq + std::hash::Hash>(
+    map: &mut HashMap<K, iced_image::Handle>,
+    key: K,
+    handle: iced_image::Handle,
+) {
+    if !map.contains_key(&key) && map.len() >= MAX_AVATAR_CACHE_ENTRIES {
+        map.clear();
+    }
+    map.insert(key, handle);
+}
+
 pub struct AvatarCache {
     handles: Mutex<HashMap<ClientUuid, iced_image::Handle>>,
     room_handles: Mutex<HashMap<RoomId, iced_image::Handle>>,
@@ -267,7 +296,7 @@ impl AvatarCache {
         let rgba = generate_identicon_rgba(client_uuid);
         let handle = iced_image::Handle::from_rgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
         if let Ok(mut map) = self.handles.lock() {
-            map.insert(*client_uuid, handle.clone());
+            insert_bounded_handle(&mut map, *client_uuid, handle.clone());
         }
         handle
     }
@@ -281,7 +310,7 @@ impl AvatarCache {
         let rgba = generate_room_avatar_rgba(room_id);
         let handle = iced_image::Handle::from_rgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
         if let Ok(mut map) = self.room_handles.lock() {
-            map.insert(*room_id, handle.clone());
+            insert_bounded_handle(&mut map, *room_id, handle.clone());
         }
         handle
     }
@@ -289,7 +318,7 @@ impl AvatarCache {
     pub fn set_custom_rgba(&self, client_uuid: ClientUuid, rgba: Vec<u8>) {
         let handle = iced_image::Handle::from_rgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
         if let Ok(mut map) = self.handles.lock() {
-            map.insert(client_uuid, handle);
+            insert_bounded_handle(&mut map, client_uuid, handle);
         }
     }
 
@@ -307,7 +336,7 @@ impl AvatarCache {
         let rgba = generate_identicon_rgba(&client_uuid);
         let handle = iced_image::Handle::from_rgba(AVATAR_SIZE, AVATAR_SIZE, rgba);
         if let Ok(mut map) = self.handles.lock() {
-            map.insert(client_uuid, handle);
+            insert_bounded_handle(&mut map, client_uuid, handle);
         }
     }
 

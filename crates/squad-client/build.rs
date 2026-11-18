@@ -23,8 +23,17 @@ fn main() {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
-    })
-    .expect("x86_64-w64-mingw32-windres not found");
+    });
+
+    let Some(windres) = windres else {
+        if std::env::var("CARGO_CFG_TARGET_ENV").as_deref() == Ok("msvc") {
+            println!(
+                "cargo:warning=windres not found on MSVC target; skipping app.rc icon embedding"
+            );
+            return;
+        }
+        panic!("x86_64-w64-mingw32-windres not found");
+    };
 
     let status = Command::new(windres)
         .args(["app.rc", "-O", "coff", "-o"])

@@ -60,6 +60,10 @@ impl SystemTray {
         }
     }
 
+    pub fn is_available(&self) -> bool {
+        self._tray.is_some()
+    }
+
     pub fn poll_action(&self, audio: &AudioEngineHandle) -> Option<TrayAction> {
         let Ok(rx) = self.menu_rx.lock() else {
             return None;

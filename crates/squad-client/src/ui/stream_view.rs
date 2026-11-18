@@ -80,7 +80,9 @@ pub fn view_stream_stage(app: &SquadApp) -> Element<'_, Message> {
             Message::ToggleLocalStreamPreview,
         )
     } else {
-        let watched_id = app.watched_peer_id.unwrap();
+        let Some(watched_id) = app.watched_peer_id else {
+            return container(text("")).into();
+        };
         let watched_peer = app.peers.iter().find(|p| p.peer_id == watched_id);
         let streamer_name = watched_peer
             .map(|p| p.nickname.as_str())
@@ -198,7 +200,9 @@ pub fn view_stream_fullscreen(app: &SquadApp) -> Element<'_, Message> {
             Message::ToggleLocalStreamPreview,
         )
     } else {
-        let watched_id = app.watched_peer_id.unwrap();
+        let Some(watched_id) = app.watched_peer_id else {
+            return container(text("")).into();
+        };
         let watched_peer = app.peers.iter().find(|p| p.peer_id == watched_id);
         let streamer_name = watched_peer
             .map(|p| p.nickname.as_str())

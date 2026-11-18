@@ -697,7 +697,14 @@ impl SquadApp {
                                     ..
                                 } = item.content
                                 {
-                                    if !self.is_in_tray {
+                                    if !self.is_in_tray
+                                        && crate::ui::avatar::decode_bounded_image(
+                                            raw,
+                                            4096,
+                                            64 * 1024 * 1024,
+                                        )
+                                        .is_ok()
+                                    {
                                         self.image_handles.insert(
                                             blob_id,
                                             iced_image::Handle::from_bytes(raw.clone()),
@@ -724,9 +731,29 @@ impl SquadApp {
                                         .sort_by_key(|m| (m.timestamp_ms, m.msg_id));
                                     if self.chat_messages.len() > 30 {
                                         let drop_n = self.chat_messages.len() - 30;
+                                        let mut dropped_blobs = Vec::new();
                                         for dropped in self.chat_messages.drain(0..drop_n) {
                                             self.chat_text_editors
                                                 .remove(&(dropped.sender_uuid, dropped.msg_id));
+                                            if let ChatContentUi::InlineImage { blob_id, .. } =
+                                                dropped.content
+                                            {
+                                                dropped_blobs.push(blob_id);
+                                            }
+                                        }
+                                        for blob_id in dropped_blobs {
+                                            if self.lightbox_blob_id != Some(blob_id)
+                                                && !self.chat_messages.iter().any(|m| {
+                                                    matches!(
+                                                        m.content,
+                                                        ChatContentUi::InlineImage { blob_id: bid, .. }
+                                                            if bid == blob_id
+                                                    )
+                                                })
+                                            {
+                                                self.image_handles.remove(&blob_id);
+                                                self.inline_image_bytes.remove(&blob_id);
+                                            }
                                         }
                                     }
                                 }
@@ -736,7 +763,16 @@ impl SquadApp {
                                 state,
                                 inline_bytes,
                             } => {
-                                if !self.is_in_tray {
+                                let valid_inline = !self.is_in_tray
+                                    && inline_bytes.as_deref().is_some_and(|raw| {
+                                        crate::ui::avatar::decode_bounded_image(
+                                            raw,
+                                            4096,
+                                            64 * 1024 * 1024,
+                                        )
+                                        .is_ok()
+                                    });
+                                if valid_inline {
                                     if let Some(ref raw) = inline_bytes {
                                         self.image_handles.insert(
                                             blob_id,
@@ -756,7 +792,7 @@ impl SquadApp {
                                             *st = state.clone();
                                             if let Some(ref raw) = inline_bytes {
                                                 *bytes = Some(raw.clone());
-                                                if !self.is_in_tray {
+                                                if valid_inline {
                                                     self.inline_image_bytes.insert(
                                                         blob_id,
                                                         (filename.clone(), raw.clone()),
@@ -1280,10 +1316,18 @@ impl SquadApp {
             }
             Message::SaveImageAs(blob_id) => {
                 if let Some((filename, raw)) = self.inline_image_bytes.get(&blob_id).cloned() {
+                    let safe_name = squad_proto::sanitize_display_str(&filename, 128)
+                        .replace(['/', '\\'], "_");
+                    let safe_name = if safe_name.is_empty() || safe_name == "." || safe_name == ".."
+                    {
+                        "image.png".to_string()
+                    } else {
+                        safe_name
+                    };
                     return Task::perform(
                         async move {
                             if let Some(handle) = rfd::AsyncFileDialog::new()
-                                .set_file_name(&filename)
+                                .set_file_name(&safe_name)
                                 .save_file()
                                 .await
                             {
@@ -1530,7 +1574,7 @@ impl SquadApp {
                 if Some(window_id) != self.main_window_id {
                     return Task::none();
                 }
-                if self.config.minimize_to_tray {
+                if self.config.minimize_to_tray && self.tray.is_available() {
                     self.is_in_tray = true;
                     self.main_window_id = None;
                     self.share_modal_open = false;
@@ -1999,7 +2043,7 @@ fn read_clipboard_payload(
 }
 
 fn copy_encoded_image_to_clipboard(encoded_bytes: &[u8]) -> Result<(), String> {
-    let img = image::load_from_memory(encoded_bytes)
+    let img = crate::ui::avatar::decode_bounded_image(encoded_bytes, 4096, 64 * 1024 * 1024)
         .map_err(|e| format!("Failed to decode image for clipboard: {e}"))?;
     let rgba = img.to_rgba8();
     let (width, height) = (rgba.width() as usize, rgba.height() as usize);
@@ -2012,31 +2056,38 @@ fn copy_encoded_image_to_clipboard(encoded_bytes: &[u8]) -> Result<(), String> {
     .map_err(|e| format!("Failed to write image to clipboard: {e}"))
 }
 
+fn spawn_and_reap(mut cmd: std::process::Command) {
+    if let Ok(mut child) = cmd.spawn() {
+        std::thread::spawn(move || {
+            let _ = child.wait();
+        });
+    }
+}
+
 fn open_in_file_manager(saved_path: Option<PathBuf>) {
     #[cfg(target_os = "macos")]
     {
+        let mut cmd = std::process::Command::new("open");
         if let Some(path) = saved_path.filter(|p| p.exists()) {
-            let _ = std::process::Command::new("open")
-                .arg("-R")
-                .arg(path)
-                .spawn();
-            return;
+            cmd.arg("-R").arg(path);
+        } else {
+            let dir = downloads_root_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            cmd.arg(dir);
         }
-        let dir = downloads_root_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::process::Command::new("open").arg(dir).spawn();
+        spawn_and_reap(cmd);
     }
     #[cfg(target_os = "windows")]
     {
+        let mut cmd = std::process::Command::new("explorer");
         if let Some(path) = saved_path.filter(|p| p.exists()) {
-            let _ = std::process::Command::new("explorer")
-                .arg(format!("/select,{}", path.display()))
-                .spawn();
-            return;
+            cmd.arg(format!("/select,{}", path.display()));
+        } else {
+            let dir = downloads_root_dir();
+            let _ = std::fs::create_dir_all(&dir);
+            cmd.arg(dir);
         }
-        let dir = downloads_root_dir();
-        let _ = std::fs::create_dir_all(&dir);
-        let _ = std::process::Command::new("explorer").arg(dir).spawn();
+        spawn_and_reap(cmd);
     }
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     {
@@ -2044,7 +2095,9 @@ fn open_in_file_manager(saved_path: Option<PathBuf>) {
             .and_then(|p| p.parent().map(|d| d.to_path_buf()))
             .unwrap_or_else(downloads_root_dir);
         let _ = std::fs::create_dir_all(&dir);
-        let _ = std::process::Command::new("xdg-open").arg(dir).spawn();
+        let mut cmd = std::process::Command::new("xdg-open");
+        cmd.arg(dir);
+        spawn_and_reap(cmd);
     }
 }
 
