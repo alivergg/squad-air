@@ -11,6 +11,8 @@ const BUCKET_BURST: f64 = 45.0;
 const RELAY_PACKETS_PER_SEC_PER_IP: f64 = 2500.0;
 const RELAY_BUCKET_BURST: f64 = 500.0;
 const STALE_BUCKET_TTL: Duration = Duration::from_secs(60);
+const MAX_ACTIVE_ROOMS: usize = 4096;
+const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
 
 #[derive(Debug, Clone)]
 pub struct PeerEntry {
@@ -74,6 +76,9 @@ fn consume_token(
     rate_per_sec: f64,
     burst: f64,
 ) -> bool {
+    if !buckets.contains_key(&ip) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+        return false;
+    }
     let mut entry = buckets.entry(ip).or_insert(TokenBucket {
         tokens: burst,
         last_refill: now,
@@ -175,10 +180,34 @@ impl RendezvousState {
         lan_addrs: Vec<SocketAddrV4>,
         now: Instant,
     ) -> Vec<(SocketAddr, SignalingPacket)> {
+        if !self.rooms.contains_key(&room_id) && self.rooms.len() >= MAX_ACTIVE_ROOMS {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::RoomFull,
+                },
+            )];
+        }
+
         let mut room = self.rooms.entry(room_id).or_default();
 
+        if let Some(existing) = room.peers.get(&client_uuid) {
+            if existing.public_addr != src_addr
+                && existing.public_addr.ip() != src_addr.ip()
+                && now.saturating_duration_since(existing.last_seen) <= Duration::from_secs(2)
+            {
+                return Vec::new();
+            }
+        }
+
+        let before_len = room.peers.len();
+        room.peers
+            .retain(|uuid, peer| *uuid == client_uuid || peer.public_addr != src_addr);
+        let removed_collision = room.peers.len() != before_len;
+
         if let Some(existing) = room.peers.get_mut(&client_uuid) {
-            let changed = existing.public_addr != src_addr
+            let changed = removed_collision
+                || existing.public_addr != src_addr
                 || existing.nickname != nickname
                 || existing.lan_addrs != lan_addrs;
             existing.public_addr = src_addr;
@@ -247,6 +276,7 @@ impl RendezvousState {
     /// Handles `C2sLeave` and returns updated `S2cRoomState` broadcasts for remaining peers.
     pub fn handle_leave(
         &self,
+        src_addr: SocketAddr,
         room_id: RoomId,
         client_uuid: ClientUuid,
     ) -> Vec<(SocketAddr, SignalingPacket)> {
@@ -254,7 +284,12 @@ impl RendezvousState {
         let mut should_remove_room = false;
 
         if let Some(mut room) = self.rooms.get_mut(&room_id) {
-            if room.peers.remove(&client_uuid).is_some() {
+            if room
+                .peers
+                .get(&client_uuid)
+                .is_some_and(|p| p.public_addr == src_addr)
+            {
+                room.peers.remove(&client_uuid);
                 if room.peers.is_empty() {
                     should_remove_room = true;
                 } else {
@@ -279,7 +314,7 @@ impl RendezvousState {
             let room = entry.value_mut();
             let before = room.peers.len();
             room.peers
-                .retain(|_, peer| now.duration_since(peer.last_seen) <= ttl);
+                .retain(|_, peer| now.saturating_duration_since(peer.last_seen) <= ttl);
 
             if room.peers.is_empty() {
                 empty_rooms.push(room_id);
@@ -513,5 +548,93 @@ mod tests {
         assert!(state.relay_rate_limits.contains_key(&addr_a.ip()));
         let _ = state.evict_expired(t_refill + Duration::from_secs(61), ttl);
         assert!(!state.relay_rate_limits.contains_key(&addr_a.ip()));
+    }
+
+    #[test]
+    fn test_handle_leave_rejects_mismatched_src_addr() {
+        let state = RendezvousState::new();
+        let now = Instant::now();
+        let room_id = [0x66u8; 16];
+        let uuid_a = [1u8; 16];
+        let uuid_b = [2u8; 16];
+        let addr_a: SocketAddr = "203.0.113.10:5001".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.11:5002".parse().unwrap();
+        let attacker_addr: SocketAddr = "198.51.100.77:9999".parse().unwrap();
+
+        register_peer(&state, addr_a, room_id, uuid_a, "Alice", now);
+        register_peer(&state, addr_b, room_id, uuid_b, "Bob", now);
+
+        // Spoofed leave from another address must be rejected and leave peer intact.
+        let spoofed = state.handle_leave(attacker_addr, room_id, uuid_a);
+        assert!(spoofed.is_empty());
+        assert_eq!(state.rooms.get(&room_id).unwrap().peers.len(), 2);
+
+        // Spoofed leave from a different port on the same IP must also be rejected.
+        let wrong_port: SocketAddr = "203.0.113.10:9999".parse().unwrap();
+        assert!(state.handle_leave(wrong_port, room_id, uuid_a).is_empty());
+        assert_eq!(state.rooms.get(&room_id).unwrap().peers.len(), 2);
+
+        // Genuine leave from registered public_addr succeeds and notifies remaining peer.
+        let legit = state.handle_leave(addr_a, room_id, uuid_a);
+        assert_eq!(legit.len(), 1);
+        assert_eq!(legit[0].0, addr_b);
+        assert_eq!(state.rooms.get(&room_id).unwrap().peers.len(), 1);
+    }
+
+    #[test]
+    fn test_handle_register_prevents_active_hijack_and_cleans_addr_collision() {
+        let state = RendezvousState::new();
+        let t0 = Instant::now();
+        let room_id = [0x77u8; 16];
+        let uuid_a = [1u8; 16];
+        let uuid_a_new = [3u8; 16];
+        let addr_a: SocketAddr = "203.0.113.10:5001".parse().unwrap();
+        let attacker_addr: SocketAddr = "198.51.100.88:5001".parse().unwrap();
+
+        register_peer(&state, addr_a, room_id, uuid_a, "Alice", t0);
+
+        // Active session hijack from another IP within 2s is ignored.
+        let hijack = state.handle_register(
+            attacker_addr,
+            room_id,
+            uuid_a,
+            "Hijacked".into(),
+            Vec::new(),
+            t0 + Duration::from_secs(1),
+        );
+        assert!(hijack.is_empty());
+        assert_eq!(
+            state.rooms.get(&room_id).unwrap().peers[&uuid_a].public_addr,
+            addr_a
+        );
+
+        // Failover from another IP after >2s is allowed.
+        let failover = state.handle_register(
+            attacker_addr,
+            room_id,
+            uuid_a,
+            "Alice".into(),
+            Vec::new(),
+            t0 + Duration::from_secs(3),
+        );
+        assert_eq!(failover.len(), 1);
+        assert_eq!(
+            state.rooms.get(&room_id).unwrap().peers[&uuid_a].public_addr,
+            attacker_addr
+        );
+
+        // Restarting with a new UUID from the same socket address cleans up the stale UUID.
+        let restart = state.handle_register(
+            attacker_addr,
+            room_id,
+            uuid_a_new,
+            "Alice2".into(),
+            Vec::new(),
+            t0 + Duration::from_secs(4),
+        );
+        assert_eq!(restart.len(), 1);
+        let room = state.rooms.get(&room_id).unwrap();
+        assert!(!room.peers.contains_key(&uuid_a));
+        assert!(room.peers.contains_key(&uuid_a_new));
     }
 }

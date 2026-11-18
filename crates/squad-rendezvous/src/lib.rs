@@ -4,8 +4,8 @@ pub use state::RendezvousState;
 
 use anyhow::Result;
 use squad_proto::{
-    is_relay_datagram, parse_relay_header, rewrite_relay_peer_id, P2pHeader, SignalingErrorCode,
-    SignalingPacket, MAX_RELAY_UDP_PAYLOAD,
+    is_relay_datagram, parse_relay_header, rewrite_relay_peer_id, P2pHeader, SignalingPacket,
+    MAX_RELAY_UDP_PAYLOAD,
 };
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -124,13 +124,6 @@ pub async fn handle_datagram_with_config(
     }
 
     if !state.check_rate_limit(src_addr.ip(), now) {
-        if let Ok(bytes) = (SignalingPacket::S2cError {
-            code: SignalingErrorCode::RateLimited,
-        })
-        .encode()
-        {
-            let _ = socket.send_to(&bytes, src_addr).await;
-        }
         return;
     }
 
@@ -138,13 +131,6 @@ pub async fn handle_datagram_with_config(
         Ok(p) => p,
         Err(e) => {
             debug!("Invalid signaling packet from {src_addr}: {e}");
-            if let Ok(bytes) = (SignalingPacket::S2cError {
-                code: SignalingErrorCode::InvalidPacket,
-            })
-            .encode()
-            {
-                let _ = socket.send_to(&bytes, src_addr).await;
-            }
             return;
         }
     };
@@ -159,7 +145,7 @@ pub async fn handle_datagram_with_config(
         SignalingPacket::C2sLeave {
             room_id,
             client_uuid,
-        } => state.handle_leave(room_id, client_uuid),
+        } => state.handle_leave(src_addr, room_id, client_uuid),
         _ => Vec::new(),
     };
 
@@ -173,7 +159,9 @@ pub async fn handle_datagram_with_config(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use squad_proto::{encode_relay_datagram_into, P2pMsgType, P2pPayload, RoomCipher};
+    use squad_proto::{
+        encode_relay_datagram_into, P2pMsgType, P2pPayload, RoomCipher, SignalingErrorCode,
+    };
 
     #[tokio::test]
     async fn test_ten_peers_registration_and_11th_rejected() {

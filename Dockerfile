@@ -11,10 +11,7 @@ RUN cargo build --release --locked -p squad-rendezvous
 
 FROM debian:bookworm-slim AS runtime
 
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates \
-    && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home --shell /usr/sbin/nologin squad
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin squad
 
 COPY --from=builder /app/target/release/squad-rendezvous /usr/local/bin/squad-rendezvous
 
