@@ -20,6 +20,9 @@ const CHUNK_REQ_INTERVAL: Duration = Duration::from_millis(40);
 const WINDOW_RETRY_COOLDOWN: Duration = Duration::from_millis(160);
 const QOS_MAX_CHUNKS_PER_TICK: usize = 15;
 const MAX_OUTBOUND_CHUNK_QUEUE: usize = 4096;
+const MAX_PENDING_RELIABLE: usize = 256;
+const MAX_ACTIVE_DOWNLOADS: usize = 8;
+const MAX_SEEN_MESSAGES: usize = 2048;
 const MAX_DOWNLOAD_FILE_BYTES: u64 = 512 * 1024 * 1024; // 512 MiB safety cap
 const MAX_AVATAR_BYTES: usize = 64 * 1024;
 const BLOB_KIND_INLINE_IMAGE: u8 = 1;
@@ -374,7 +377,7 @@ impl SwarmChatManager {
         }
 
         for entry in entries {
-            if !self.seen_messages.insert((entry.sender_uuid, entry.msg_id)) {
+            if !self.mark_seen_message((entry.sender_uuid, entry.msg_id)) {
                 continue;
             }
             let is_self = entry.sender_uuid == local_uuid;
@@ -521,6 +524,50 @@ impl SwarmChatManager {
         }
     }
 
+    fn mark_seen_message(&mut self, key: (ClientUuid, u64)) -> bool {
+        if self.seen_messages.contains(&key) {
+            return false;
+        }
+        if self.seen_messages.len() >= MAX_SEEN_MESSAGES {
+            self.seen_messages.clear();
+            for entry in &self.history {
+                self.seen_messages
+                    .insert((entry.sender_uuid, entry.msg_id));
+            }
+        }
+        self.seen_messages.insert(key)
+    }
+
+    fn active_download_count(&self) -> usize {
+        self.remote_blobs
+            .values()
+            .filter(|b| b.download.is_some())
+            .count()
+    }
+
+    fn clear_pending_avatar_for_sender(
+        &mut self,
+        sender_uuid: ClientUuid,
+        keep_blob_id: Option<[u8; 16]>,
+    ) {
+        let stale_ids: Vec<[u8; 16]> = self
+            .avatar_targets
+            .iter()
+            .filter(|(&id, (uuid, _))| *uuid == sender_uuid && Some(id) != keep_blob_id)
+            .map(|(&id, _)| id)
+            .collect();
+        for stale_id in stale_ids {
+            self.avatar_targets.remove(&stale_id);
+            if self
+                .remote_blobs
+                .get(&stale_id)
+                .is_some_and(|b| !b.completed)
+            {
+                self.remote_blobs.remove(&stale_id);
+            }
+        }
+    }
+
     fn next_msg_id(&mut self, local_peer_id: PeerId) -> u64 {
         let seq = self.local_msg_counter & 0x0000_FFFF_FFFF_FFFF;
         self.local_msg_counter = self.local_msg_counter.wrapping_add(1);
@@ -591,7 +638,7 @@ impl SwarmChatManager {
         let timestamp_ms = now_millis();
         let text_owned = trimmed.to_string();
 
-        self.seen_messages.insert((ctx.local_uuid, msg_id));
+        self.mark_seen_message((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
             sender_uuid: ctx.local_uuid,
             sender_nickname: ctx.local_nickname.to_string(),
@@ -653,7 +700,7 @@ impl SwarmChatManager {
         if let Some(root) = &self.data_root {
             let _ = save_cached_inline_image(root, &blob_id, &bytes);
         }
-        self.seen_messages.insert((ctx.local_uuid, msg_id));
+        self.mark_seen_message((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
             sender_uuid: ctx.local_uuid,
             sender_nickname: ctx.local_nickname.to_string(),
@@ -765,7 +812,7 @@ impl SwarmChatManager {
             },
         );
         self.record_downloaded_blob(blob_id, path.clone(), total_size, blake3_root);
-        self.seen_messages.insert((ctx.local_uuid, msg_id));
+        self.mark_seen_message((ctx.local_uuid, msg_id));
         self.push_history(HistoryEntry {
             sender_uuid: ctx.local_uuid,
             sender_nickname: ctx.local_nickname.to_string(),
@@ -893,7 +940,7 @@ impl SwarmChatManager {
                 ctx.send_p2p(sender_addr, &P2pPayload::ChatAck { msg_id })
                     .await;
 
-                if !self.seen_messages.insert((sender_uuid, msg_id)) {
+                if !self.mark_seen_message((sender_uuid, msg_id)) {
                     return;
                 }
 
@@ -933,6 +980,14 @@ impl SwarmChatManager {
                 }
             }
             P2pPayload::HistorySyncReq => {
+                if self.pending_reliable.len() >= MAX_PENDING_RELIABLE
+                    || self
+                        .pending_reliable
+                        .iter()
+                        .any(|p| p.target_peer == sender_peer_id)
+                {
+                    return;
+                }
                 let now = Instant::now();
                 let entries: Vec<HistoryEntry> = self.history.iter().cloned().collect();
                 for (idx, entry) in entries.into_iter().enumerate() {
@@ -1012,7 +1067,7 @@ impl SwarmChatManager {
                     blob.seeders.insert(sender_peer_id);
                 }
 
-                if !self.seen_messages.insert((sender_uuid, msg_id)) {
+                if !self.mark_seen_message((sender_uuid, msg_id)) {
                     return;
                 }
 
@@ -1048,8 +1103,10 @@ impl SwarmChatManager {
                     },
                 });
 
-                let should_auto =
-                    kind == 1 && auto_download && total_size < INLINE_IMAGE_MAX_BYTES as u64;
+                let should_auto = kind == 1
+                    && auto_download
+                    && total_size < INLINE_IMAGE_MAX_BYTES as u64
+                    && self.active_download_count() < MAX_ACTIVE_DOWNLOADS;
                 let (download, init_state) = if should_auto {
                     match init_download(&meta) {
                         Ok(dl) => (
@@ -1111,6 +1168,7 @@ impl SwarmChatManager {
                 total_chunks,
             } => {
                 if avatar_hash == [0u8; 32] {
+                    self.clear_pending_avatar_for_sender(sender_uuid, None);
                     let _ = ctx
                         .evt_tx
                         .send(TransferEvent::PeerAvatarLoaded {
@@ -1129,6 +1187,7 @@ impl SwarmChatManager {
                     return;
                 }
                 if let Some(cached) = crate::ui::avatar::load_cached_avatar_jpeg(&avatar_hash) {
+                    self.clear_pending_avatar_for_sender(sender_uuid, None);
                     let _ = ctx
                         .evt_tx
                         .send(TransferEvent::PeerAvatarLoaded {
@@ -1140,6 +1199,19 @@ impl SwarmChatManager {
                     return;
                 }
                 let blob_id = avatar_blob_id(&avatar_hash);
+                self.clear_pending_avatar_for_sender(sender_uuid, Some(blob_id));
+                let active_downloads = self.active_download_count();
+                if let Some(existing) = self.remote_blobs.get_mut(&blob_id) {
+                    existing.seeders.insert(sender_peer_id);
+                    if !existing.completed {
+                        if existing.download.is_none() && active_downloads < MAX_ACTIVE_DOWNLOADS {
+                            existing.download = init_download(&existing.meta).ok();
+                        }
+                        self.avatar_targets
+                            .insert(blob_id, (sender_uuid, avatar_hash));
+                    }
+                    return;
+                }
                 let meta = BlobMetadata {
                     blob_id,
                     kind: BLOB_KIND_AVATAR,
@@ -1148,22 +1220,25 @@ impl SwarmChatManager {
                     total_chunks: total_chunks as u32,
                     blake3_root: avatar_hash,
                 };
-                if let Ok(dl) = init_download(&meta) {
-                    let mut seeders = HashSet::new();
-                    seeders.insert(sender_peer_id);
-                    self.remote_blobs.insert(
-                        blob_id,
-                        TrackedBlob {
-                            meta,
-                            seeders,
-                            seeder_rr_cursor: 0,
-                            download: Some(dl),
-                            completed: false,
-                        },
-                    );
-                    self.avatar_targets
-                        .insert(blob_id, (sender_uuid, avatar_hash));
-                }
+                let download = if active_downloads < MAX_ACTIVE_DOWNLOADS {
+                    init_download(&meta).ok()
+                } else {
+                    None
+                };
+                let mut seeders = HashSet::new();
+                seeders.insert(sender_peer_id);
+                self.remote_blobs.insert(
+                    blob_id,
+                    TrackedBlob {
+                        meta,
+                        seeders,
+                        seeder_rr_cursor: 0,
+                        download,
+                        completed: false,
+                    },
+                );
+                self.avatar_targets
+                    .insert(blob_id, (sender_uuid, avatar_hash));
             }
             P2pPayload::BlobChunkReq {
                 blob_id,
@@ -1191,8 +1266,15 @@ impl SwarmChatManager {
                 chunk_index,
                 data,
             } => {
-                self.handle_incoming_chunk(blob_id, chunk_index, &data, connected_peers, ctx)
-                    .await;
+                self.handle_incoming_chunk(
+                    sender_peer_id,
+                    blob_id,
+                    chunk_index,
+                    &data,
+                    connected_peers,
+                    ctx,
+                )
+                .await;
             }
             P2pPayload::BlobHave { blob_id } => {
                 if let Some(blob) = self.remote_blobs.get_mut(&blob_id) {
@@ -1205,6 +1287,7 @@ impl SwarmChatManager {
 
     async fn handle_incoming_chunk(
         &mut self,
+        sender_peer_id: PeerId,
         blob_id: [u8; 16],
         chunk_index: u32,
         data: &[u8],
@@ -1214,7 +1297,7 @@ impl SwarmChatManager {
         let Some(blob) = self.remote_blobs.get_mut(&blob_id) else {
             return;
         };
-        if blob.completed {
+        if blob.completed || !blob.seeders.contains(&sender_peer_id) {
             return;
         }
         let Some(dl) = blob.download.as_mut() else {
@@ -1226,7 +1309,10 @@ impl SwarmChatManager {
         }
 
         let offset = (chunk_index as u64) * (BLOB_CHUNK_SIZE as u64);
-        let expected_len = ((blob.meta.total_size - offset).min(BLOB_CHUNK_SIZE as u64)) as usize;
+        let Some(rem) = blob.meta.total_size.checked_sub(offset) else {
+            return;
+        };
+        let expected_len = (rem.min(BLOB_CHUNK_SIZE as u64)) as usize;
         if data.len() != expected_len {
             return;
         }
@@ -1863,11 +1949,11 @@ fn read_room_history_file(root: &Path, room_id: &RoomId) -> Vec<HistoryEntry> {
         let Some(timestamp_ms) = obj.get("timestamp_ms").and_then(JsonVal::as_u64) else {
             continue;
         };
-        let Some(kind) = obj.get("kind").and_then(JsonVal::as_u64) else {
+        let Some(raw_kind) = obj.get("kind").and_then(JsonVal::as_u64) else {
             continue;
         };
 
-        let payload = if kind == 0 {
+        let payload = if raw_kind == 0 {
             let text = obj
                 .get("text")
                 .and_then(JsonVal::as_str)
@@ -1875,6 +1961,9 @@ fn read_room_history_file(root: &Path, room_id: &RoomId) -> Vec<HistoryEntry> {
                 .to_string();
             HistoryPayload::Text(text)
         } else {
+            let Ok(kind) = u8::try_from(raw_kind) else {
+                continue;
+            };
             let Some(blob_id) = obj
                 .get("blob_id")
                 .and_then(JsonVal::as_str)
@@ -1894,14 +1983,27 @@ fn read_room_history_file(root: &Path, room_id: &RoomId) -> Vec<HistoryEntry> {
             let Some(total_size) = obj.get("total_size").and_then(JsonVal::as_u64) else {
                 continue;
             };
-            let chunk_size = obj
+            let raw_chunk_size = obj
                 .get("chunk_size")
                 .and_then(JsonVal::as_u64)
-                .unwrap_or(BLOB_CHUNK_SIZE as u64) as u16;
-            let total_chunks = obj
+                .unwrap_or(BLOB_CHUNK_SIZE as u64);
+            let Ok(chunk_size) = u16::try_from(raw_chunk_size) else {
+                continue;
+            };
+            let raw_total_chunks = obj
                 .get("total_chunks")
                 .and_then(JsonVal::as_u64)
-                .unwrap_or(1) as u32;
+                .unwrap_or(1);
+            let Ok(total_chunks) = u32::try_from(raw_total_chunks) else {
+                continue;
+            };
+            if total_size == 0
+                || total_size > MAX_DOWNLOAD_FILE_BYTES
+                || (chunk_size as usize) != BLOB_CHUNK_SIZE
+                || (total_chunks as u64) != total_size.div_ceil(BLOB_CHUNK_SIZE as u64)
+            {
+                continue;
+            }
             let Some(blake3_root) = obj
                 .get("blake3_root")
                 .and_then(JsonVal::as_str)
@@ -1911,7 +2013,7 @@ fn read_room_history_file(root: &Path, room_id: &RoomId) -> Vec<HistoryEntry> {
             };
             HistoryPayload::BlobOffer {
                 blob_id,
-                kind: kind as u8,
+                kind,
                 auto_download,
                 filename,
                 total_size,
@@ -2093,71 +2195,120 @@ fn parse_json_object_array(input: &str) -> Vec<HashMap<String, JsonVal>> {
 }
 
 fn parse_json_string(input: &str, idx: &mut usize) -> Option<String> {
-    let bytes = input.as_bytes();
-    if *idx >= bytes.len() || bytes[*idx] != b'"' {
+    let rest = input.get(*idx..)?;
+    if !rest.starts_with('"') {
         return None;
     }
-    *idx += 1;
+    let mut chars = rest[1..].char_indices();
     let mut out = String::new();
-    while *idx < bytes.len() {
-        let b = bytes[*idx];
-        if b == b'"' {
-            *idx += 1;
-            return Some(out);
-        }
-        if b == b'\\' {
-            *idx += 1;
-            if *idx >= bytes.len() {
-                return None;
+    while let Some((off, ch)) = chars.next() {
+        match ch {
+            '"' => {
+                *idx += 1 + off + 1;
+                return Some(out);
             }
-            match bytes[*idx] {
-                b'"' => out.push('"'),
-                b'\\' => out.push('\\'),
-                b'/' => out.push('/'),
-                b'n' => out.push('\n'),
-                b'r' => out.push('\r'),
-                b't' => out.push('\t'),
-                b'u' => {
-                    let hex = input.get(*idx + 1..*idx + 5)?;
-                    let code = u32::from_str_radix(hex, 16).ok()?;
-                    if let Some(ch) = char::from_u32(code) {
-                        out.push(ch);
+            '\\' => {
+                let (_, esc) = chars.next()?;
+                match esc {
+                    '"' => out.push('"'),
+                    '\\' => out.push('\\'),
+                    '/' => out.push('/'),
+                    'b' => out.push('\u{0008}'),
+                    'f' => out.push('\u{000C}'),
+                    'n' => out.push('\n'),
+                    'r' => out.push('\r'),
+                    't' => out.push('\t'),
+                    'u' => {
+                        let mut hex = [0u8; 4];
+                        for slot in &mut hex {
+                            let (_, h) = chars.next()?;
+                            if !h.is_ascii_hexdigit() {
+                                return None;
+                            }
+                            *slot = h as u8;
+                        }
+                        let hex_str = std::str::from_utf8(&hex).ok()?;
+                        let code = u32::from_str_radix(hex_str, 16).ok()?;
+                        if let Some(decoded) = char::from_u32(code) {
+                            out.push(decoded);
+                        }
                     }
-                    *idx += 4;
+                    other => out.push(other),
                 }
-                other => out.push(other as char),
             }
-            *idx += 1;
-        } else {
-            let ch = input[*idx..].chars().next()?;
-            out.push(ch);
-            *idx += ch.len_utf8();
+            other => out.push(other),
         }
     }
     None
+}
+
+fn is_windows_reserved_stem(stem: &str) -> bool {
+    let upper = stem.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
 }
 
 fn sanitize_filename(raw: &str) -> String {
     let base = Path::new(raw)
         .file_name()
         .and_then(|s| s.to_str())
-        .unwrap_or("received_file")
-        .trim();
-    if base.is_empty() || base == "." || base == ".." {
-        return "received_file".to_string();
-    }
-    base.chars()
+        .unwrap_or("");
+    let cleaned: String = base
+        .chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\u{202A}'..='\u{202E}'
+                    | '\u{2066}'..='\u{2069}'
+                    | '\u{200E}'
+                    | '\u{200F}'
+                    | '\u{FEFF}'
+            )
+        })
         .map(|c| match c {
             '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
             c if c.is_control() => '_',
             other => other,
         })
-        .collect()
+        .collect();
+    let trimmed = cleaned.trim_matches(|c| c == '.' || c == ' ');
+    if trimmed.is_empty() {
+        return "received_file".to_string();
+    }
+    let stem = trimmed.split('.').next().unwrap_or(trimmed).trim_end_matches(' ');
+    if is_windows_reserved_stem(stem) {
+        format!("file_{trimmed}")
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn unique_destination_path(dir: &Path, filename: &str) -> PathBuf {
     let candidate = dir.join(filename);
-    if !candidate.exists() {
+    if candidate.symlink_metadata().is_err() {
         return candidate;
     }
     let path = Path::new(filename);
@@ -2174,7 +2325,7 @@ fn unique_destination_path(dir: &Path, filename: &str) -> PathBuf {
             _ => format!("{stem} ({n})"),
         };
         let p = dir.join(numbered);
-        if !p.exists() {
+        if p.symlink_metadata().is_err() {
             return p;
         }
     }
@@ -3132,5 +3283,38 @@ mod tests {
 
         let _ = fs::remove_file(&dl_path);
         let _ = fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_parse_json_string_malformed_utf8_escapes() {
+        let mut idx = 0;
+        assert_eq!(
+            parse_json_string("\"hello\\éworld\"", &mut idx).as_deref(),
+            Some("helloéworld")
+        );
+        assert_eq!(idx, "\"hello\\éworld\"".len());
+
+        let mut idx = 0;
+        assert_eq!(parse_json_string("\"\\🦀\"", &mut idx).as_deref(), Some("🦀"));
+        assert_eq!(idx, "\"\\🦀\"".len());
+
+        let mut idx = 0;
+        assert_eq!(parse_json_string("\"\\u00é1\"", &mut idx), None);
+
+        let mut idx = 0;
+        assert_eq!(parse_json_string("\"\\u12\"", &mut idx), None);
+
+        let mut idx = 0;
+        assert_eq!(parse_json_string("\"unterminated\\", &mut idx), None);
+
+        let mut idx = 0;
+        assert_eq!(
+            parse_json_string("\"\\u0041\\n\\t\\\"\\\\\"", &mut idx).as_deref(),
+            Some("A\n\t\"\\")
+        );
+
+        let parsed = parse_json_object_array("[{\"text\":\"ok\\é\"}]");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].get("text").and_then(JsonVal::as_str), Some("oké"));
     }
 }

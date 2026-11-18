@@ -194,6 +194,10 @@ struct RemotePeerState {
     rtt_ms: u32,
     has_announced_once: bool,
     stream_info: Option<RemoteStreamInfo>,
+    replay_control: squad_proto::ReplayWindow,
+    replay_voice: squad_proto::ReplayWindow,
+    replay_dtx: squad_proto::ReplayWindow,
+    replay_stream_audio: squad_proto::ReplayWindow,
 }
 
 struct CaptureWorkerHandle {
@@ -367,12 +371,13 @@ pub fn spawn_mesh_worker(
                         match decoder.decode_checked(&annex_b_bytes) {
                             Ok(Some(raw_rgba)) => {
                                 if decode_gen.load(Ordering::Acquire) == generation {
-                                    *slot_decode.lock().unwrap() = Some(DecodedVideoFrame {
-                                        streamer_peer_id,
-                                        width: raw_rgba.width,
-                                        height: raw_rgba.height,
-                                        rgba: raw_rgba.rgba,
-                                    });
+                                    *slot_decode.lock().unwrap_or_else(|e| e.into_inner()) =
+                                        Some(DecodedVideoFrame {
+                                            streamer_peer_id,
+                                            width: raw_rgba.width,
+                                            height: raw_rgba.height,
+                                            rgba: raw_rgba.rgba,
+                                        });
                                     video_notify_decode.notify_one();
                                 }
                             }
@@ -503,8 +508,10 @@ pub fn spawn_mesh_worker(
 
                             send_register(&socket, &new_sess).await;
                             stop_capture_worker(&mut capture_worker);
+                            drain_video_out_rx(&mut video_out_rx);
+                            audio_engine.clear_stream_audio();
                             decode_handle.reset();
-                            *video_frame_slot.lock().unwrap() = None;
+                            clear_video_slot(&video_frame_slot);
                             last_snapshots.clear();
                             session = Some(new_sess);
                             audio_engine.play_cue(SoundCue::Join);
@@ -572,8 +579,10 @@ pub fn spawn_mesh_worker(
                             send_register(&socket, &new_sess).await;
                             broadcast_lan_announce(lan_tx_sock.as_ref(), &new_sess).await;
                             stop_capture_worker(&mut capture_worker);
+                            drain_video_out_rx(&mut video_out_rx);
+                            audio_engine.clear_stream_audio();
                             decode_handle.reset();
-                            *video_frame_slot.lock().unwrap() = None;
+                            clear_video_slot(&video_frame_slot);
                             last_snapshots.clear();
                             session = Some(new_sess);
                             audio_engine.play_cue(SoundCue::Join);
@@ -584,7 +593,7 @@ pub fn spawn_mesh_worker(
                             audio_engine.set_share_stream_audio(false);
                             audio_engine.clear_stream_audio();
                             decode_handle.reset();
-                            *video_frame_slot.lock().unwrap() = None;
+                            clear_video_slot(&video_frame_slot);
                             last_snapshots.clear();
                             if let Some(mut sess) = session.take() {
                                 sess.local_preview_enabled = false;
@@ -737,7 +746,7 @@ pub fn spawn_mesh_worker(
                             audio_engine.set_share_stream_audio(false);
                             if let Some(sess) = session.as_mut() {
                                 if sess.local_preview_enabled && sess.watched_peer_id.is_none() {
-                                    *video_frame_slot.lock().unwrap() = None;
+                                    clear_video_slot(&video_frame_slot);
                                 }
                                 sess.local_preview_enabled = false;
                                 sess.local_stream_config = None;
@@ -796,11 +805,11 @@ pub fn spawn_mesh_worker(
                                         false,
                                     );
                                     if sess.watched_peer_id.is_none() {
-                                        *video_frame_slot.lock().unwrap() = None;
+                                        clear_video_slot(&video_frame_slot);
                                     }
                                 }
                             } else {
-                                *video_frame_slot.lock().unwrap() = None;
+                                clear_video_slot(&video_frame_slot);
                             }
                         }
                         MeshCommand::WatchPeerStream { peer_id } => {
@@ -834,7 +843,7 @@ pub fn spawn_mesh_worker(
                                 sess.video_reassembler.reset();
                                 decode_handle.reset();
                                 audio_engine.clear_stream_audio();
-                                *video_frame_slot.lock().unwrap() = None;
+                                clear_video_slot(&video_frame_slot);
                                 if let Some(target_pid) = peer_id {
                                     let relay_only = sess
                                         .peers
@@ -888,7 +897,7 @@ pub fn spawn_mesh_worker(
                                 }
                             } else {
                                 audio_engine.clear_stream_audio();
-                                *video_frame_slot.lock().unwrap() = None;
+                                clear_video_slot(&video_frame_slot);
                             }
                         }
                         MeshCommand::SetTrayMode { in_tray } => {
@@ -920,7 +929,7 @@ pub fn spawn_mesh_worker(
                                     sess.transfer.trim_memory();
                                 }
                                 audio_engine.clear_stream_audio();
-                                *video_frame_slot.lock().unwrap() = None;
+                                clear_video_slot(&video_frame_slot);
                                 drain_video_out_rx(&mut video_out_rx);
                                 seal_buf.clear();
                                 seal_buf.shrink_to(2048);
@@ -1087,7 +1096,7 @@ pub fn spawn_mesh_worker(
                         handle_peer_relay_datagram(&socket, datagram, src_addr, sess, &mut rx_ctx)
                             .await;
                         forward_transfer_events(&mut tr_rx, &evt_tx).await;
-                    } else if src_addr == sess.rendezvous_addr || is_signaling_opcode(datagram) {
+                    } else if src_addr == sess.rendezvous_addr {
                         handle_signaling_rx(datagram, sess, &mut rx_ctx).await;
                     } else {
                         handle_p2p_rx(
@@ -1298,6 +1307,11 @@ pub fn spawn_mesh_worker(
                                     .as_ref()
                                     .is_some_and(|s| s.invite.room_id == room_id);
                                 if !is_own_active && rv_port != 0 {
+                                    if !discovered_lan.contains_key(&room_id)
+                                        && discovered_lan.len() >= 64
+                                    {
+                                        continue;
+                                    }
                                     let room = DiscoveredLanRoom {
                                         room_id,
                                         secret,
@@ -1665,11 +1679,6 @@ fn seal_punch_syn_parts(
     cipher.seal_packet(&hdr, &payload, seal_buf).is_ok()
 }
 
-#[inline]
-fn is_signaling_opcode(datagram: &[u8]) -> bool {
-    datagram.len() >= 4 && matches!(datagram[3], 0x01..=0x04)
-}
-
 async fn send_register(socket: &UdpSocket, sess: &ActiveSession) {
     let pkt = SignalingPacket::C2sRegister {
         room_id: sess.invite.room_id,
@@ -1781,6 +1790,10 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                             rtt_ms: 0,
                             has_announced_once: false,
                             stream_info: None,
+                            replay_control: squad_proto::ReplayWindow::new(),
+                            replay_voice: squad_proto::ReplayWindow::new(),
+                            replay_dtx: squad_proto::ReplayWindow::new(),
+                            replay_stream_audio: squad_proto::ReplayWindow::new(),
                         },
                     );
                     io.audio_engine.play_cue(SoundCue::PeerJoin);
@@ -1820,7 +1833,7 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                     sess.video_reassembler.reset();
                     io.decode_handle.reset();
                     io.audio_engine.clear_stream_audio();
-                    *io.video_frame_slot.lock().unwrap() = None;
+                    clear_video_slot(io.video_frame_slot);
                     let _ = io
                         .evt_tx
                         .send(MeshEvent::RemoteStreamUpdated {
@@ -2013,6 +2026,27 @@ async fn handle_p2p_rx(
         let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) else {
             return;
         };
+
+        if matches!(header.msg_type, P2pMsgType::PunchSyn)
+            && now.saturating_duration_since(peer.last_rx) > Duration::from_secs(2)
+        {
+            peer.replay_control.reset();
+            peer.replay_voice.reset();
+            peer.replay_dtx.reset();
+            peer.replay_stream_audio.reset();
+        }
+
+        let replay_ok = match header.msg_type {
+            P2pMsgType::AudioOpus => peer.replay_voice.check_and_accept(header.seq_num),
+            P2pMsgType::AudioDtxKeepalive => peer.replay_dtx.check_and_accept(header.seq_num),
+            P2pMsgType::StreamAudioOpus => {
+                peer.replay_stream_audio.check_and_accept(header.seq_num)
+            }
+            _ => peer.replay_control.check_and_accept(header.seq_num),
+        };
+        if !replay_ok {
+            return;
+        }
 
         peer.last_rx = now;
         match relay_source {
@@ -2312,7 +2346,7 @@ async fn handle_p2p_rx(
                 sess.video_reassembler.reset();
                 io.decode_handle.reset();
                 io.audio_engine.clear_stream_audio();
-                *io.video_frame_slot.lock().unwrap() = None;
+                clear_video_slot(io.video_frame_slot);
             }
             let _ = io
                 .evt_tx
@@ -2384,24 +2418,18 @@ async fn handle_p2p_rx(
                     };
                     match io.decode_handle.tx.try_send(job) {
                         Ok(()) => {}
-                        Err(std::sync::mpsc::TrySendError::Full(job)) => {
-                            if reassembled.is_keyframe {
-                                let _ = io.decode_handle.tx.send(job);
-                            } else {
-                                sess.video_reassembler.reset();
-                                if now.duration_since(sess.last_pli_sent)
-                                    > Duration::from_millis(120)
-                                {
-                                    send_stream_pli(
-                                        socket,
-                                        sess,
-                                        io.seal_buf,
-                                        io.relay_buf,
-                                        header.sender_peer_id,
-                                    )
-                                    .await;
-                                    sess.last_pli_sent = now;
-                                }
+                        Err(std::sync::mpsc::TrySendError::Full(_)) => {
+                            sess.video_reassembler.reset();
+                            if now.duration_since(sess.last_pli_sent) > Duration::from_millis(120) {
+                                send_stream_pli(
+                                    socket,
+                                    sess,
+                                    io.seal_buf,
+                                    io.relay_buf,
+                                    header.sender_peer_id,
+                                )
+                                .await;
+                                sess.last_pli_sent = now;
                             }
                         }
                         Err(std::sync::mpsc::TrySendError::Disconnected(_)) => {}
@@ -2717,7 +2745,7 @@ async fn enforce_video_route_policy(
                 sess.video_reassembler.reset();
                 decode_handle.reset();
                 audio_engine.clear_stream_audio();
-                *video_frame_slot.lock().unwrap() = None;
+                clear_video_slot(video_frame_slot);
                 stopped_watch = true;
             }
         }
@@ -2910,6 +2938,10 @@ fn stop_capture_worker(handle: &mut Option<CaptureWorkerHandle>) {
 
 fn drain_video_out_rx(rx: &mut mpsc::Receiver<Vec<VideoPacketOut>>) {
     while rx.try_recv().is_ok() {}
+}
+
+fn clear_video_slot(slot: &Mutex<Option<DecodedVideoFrame>>) {
+    *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
 fn reconcile_capture_worker(
@@ -3630,6 +3662,10 @@ mod tests {
                 rtt_ms: 10,
                 has_announced_once: true,
                 stream_info: None,
+                replay_control: squad_proto::ReplayWindow::new(),
+                replay_voice: squad_proto::ReplayWindow::new(),
+                replay_dtx: squad_proto::ReplayWindow::new(),
+                replay_stream_audio: squad_proto::ReplayWindow::new(),
             }
         };
 
