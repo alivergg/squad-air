@@ -627,11 +627,10 @@ mod tests {
             .await
             .unwrap();
         let mut buf = [0u8; 1200];
-        let (len, _) =
-            tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         match SignalingPacket::decode(&buf[..len]).unwrap() {
             SignalingPacket::S2cFriendsStatus { online_friends } => {
                 assert_eq!(online_friends.len(), 1);
@@ -676,11 +675,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let (len, _) =
-            tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
-                .await
-                .unwrap()
-                .unwrap();
+        let (len, _) = tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             SignalingPacket::decode(&buf[..len]).unwrap(),
             SignalingPacket::S2cShortCodeRegistered {

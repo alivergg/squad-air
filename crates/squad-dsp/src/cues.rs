@@ -386,7 +386,7 @@ mod tests {
         if !has_wavs {
             return;
         }
-        let bank = SoundCueBank::load_from_dirs(&[dir.clone()]);
+        let bank = SoundCueBank::load_from_dirs(std::slice::from_ref(&dir));
         for cue in SoundCue::all() {
             if !dir.join(cue.filename()).exists() {
                 continue;

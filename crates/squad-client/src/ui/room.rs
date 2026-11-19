@@ -83,21 +83,14 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             .padding([7, 10])
             .size(12)
             .style(m3_text_input_style),
-        button(
-            text(if already_saved {
-                "Saved ✓"
+        button(text(if already_saved { "Saved ✓" } else { "Save" }).size(12))
+            .padding([8, 11])
+            .style(if already_saved {
+                pill_success_button
             } else {
-                "Save"
+                pill_tonal_button
             })
-            .size(12)
-        )
-        .padding([8, 11])
-        .style(if already_saved {
-            pill_success_button
-        } else {
-            pill_tonal_button
-        })
-        .on_press(Message::SaveActiveChannel),
+            .on_press(Message::SaveActiveChannel),
     ]
     .spacing(6)
     .align_y(Vertical::Center);

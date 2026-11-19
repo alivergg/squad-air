@@ -104,13 +104,16 @@ pub fn parse_friend_code(input: &str) -> Result<([u8; 32], Option<String>), Stri
     Ok((pub_key, nick))
 }
 
+pub type SealedFriendInvite = ([u8; 32], [u8; 12], Vec<u8>);
+pub type Spake2SealedInvite = (Vec<u8>, [u8; 12], Vec<u8>);
+
 pub fn seal_friend_invite(
     my_secret: &StaticSecret,
     friend_pub: &[u8; 32],
     invite: &InviteLink,
     my_nick: &str,
     is_party_invite: bool,
-) -> Result<([u8; 32], [u8; 12], Vec<u8>), String> {
+) -> Result<SealedFriendInvite, String> {
     if *friend_pub == [0u8; 32] {
         return Err("Invalid target public key".to_string());
     }
@@ -228,7 +231,7 @@ pub fn spake2_host_seal_invite(
     code: u32,
     msg_a: &[u8],
     invite: &InviteLink,
-) -> Result<(Vec<u8>, [u8; 12], Vec<u8>), String> {
+) -> Result<Spake2SealedInvite, String> {
     let pw = format!("{code:06}");
     let (state_b, msg_b) = Spake2::<Ed25519Group>::start_b(
         &Password::new(pw.as_bytes()),
@@ -519,7 +522,8 @@ mod tests {
         let invite = InviteLink::generate();
         let (joiner_state, msg_a) = spake2_start_joiner(482_910);
         let (msg_b, nonce, enc) = spake2_host_seal_invite(482_910, &msg_a, &invite).unwrap();
-        let opened = spake2_joiner_open_invite(joiner_state, 482_910, &msg_b, &nonce, &enc).unwrap();
+        let opened =
+            spake2_joiner_open_invite(joiner_state, 482_910, &msg_b, &nonce, &enc).unwrap();
         assert_eq!(opened, invite);
 
         // Wrong 6-digit code fails SPAKE2 decryption cleanly without disclosing secret

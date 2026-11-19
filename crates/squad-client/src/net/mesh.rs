@@ -19,12 +19,11 @@ use squad_proto::{
     encode_peer_relay_datagram_into, encode_relay_datagram_into, is_peer_relay_datagram,
     is_relay_datagram, is_spake2_datagram, parse_peer_relay_header, parse_relay_header,
     rewrite_relay_peer_id, sanitize_display_str, ClientUuid, InviteLink, LanDiscoveryPacket,
-    P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, RoomId,
-    SignalingErrorCode, SignalingPacket, Spake2Packet, LAN_DISCOVERY_PORT,
-    MAX_FRIENDS_STATUS_PER_PACKET, MAX_QUERY_FRIENDS_PER_PACKET, MAX_RELAY_UDP_PAYLOAD,
-    MAX_ROOM_PEERS, MAX_UDP_PAYLOAD, RELAY_HEADER_LEN,
+    P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, RoomId, SignalingErrorCode,
+    SignalingPacket, Spake2Packet, LAN_DISCOVERY_PORT, MAX_FRIENDS_STATUS_PER_PACKET,
+    MAX_QUERY_FRIENDS_PER_PACKET, MAX_RELAY_UDP_PAYLOAD, MAX_ROOM_PEERS, MAX_UDP_PAYLOAD,
+    RELAY_HEADER_LEN,
 };
-use x25519_dalek::{PublicKey, StaticSecret};
 use squad_video::{
     detect_hardware_encoder_backend, fragment_frame, is_hevc_hardware_supported, DecoderError,
     FrameReassembler, H264Decoder, H264Encoder, ScreenCapturer, StreamConfig, VideoCodec,
@@ -39,6 +38,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
 use tracing::{debug, info, warn};
+use x25519_dalek::{PublicKey, StaticSecret};
 
 const REGISTER_INTERVAL: Duration = Duration::from_secs(2);
 const PUNCH_INTERVAL: Duration = Duration::from_millis(60);
@@ -4060,11 +4060,7 @@ fn snapshot_friends(map: &HashMap<[u8; 32], (String, bool, Instant)>) -> Vec<Fri
     out
 }
 
-async fn send_presence_ping(
-    socket: &UdpSocket,
-    presence: &PresenceWorkerState,
-    in_room: bool,
-) {
+async fn send_presence_ping(socket: &UdpSocket, presence: &PresenceWorkerState, in_room: bool) {
     let Some(rv_addr) = presence.rendezvous_addr else {
         return;
     };
@@ -4090,7 +4086,10 @@ async fn send_presence_ping_and_query(
         return;
     };
     send_presence_ping(socket, presence, in_room).await;
-    for chunk in presence.friend_pub_keys.chunks(MAX_QUERY_FRIENDS_PER_PACKET) {
+    for chunk in presence
+        .friend_pub_keys
+        .chunks(MAX_QUERY_FRIENDS_PER_PACKET)
+    {
         let query = SignalingPacket::C2sQueryFriends {
             friend_pub_keys: chunk.to_vec(),
         };
@@ -4161,10 +4160,9 @@ async fn handle_global_signaling_packet(
             }
             for info in online_friends {
                 if presence.friend_pub_keys.contains(&info.pub_key) {
-                    presence.online_friends.insert(
-                        info.pub_key,
-                        (info.nickname.clone(), info.in_room, now),
-                    );
+                    presence
+                        .online_friends
+                        .insert(info.pub_key, (info.nickname.clone(), info.in_room, now));
                 }
             }
             presence
@@ -4203,7 +4201,9 @@ async fn handle_global_signaling_packet(
                         .await;
                 }
                 Err(e) => {
-                    warn!("Ignored incoming friend invite that failed X25519 AEAD verification: {e}");
+                    warn!(
+                        "Ignored incoming friend invite that failed X25519 AEAD verification: {e}"
+                    );
                 }
             }
             true
@@ -4213,8 +4213,10 @@ async fn handle_global_signaling_packet(
             expires_in_secs,
         } => {
             if let Some(sess) = session.as_mut() {
-                sess.active_short_code =
-                    Some((*code, Instant::now() + Duration::from_secs(*expires_in_secs as u64)));
+                sess.active_short_code = Some((
+                    *code,
+                    Instant::now() + Duration::from_secs(*expires_in_secs as u64),
+                ));
             }
             evt_tx
                 .send(MeshEvent::ShortCodeGenerated {
@@ -4278,7 +4280,9 @@ async fn handle_global_signaling_packet(
         SignalingPacket::S2cError { code } => match code {
             SignalingErrorCode::FriendOffline => {
                 evt_tx
-                    .send(MeshEvent::Error("Friend is offline or unreachable".to_string()))
+                    .send(MeshEvent::Error(
+                        "Friend is offline or unreachable".to_string(),
+                    ))
                     .await;
                 true
             }
@@ -4304,17 +4308,13 @@ async fn handle_global_signaling_packet(
                 }
                 true
             }
-            SignalingErrorCode::RateLimited => {
-                if pending_short_code_join.take().is_some() {
-                    evt_tx
-                        .send(MeshEvent::Error(
-                            "Too many wrong code attempts. Please wait 60 seconds.".to_string(),
-                        ))
-                        .await;
-                    true
-                } else {
-                    false
-                }
+            SignalingErrorCode::RateLimited if pending_short_code_join.take().is_some() => {
+                evt_tx
+                    .send(MeshEvent::Error(
+                        "Too many wrong code attempts. Please wait 60 seconds.".to_string(),
+                    ))
+                    .await;
+                true
             }
             _ => false,
         },
@@ -4870,5 +4870,443 @@ mod tests {
         aud_a.shutdown();
         aud_b.shutdown();
         aud_c.shutdown();
+    }
+
+    fn spawn_test_node(
+        uuid_byte: u8,
+    ) -> (
+        AudioEngineHandle,
+        mpsc::Sender<MeshCommand>,
+        mpsc::Receiver<MeshEvent>,
+        ClientUuid,
+    ) {
+        let (out_tx, out_rx) = mpsc::channel(64);
+        let audio = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx).unwrap();
+        let slot = Arc::new(Mutex::new(None));
+        let mesh_notify = Arc::new(Notify::new());
+        let video_notify = Arc::new(Notify::new());
+        let (cmd_tx, evt_rx) =
+            spawn_mesh_worker(audio.clone(), out_rx, slot, mesh_notify, video_notify);
+        (audio, cmd_tx, evt_rx, [uuid_byte; 16])
+    }
+
+    #[tokio::test]
+    async fn test_mesh_worker_spake2_short_code_join_and_wrong_code_rejection() {
+        let rv = start_embedded_rendezvous().await.unwrap();
+        let rv_addr = format!("127.0.0.1:{}", rv.port);
+
+        let (aud_a, tx_a, mut rx_a, uuid_a) = spawn_test_node(0xD1);
+        let (aud_b, tx_b, mut rx_b, uuid_b) = spawn_test_node(0xD2);
+
+        let sk_a = StaticSecret::random_from_rng(OsRng);
+        let sk_b = StaticSecret::random_from_rng(OsRng);
+        tx_a.send(MeshCommand::UpdatePresenceConfig {
+            rendezvous_server: rv_addr.clone(),
+            nickname: "HostAlpha".to_string(),
+            client_uuid: uuid_a,
+            identity_secret: sk_a.to_bytes(),
+            friend_pub_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+        tx_b.send(MeshCommand::UpdatePresenceConfig {
+            rendezvous_server: rv_addr.clone(),
+            nickname: "JoinerBravo".to_string(),
+            client_uuid: uuid_b,
+            identity_secret: sk_b.to_bytes(),
+            friend_pub_keys: Vec::new(),
+        })
+        .await
+        .unwrap();
+
+        let invite = InviteLink::generate();
+        let expected_uri = invite.to_uri();
+        tx_a.send(MeshCommand::JoinRoom {
+            rendezvous_server: rv_addr.clone(),
+            invite,
+            nickname: "HostAlpha".to_string(),
+            client_uuid: uuid_a,
+            initial_volumes: HashMap::new(),
+            is_lan_room: false,
+            room_name: None,
+        })
+        .await
+        .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let mut host_joined = false;
+        while Instant::now() < deadline && !host_joined {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::JoinedRoom { invite_uri, .. } = ev {
+                    assert_eq!(invite_uri, expected_uri);
+                    host_joined = true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            host_joined,
+            "Host must join room before generating short code"
+        );
+
+        tx_a.send(MeshCommand::GenerateShortCode).await.unwrap();
+        let code_deadline = Instant::now() + Duration::from_secs(3);
+        let mut active_code: Option<u32> = None;
+        while Instant::now() < code_deadline && active_code.is_none() {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::ShortCodeGenerated {
+                    code,
+                    expires_in_secs,
+                } = ev
+                {
+                    assert_eq!(expires_in_secs, 600);
+                    active_code = Some(code);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let code = active_code.expect("Host must receive ShortCodeGenerated");
+
+        // 1. Wrong code attempt must fail cleanly without joining
+        let wrong_code = if code == 999_999 { 100_000 } else { code + 1 };
+        tx_b.send(MeshCommand::JoinByShortCode {
+            rendezvous_server: rv_addr.clone(),
+            code: wrong_code,
+            nickname: "JoinerBravo".to_string(),
+            client_uuid: uuid_b,
+        })
+        .await
+        .unwrap();
+
+        let err_deadline = Instant::now() + Duration::from_secs(3);
+        let mut got_wrong_err = false;
+        while Instant::now() < err_deadline && !got_wrong_err {
+            while let Ok(ev) = rx_b.try_recv() {
+                match ev {
+                    MeshEvent::Error(_) => got_wrong_err = true,
+                    MeshEvent::JoinedRoom { .. } => {
+                        panic!("Wrong 6-digit code must never allow joining the room");
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            got_wrong_err,
+            "Wrong 6-digit code must return MeshEvent::Error"
+        );
+
+        // 2. Valid code must authenticate via SPAKE2, deliver RoomCipher invite, and connect P2P
+        tx_b.send(MeshCommand::JoinByShortCode {
+            rendezvous_server: rv_addr,
+            code,
+            nickname: "JoinerBravo".to_string(),
+            client_uuid: uuid_b,
+        })
+        .await
+        .unwrap();
+
+        let join_deadline = Instant::now() + Duration::from_secs(6);
+        let mut b_joined = false;
+        let mut a_connected = false;
+        let mut b_connected = false;
+        while Instant::now() < join_deadline && !(b_joined && a_connected && b_connected) {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers.iter().any(|p| p.status == PeerConnStatus::Connected) {
+                        a_connected = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                match ev {
+                    MeshEvent::JoinedRoom { invite_uri, .. } => {
+                        assert_eq!(invite_uri, expected_uri);
+                        b_joined = true;
+                    }
+                    MeshEvent::PeersUpdated(peers)
+                        if peers.iter().any(|p| p.status == PeerConnStatus::Connected) =>
+                    {
+                        b_connected = true;
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            b_joined,
+            "Joiner must join the exact room via SPAKE2 short code"
+        );
+        assert!(
+            a_connected && b_connected,
+            "Host and SPAKE2 joiner must reach Connected state"
+        );
+
+        tx_a.send(MeshCommand::SendChatText {
+            text: "SPAKE2 code verified!".to_string(),
+        })
+        .await
+        .unwrap();
+        let chat_deadline = Instant::now() + Duration::from_secs(3);
+        let mut got_chat = false;
+        while Instant::now() < chat_deadline && !got_chat {
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::ChatItemReceived(item) = ev {
+                    if matches!(item.content, ChatContentUi::Text(ref t) if t == "SPAKE2 code verified!")
+                    {
+                        got_chat = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            got_chat,
+            "Joiner must decrypt chat encrypted with shared RoomCipher"
+        );
+
+        let _ = tx_a.send(MeshCommand::Shutdown).await;
+        let _ = tx_b.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        rv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_mesh_worker_x25519_friend_call_and_third_peer_party_invite() {
+        let rv = start_embedded_rendezvous().await.unwrap();
+        let rv_addr = format!("127.0.0.1:{}", rv.port);
+
+        let (aud_a, tx_a, mut rx_a, uuid_a) = spawn_test_node(0xE1);
+        let (aud_b, tx_b, mut rx_b, uuid_b) = spawn_test_node(0xE2);
+        let (aud_c, tx_c, mut rx_c, uuid_c) = spawn_test_node(0xE3);
+
+        let sk_a = StaticSecret::random_from_rng(OsRng);
+        let sk_b = StaticSecret::random_from_rng(OsRng);
+        let sk_c = StaticSecret::random_from_rng(OsRng);
+        let pk_a = PublicKey::from(&sk_a).to_bytes();
+        let pk_b = PublicKey::from(&sk_b).to_bytes();
+        let pk_c = PublicKey::from(&sk_c).to_bytes();
+
+        for (tx, nick, uuid, sk, friends) in [
+            (&tx_a, "Alice", uuid_a, &sk_a, vec![pk_b, pk_c]),
+            (&tx_b, "Bob", uuid_b, &sk_b, vec![pk_a, pk_c]),
+            (&tx_c, "Charlie", uuid_c, &sk_c, vec![pk_a, pk_b]),
+        ] {
+            tx.send(MeshCommand::UpdatePresenceConfig {
+                rendezvous_server: rv_addr.clone(),
+                nickname: nick.to_string(),
+                client_uuid: uuid,
+                identity_secret: sk.to_bytes(),
+                friend_pub_keys: friends,
+            })
+            .await
+            .unwrap();
+        }
+
+        // 1. Wait until Alice observes Bob & Charlie online in RAM presence table
+        let pres_deadline = Instant::now() + Duration::from_secs(5);
+        let mut a_sees_both = false;
+        while Instant::now() < pres_deadline && !a_sees_both {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::FriendsStatusUpdated(list) = ev {
+                    let has_b = list
+                        .iter()
+                        .any(|f| f.pub_key == pk_b && f.online && !f.in_room);
+                    let has_c = list
+                        .iter()
+                        .any(|f| f.pub_key == pk_c && f.online && !f.in_room);
+                    if has_b && has_c {
+                        a_sees_both = true;
+                    }
+                }
+            }
+            while rx_b.try_recv().is_ok() {}
+            while rx_c.try_recv().is_ok() {}
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            a_sees_both,
+            "Alice must see Bob and Charlie online via presence table"
+        );
+
+        // 2. Alice calls Bob in 1 click from lobby
+        tx_a.send(MeshCommand::CallOrInviteFriend {
+            target_pub_key: pk_b,
+        })
+        .await
+        .unwrap();
+
+        let call_deadline = Instant::now() + Duration::from_secs(4);
+        let mut a_uri: Option<String> = None;
+        let mut b_call: Option<IncomingFriendCallUi> = None;
+        while Instant::now() < call_deadline && (a_uri.is_none() || b_call.is_none()) {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::JoinedRoom { invite_uri, .. } = ev {
+                    a_uri = Some(invite_uri);
+                }
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::IncomingFriendCall(call) = ev {
+                    b_call = Some(call);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let room_uri = a_uri.expect("Caller Alice must join created room");
+        let b_call = b_call.expect("Callee Bob must receive decrypted IncomingFriendCall");
+        assert_eq!(b_call.sender_pub_key, pk_a);
+        assert_eq!(b_call.sender_nickname, "Alice");
+        assert!(!b_call.is_party_invite);
+        assert!(b_call.is_known_friend);
+        assert_eq!(b_call.invite.to_uri(), room_uri);
+
+        // Bob accepts call
+        tx_b.send(MeshCommand::JoinRoom {
+            rendezvous_server: rv_addr.clone(),
+            invite: b_call.invite,
+            nickname: "Bob".to_string(),
+            client_uuid: uuid_b,
+            initial_volumes: HashMap::new(),
+            is_lan_room: false,
+            room_name: None,
+        })
+        .await
+        .unwrap();
+
+        // 3. Alice invites Charlie into the already-active party
+        tx_a.send(MeshCommand::CallOrInviteFriend {
+            target_pub_key: pk_c,
+        })
+        .await
+        .unwrap();
+
+        let party_deadline = Instant::now() + Duration::from_secs(4);
+        let mut a_sent_party = false;
+        let mut c_call: Option<IncomingFriendCallUi> = None;
+        while Instant::now() < party_deadline && (!a_sent_party || c_call.is_none()) {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::FriendInviteSent { target_pub_key } = ev {
+                    if target_pub_key == pk_c {
+                        a_sent_party = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_c.try_recv() {
+                if let MeshEvent::IncomingFriendCall(call) = ev {
+                    c_call = Some(call);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            a_sent_party,
+            "Alice must receive FriendInviteSent ack for Charlie"
+        );
+        let c_call = c_call.expect("Charlie must receive E2EE party invite");
+        assert!(
+            c_call.is_party_invite,
+            "Active-room invite must set is_party_invite"
+        );
+        assert_eq!(c_call.invite.to_uri(), room_uri);
+
+        tx_c.send(MeshCommand::JoinRoom {
+            rendezvous_server: rv_addr,
+            invite: c_call.invite,
+            nickname: "Charlie".to_string(),
+            client_uuid: uuid_c,
+            initial_volumes: HashMap::new(),
+            is_lan_room: false,
+            room_name: None,
+        })
+        .await
+        .unwrap();
+
+        let mesh_deadline = Instant::now() + Duration::from_secs(6);
+        let (mut a_ok, mut b_ok, mut c_ok) = (false, false, false);
+        while Instant::now() < mesh_deadline && !(a_ok && b_ok && c_ok) {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers
+                        .iter()
+                        .filter(|p| p.status == PeerConnStatus::Connected)
+                        .count()
+                        >= 2
+                    {
+                        a_ok = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers
+                        .iter()
+                        .filter(|p| p.status == PeerConnStatus::Connected)
+                        .count()
+                        >= 2
+                    {
+                        b_ok = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_c.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers
+                        .iter()
+                        .filter(|p| p.status == PeerConnStatus::Connected)
+                        .count()
+                        >= 2
+                    {
+                        c_ok = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            a_ok && b_ok && c_ok,
+            "All three peers must reach full Connected mesh after friend call + party invite"
+        );
+
+        tx_a.send(MeshCommand::SendChatText {
+            text: "Three-peer party mesh connected!".to_string(),
+        })
+        .await
+        .unwrap();
+        let chat_deadline = Instant::now() + Duration::from_secs(3);
+        let (mut b_got, mut c_got) = (false, false);
+        while Instant::now() < chat_deadline && !(b_got && c_got) {
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::ChatItemReceived(item) = ev {
+                    if matches!(item.content, ChatContentUi::Text(ref t) if t == "Three-peer party mesh connected!")
+                    {
+                        b_got = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_c.try_recv() {
+                if let MeshEvent::ChatItemReceived(item) = ev {
+                    if matches!(item.content, ChatContentUi::Text(ref t) if t == "Three-peer party mesh connected!")
+                    {
+                        c_got = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            b_got && c_got,
+            "Both Bob and Charlie must decrypt Alice's party chat"
+        );
+
+        let _ = tx_a.send(MeshCommand::Shutdown).await;
+        let _ = tx_b.send(MeshCommand::Shutdown).await;
+        let _ = tx_c.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        aud_c.shutdown();
+        rv.stop().await;
     }
 }

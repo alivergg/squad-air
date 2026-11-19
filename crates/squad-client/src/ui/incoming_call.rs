@@ -58,24 +58,16 @@ pub fn view_incoming_call_modal<'a>(
     };
 
     let actions = row![
-        button(
-            text("Decline")
-                .size(13)
-                .align_x(Horizontal::Center)
-        )
-        .width(Length::Fill)
-        .padding([12, 18])
-        .style(pill_danger_button)
-        .on_press(Message::DeclineIncomingCall),
-        button(
-            text("Accept & Join")
-                .size(13)
-                .align_x(Horizontal::Center)
-        )
-        .width(Length::Fill)
-        .padding([12, 18])
-        .style(pill_success_button)
-        .on_press(Message::AcceptIncomingCall),
+        button(text("Decline").size(13).align_x(Horizontal::Center))
+            .width(Length::Fill)
+            .padding([12, 18])
+            .style(pill_danger_button)
+            .on_press(Message::DeclineIncomingCall),
+        button(text("Accept & Join").size(13).align_x(Horizontal::Center))
+            .width(Length::Fill)
+            .padding([12, 18])
+            .style(pill_success_button)
+            .on_press(Message::AcceptIncomingCall),
     ]
     .spacing(12)
     .width(Length::Fill);
@@ -83,10 +75,12 @@ pub fn view_incoming_call_modal<'a>(
     let card = container(
         column![
             text(header_title).size(18).color(M3_PRIMARY),
-            avatar_circle(app.avatars.handle_for_pub_key(&call.sender_pub_key), 72.0, true),
-            text(&call.sender_nickname)
-                .size(20)
-                .color(M3_ON_SURFACE),
+            avatar_circle(
+                app.avatars.handle_for_pub_key(&call.sender_pub_key),
+                72.0,
+                true
+            ),
+            text(&call.sender_nickname).size(20).color(M3_ON_SURFACE),
             text(subtitle).size(12).color(subtitle_color),
             actions,
         ]
@@ -164,7 +158,9 @@ pub fn view_add_friend_modal(app: &SquadApp) -> Element<'_, Message> {
         ]
         .spacing(6),
         column![
-            text("Display Name (optional)").size(12).color(M3_ON_SURFACE_VARIANT),
+            text("Display Name (optional)")
+                .size(12)
+                .color(M3_ON_SURFACE_VARIANT),
             text_input("Nickname override", &app.add_friend_nick_input)
                 .on_input(Message::AddFriendNickChanged)
                 .on_submit(Message::ConfirmAddFriend)
@@ -219,11 +215,8 @@ pub fn view_invite_friends_modal(app: &SquadApp) -> Element<'_, Message> {
         let fb = &app.friends[b];
         let oa = app.friend_presences.contains_key(&fa.pub_key);
         let ob = app.friend_presences.contains_key(&fb.pub_key);
-        ob.cmp(&oa).then_with(|| {
-            fa.nickname
-                .to_lowercase()
-                .cmp(&fb.nickname.to_lowercase())
-        })
+        ob.cmp(&oa)
+            .then_with(|| fa.nickname.to_lowercase().cmp(&fb.nickname.to_lowercase()))
     });
 
     let mut list_col = column![].spacing(8).width(Length::Fill);
@@ -267,7 +260,11 @@ pub fn view_invite_friends_modal(app: &SquadApp) -> Element<'_, Message> {
 
             let item_row = container(
                 row![
-                    avatar_circle(app.avatars.handle_for_pub_key(&friend.pub_key), 34.0, online),
+                    avatar_circle(
+                        app.avatars.handle_for_pub_key(&friend.pub_key),
+                        34.0,
+                        online
+                    ),
                     column![
                         text(display_name)
                             .size(13)

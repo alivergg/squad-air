@@ -3,8 +3,8 @@ use crate::ui::{
     theme::{
         canvas_panel_style, channel_nav_button, m3_text_input_style, pill_danger_button,
         pill_primary_button, pill_success_button, pill_tonal_button, sidebar_panel_style,
-        surface_card_style, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY,
-        M3_SUCCESS, M3_WARNING,
+        surface_card_style, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+        M3_WARNING,
     },
     Message, SquadApp,
 };
@@ -328,11 +328,8 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         let fb = &app.friends[b];
         let oa = app.friend_presences.contains_key(&fa.pub_key);
         let ob = app.friend_presences.contains_key(&fb.pub_key);
-        ob.cmp(&oa).then_with(|| {
-            fa.nickname
-                .to_lowercase()
-                .cmp(&fb.nickname.to_lowercase())
-        })
+        ob.cmp(&oa)
+            .then_with(|| fa.nickname.to_lowercase().cmp(&fb.nickname.to_lowercase()))
     });
     let online_friends_count = app
         .friends
@@ -380,7 +377,11 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
 
             let friend_row = container(
                 row![
-                    avatar_circle(app.avatars.handle_for_pub_key(&friend.pub_key), 34.0, online),
+                    avatar_circle(
+                        app.avatars.handle_for_pub_key(&friend.pub_key),
+                        34.0,
+                        online
+                    ),
                     column![
                         text(display_name)
                             .size(13)
@@ -435,9 +436,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     let my_id_strip = container(
         row![
             column![
-                text("My X25519 Friend ID")
-                    .size(12)
-                    .color(M3_ON_SURFACE),
+                text("My X25519 Friend ID").size(12).color(M3_ON_SURFACE),
                 text("Zero-server E2EE contact key")
                     .size(10)
                     .color(M3_ON_SURFACE_VARIANT),

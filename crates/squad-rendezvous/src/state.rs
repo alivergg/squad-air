@@ -340,8 +340,9 @@ impl RendezvousState {
         if should_remove_room {
             self.rooms.remove(&room_id);
         }
-        self.short_codes
-            .retain(|_, sc| sc.room_id != room_id || (!should_remove_room && sc.host_addr != src_addr));
+        self.short_codes.retain(|_, sc| {
+            sc.room_id != room_id || (!should_remove_room && sc.host_addr != src_addr)
+        });
         notifications
     }
 
@@ -1003,7 +1004,8 @@ mod tests {
         state.handle_presence_ping(addr_a, key_a, "Alice".into(), false, t0);
         state.handle_presence_ping(addr_b, key_b, "Bob".into(), true, t0);
 
-        let res = state.handle_query_friends(addr_a, vec![key_b, key_c], t0 + Duration::from_secs(5));
+        let res =
+            state.handle_query_friends(addr_a, vec![key_b, key_c], t0 + Duration::from_secs(5));
         assert_eq!(res.len(), 1);
         match &res[0].1 {
             SignalingPacket::S2cFriendsStatus { online_friends } => {

@@ -662,300 +662,298 @@ impl SquadApp {
                 }
                 for evt in events {
                     match evt {
-                            MeshEvent::JoinedRoom {
-                                local_peer_id,
-                                invite_uri,
-                            } => {
-                                if self.screen != Screen::Room {
-                                    self.prepare_for_room_entry();
-                                }
-                                self.local_peer_id = local_peer_id;
-                                self.active_invite_uri = invite_uri.clone();
-                                self.save_channel_name_input = self
-                                    .config
-                                    .saved_channels
-                                    .iter()
-                                    .find(|c| c.invite_uri == invite_uri)
-                                    .map(|c| c.name.clone())
-                                    .unwrap_or_default();
-                                self.short_code_joining = false;
-                                self.short_code_input.clear();
-                                self.active_short_code = None;
-                                self.short_code_copied_flash = false;
-                                self.invite_friends_modal_open = false;
-                                self.invited_friends_session.clear();
-                                self.incoming_call = None;
-                                self.screen = Screen::Room;
-                                self.status_banner = None;
-                                self.audio.set_streams_active(true);
-                                self.audio.set_monitoring_in_settings(false);
-                                self.hotkeys.set_active(true);
-                                self.ui_sync.in_room.store(true, Ordering::Release);
-                                self.ui_sync.in_settings.store(false, Ordering::Release);
-                                self.ui_sync.audio_ui_notify.notify_one();
-                                overlay_sync_needed = true;
+                        MeshEvent::JoinedRoom {
+                            local_peer_id,
+                            invite_uri,
+                        } => {
+                            if self.screen != Screen::Room {
+                                self.prepare_for_room_entry();
                             }
-                            MeshEvent::LeftRoom => {
-                                self.peers.clear();
-                                self.chat_messages.clear();
-                                self.chat_text_editors.clear();
-                                self.active_chat_selection = None;
-                                self.image_handles.clear();
-                                self.inline_image_bytes.clear();
-                                self.copied_msg_id = None;
-                                self.lightbox_blob_id = None;
-                                self.chat_input.clear();
-                                self.local_peer_id = 0;
-                                self.share_modal_open = false;
-                                self.active_short_code = None;
-                                self.short_code_copied_flash = false;
-                                self.invite_friends_modal_open = false;
-                                self.invited_friends_session.clear();
-                                self.short_code_joining = false;
-                                self.is_local_sharing = false;
-                                self.local_stream_preview = false;
-                                self.local_stream_subscribers = 0;
+                            self.local_peer_id = local_peer_id;
+                            self.active_invite_uri = invite_uri.clone();
+                            self.save_channel_name_input = self
+                                .config
+                                .saved_channels
+                                .iter()
+                                .find(|c| c.invite_uri == invite_uri)
+                                .map(|c| c.name.clone())
+                                .unwrap_or_default();
+                            self.short_code_joining = false;
+                            self.short_code_input.clear();
+                            self.active_short_code = None;
+                            self.short_code_copied_flash = false;
+                            self.invite_friends_modal_open = false;
+                            self.invited_friends_session.clear();
+                            self.incoming_call = None;
+                            self.screen = Screen::Room;
+                            self.status_banner = None;
+                            self.audio.set_streams_active(true);
+                            self.audio.set_monitoring_in_settings(false);
+                            self.hotkeys.set_active(true);
+                            self.ui_sync.in_room.store(true, Ordering::Release);
+                            self.ui_sync.in_settings.store(false, Ordering::Release);
+                            self.ui_sync.audio_ui_notify.notify_one();
+                            overlay_sync_needed = true;
+                        }
+                        MeshEvent::LeftRoom => {
+                            self.peers.clear();
+                            self.chat_messages.clear();
+                            self.chat_text_editors.clear();
+                            self.active_chat_selection = None;
+                            self.image_handles.clear();
+                            self.inline_image_bytes.clear();
+                            self.copied_msg_id = None;
+                            self.lightbox_blob_id = None;
+                            self.chat_input.clear();
+                            self.local_peer_id = 0;
+                            self.share_modal_open = false;
+                            self.active_short_code = None;
+                            self.short_code_copied_flash = false;
+                            self.invite_friends_modal_open = false;
+                            self.invited_friends_session.clear();
+                            self.short_code_joining = false;
+                            self.is_local_sharing = false;
+                            self.local_stream_preview = false;
+                            self.local_stream_subscribers = 0;
+                            self.watched_peer_id = None;
+                            self.active_stream_frame = None;
+                            self.stream_expanded = false;
+                            let was_fs = self.stream_fullscreen;
+                            self.stream_fullscreen = false;
+                            if let Ok(mut slot) = self.video_frame_slot.try_lock() {
+                                *slot = None;
+                            }
+                            self.screen = Screen::Lobby;
+                            self.audio.set_streams_active(false);
+                            self.audio.set_monitoring_in_settings(false);
+                            self.hotkeys.set_active(false);
+                            self.ui_sync.in_room.store(false, Ordering::Release);
+                            self.ui_sync.in_settings.store(false, Ordering::Release);
+                            self.ui_sync.watching_video.store(false, Ordering::Release);
+                            self.ui_sync.audio_ui_notify.notify_one();
+                            overlay_sync_needed = true;
+                            if was_fs {
+                                if let Some(id) = self.main_window_id {
+                                    pending_tasks.push(set_window_fullscreen_task(id, false));
+                                }
+                            }
+                        }
+                        MeshEvent::PeersUpdated(snapshots) => {
+                            for snap in &snapshots {
+                                let saved = self.config.peer_volume(&snap.client_uuid);
+                                self.audio.set_peer_gain(snap.peer_id, saved);
+                            }
+                            self.peers = snapshots;
+                        }
+                        MeshEvent::ChatItemReceived(item) => {
+                            if let ChatContentUi::InlineImage {
+                                blob_id,
+                                ref filename,
+                                bytes: Some(ref raw),
+                                ..
+                            } = item.content
+                            {
+                                if !self.is_in_tray
+                                    && crate::ui::avatar::decode_bounded_image(
+                                        raw,
+                                        4096,
+                                        64 * 1024 * 1024,
+                                    )
+                                    .is_ok()
+                                {
+                                    self.image_handles.insert(
+                                        blob_id,
+                                        iced_image::Handle::from_bytes(raw.clone()),
+                                    );
+                                    self.inline_image_bytes
+                                        .insert(blob_id, (filename.clone(), raw.clone()));
+                                }
+                            }
+                            let already = self.chat_messages.iter().any(|existing| {
+                                existing.sender_uuid == item.sender_uuid
+                                    && existing.msg_id == item.msg_id
+                            });
+                            if !already {
+                                if !self.is_in_tray {
+                                    if let ChatContentUi::Text(ref body_text) = item.content {
+                                        self.chat_text_editors.insert(
+                                            (item.sender_uuid, item.msg_id),
+                                            text_editor::Content::with_text(body_text),
+                                        );
+                                    }
+                                }
+                                self.chat_messages.push(item);
+                                self.chat_messages
+                                    .sort_by_key(|m| (m.timestamp_ms, m.msg_id));
+                                if self.chat_messages.len() > 30 {
+                                    let drop_n = self.chat_messages.len() - 30;
+                                    let mut dropped_blobs = Vec::new();
+                                    for dropped in self.chat_messages.drain(0..drop_n) {
+                                        self.chat_text_editors
+                                            .remove(&(dropped.sender_uuid, dropped.msg_id));
+                                        if let ChatContentUi::InlineImage { blob_id, .. } =
+                                            dropped.content
+                                        {
+                                            dropped_blobs.push(blob_id);
+                                        }
+                                    }
+                                    for blob_id in dropped_blobs {
+                                        if self.lightbox_blob_id != Some(blob_id)
+                                            && !self.chat_messages.iter().any(|m| {
+                                                matches!(
+                                                    m.content,
+                                                    ChatContentUi::InlineImage { blob_id: bid, .. }
+                                                        if bid == blob_id
+                                                )
+                                            })
+                                        {
+                                            self.image_handles.remove(&blob_id);
+                                            self.inline_image_bytes.remove(&blob_id);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        MeshEvent::BlobStateChanged {
+                            blob_id,
+                            state,
+                            inline_bytes,
+                        } => {
+                            let valid_inline = !self.is_in_tray
+                                && inline_bytes.as_deref().is_some_and(|raw| {
+                                    crate::ui::avatar::decode_bounded_image(
+                                        raw,
+                                        4096,
+                                        64 * 1024 * 1024,
+                                    )
+                                    .is_ok()
+                                });
+                            if valid_inline {
+                                if let Some(ref raw) = inline_bytes {
+                                    self.image_handles.insert(
+                                        blob_id,
+                                        iced_image::Handle::from_bytes(raw.clone()),
+                                    );
+                                }
+                            }
+                            for item in &mut self.chat_messages {
+                                match &mut item.content {
+                                    ChatContentUi::InlineImage {
+                                        blob_id: bid,
+                                        filename,
+                                        state: st,
+                                        bytes,
+                                        ..
+                                    } if *bid == blob_id => {
+                                        *st = state.clone();
+                                        if let Some(ref raw) = inline_bytes {
+                                            *bytes = Some(raw.clone());
+                                            if valid_inline {
+                                                self.inline_image_bytes.insert(
+                                                    blob_id,
+                                                    (filename.clone(), raw.clone()),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    ChatContentUi::File {
+                                        blob_id: bid,
+                                        state: st,
+                                        ..
+                                    } if *bid == blob_id => {
+                                        *st = state.clone();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        MeshEvent::RemoteStreamUpdated { peer_id, stream } => {
+                            if let Some(peer) = self.peers.iter_mut().find(|p| p.peer_id == peer_id)
+                            {
+                                peer.stream_info = stream.clone();
+                            }
+                            if stream.is_none() && self.watched_peer_id == Some(peer_id) {
                                 self.watched_peer_id = None;
                                 self.active_stream_frame = None;
                                 self.stream_expanded = false;
-                                let was_fs = self.stream_fullscreen;
-                                self.stream_fullscreen = false;
-                                if let Ok(mut slot) = self.video_frame_slot.try_lock() {
-                                    *slot = None;
-                                }
-                                self.screen = Screen::Lobby;
-                                self.audio.set_streams_active(false);
-                                self.audio.set_monitoring_in_settings(false);
-                                self.hotkeys.set_active(false);
-                                self.ui_sync.in_room.store(false, Ordering::Release);
-                                self.ui_sync.in_settings.store(false, Ordering::Release);
-                                self.ui_sync.watching_video.store(false, Ordering::Release);
-                                self.ui_sync.audio_ui_notify.notify_one();
-                                overlay_sync_needed = true;
-                                if was_fs {
+                                self.ui_sync
+                                    .watching_video
+                                    .store(self.local_stream_preview, Ordering::Release);
+                                if self.stream_fullscreen {
+                                    self.stream_fullscreen = false;
                                     if let Some(id) = self.main_window_id {
                                         pending_tasks.push(set_window_fullscreen_task(id, false));
                                     }
                                 }
                             }
-                            MeshEvent::PeersUpdated(snapshots) => {
-                                for snap in &snapshots {
-                                    let saved = self.config.peer_volume(&snap.client_uuid);
-                                    self.audio.set_peer_gain(snap.peer_id, saved);
-                                }
-                                self.peers = snapshots;
+                        }
+                        MeshEvent::LocalStreamStatus {
+                            is_sharing,
+                            subscriber_count,
+                        } => {
+                            self.is_local_sharing = is_sharing;
+                            self.local_stream_subscribers = subscriber_count;
+                        }
+                        MeshEvent::PeerAvatarLoaded {
+                            client_uuid,
+                            avatar_hash,
+                            jpeg_bytes,
+                        } => {
+                            if avatar_hash == [0u8; 32] {
+                                self.avatars.reset_to_identicon(client_uuid);
+                            } else {
+                                self.avatars
+                                    .set_from_jpeg_option(client_uuid, jpeg_bytes.as_deref());
                             }
-                            MeshEvent::ChatItemReceived(item) => {
-                                if let ChatContentUi::InlineImage {
-                                    blob_id,
-                                    ref filename,
-                                    bytes: Some(ref raw),
-                                    ..
-                                } = item.content
-                                {
-                                    if !self.is_in_tray
-                                        && crate::ui::avatar::decode_bounded_image(
-                                            raw,
-                                            4096,
-                                            64 * 1024 * 1024,
-                                        )
-                                        .is_ok()
-                                    {
-                                        self.image_handles.insert(
-                                            blob_id,
-                                            iced_image::Handle::from_bytes(raw.clone()),
-                                        );
-                                        self.inline_image_bytes
-                                            .insert(blob_id, (filename.clone(), raw.clone()));
-                                    }
-                                }
-                                let already = self.chat_messages.iter().any(|existing| {
-                                    existing.sender_uuid == item.sender_uuid
-                                        && existing.msg_id == item.msg_id
-                                });
-                                if !already {
-                                    if !self.is_in_tray {
-                                        if let ChatContentUi::Text(ref body_text) = item.content {
-                                            self.chat_text_editors.insert(
-                                                (item.sender_uuid, item.msg_id),
-                                                text_editor::Content::with_text(body_text),
-                                            );
-                                        }
-                                    }
-                                    self.chat_messages.push(item);
-                                    self.chat_messages
-                                        .sort_by_key(|m| (m.timestamp_ms, m.msg_id));
-                                    if self.chat_messages.len() > 30 {
-                                        let drop_n = self.chat_messages.len() - 30;
-                                        let mut dropped_blobs = Vec::new();
-                                        for dropped in self.chat_messages.drain(0..drop_n) {
-                                            self.chat_text_editors
-                                                .remove(&(dropped.sender_uuid, dropped.msg_id));
-                                            if let ChatContentUi::InlineImage { blob_id, .. } =
-                                                dropped.content
-                                            {
-                                                dropped_blobs.push(blob_id);
-                                            }
-                                        }
-                                        for blob_id in dropped_blobs {
-                                            if self.lightbox_blob_id != Some(blob_id)
-                                                && !self.chat_messages.iter().any(|m| {
-                                                    matches!(
-                                                        m.content,
-                                                        ChatContentUi::InlineImage { blob_id: bid, .. }
-                                                            if bid == blob_id
-                                                    )
-                                                })
-                                            {
-                                                self.image_handles.remove(&blob_id);
-                                                self.inline_image_bytes.remove(&blob_id);
-                                            }
-                                        }
-                                    }
-                                }
+                        }
+                        MeshEvent::StreamCodecFallbackToH264 { reason } => {
+                            tracing::info!("Stream codec fell back to H.264: {reason}");
+                            self.share_codec = VideoCodec::H264;
+                            self.status_banner = Some(
+                                "Switched stream to H.264 for viewer compatibility".to_string(),
+                            );
+                        }
+                        MeshEvent::LanRoomsUpdated(rooms) => {
+                            self.lan_rooms = rooms;
+                        }
+                        MeshEvent::FriendsStatusUpdated(list) => {
+                            self.friend_presences = list
+                                .into_iter()
+                                .filter(|f| f.online)
+                                .map(|f| (f.pub_key, f))
+                                .collect();
+                        }
+                        MeshEvent::IncomingFriendCall(call) => {
+                            self.incoming_call = Some(call);
+                            if self.is_in_tray {
+                                pending_tasks.extend(self.restore_from_tray());
+                            } else if let Some(id) = self.main_window_id {
+                                pending_tasks.push(iced::window::gain_focus(id));
                             }
-                            MeshEvent::BlobStateChanged {
-                                blob_id,
-                                state,
-                                inline_bytes,
-                            } => {
-                                let valid_inline = !self.is_in_tray
-                                    && inline_bytes.as_deref().is_some_and(|raw| {
-                                        crate::ui::avatar::decode_bounded_image(
-                                            raw,
-                                            4096,
-                                            64 * 1024 * 1024,
-                                        )
-                                        .is_ok()
-                                    });
-                                if valid_inline {
-                                    if let Some(ref raw) = inline_bytes {
-                                        self.image_handles.insert(
-                                            blob_id,
-                                            iced_image::Handle::from_bytes(raw.clone()),
-                                        );
-                                    }
-                                }
-                                for item in &mut self.chat_messages {
-                                    match &mut item.content {
-                                        ChatContentUi::InlineImage {
-                                            blob_id: bid,
-                                            filename,
-                                            state: st,
-                                            bytes,
-                                            ..
-                                        } if *bid == blob_id => {
-                                            *st = state.clone();
-                                            if let Some(ref raw) = inline_bytes {
-                                                *bytes = Some(raw.clone());
-                                                if valid_inline {
-                                                    self.inline_image_bytes.insert(
-                                                        blob_id,
-                                                        (filename.clone(), raw.clone()),
-                                                    );
-                                                }
-                                            }
-                                        }
-                                        ChatContentUi::File {
-                                            blob_id: bid,
-                                            state: st,
-                                            ..
-                                        } if *bid == blob_id => {
-                                            *st = state.clone();
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            MeshEvent::RemoteStreamUpdated { peer_id, stream } => {
-                                if let Some(peer) =
-                                    self.peers.iter_mut().find(|p| p.peer_id == peer_id)
-                                {
-                                    peer.stream_info = stream.clone();
-                                }
-                                if stream.is_none() && self.watched_peer_id == Some(peer_id) {
-                                    self.watched_peer_id = None;
-                                    self.active_stream_frame = None;
-                                    self.stream_expanded = false;
-                                    self.ui_sync
-                                        .watching_video
-                                        .store(self.local_stream_preview, Ordering::Release);
-                                    if self.stream_fullscreen {
-                                        self.stream_fullscreen = false;
-                                        if let Some(id) = self.main_window_id {
-                                            pending_tasks
-                                                .push(set_window_fullscreen_task(id, false));
-                                        }
-                                    }
-                                }
-                            }
-                            MeshEvent::LocalStreamStatus {
-                                is_sharing,
-                                subscriber_count,
-                            } => {
-                                self.is_local_sharing = is_sharing;
-                                self.local_stream_subscribers = subscriber_count;
-                            }
-                            MeshEvent::PeerAvatarLoaded {
-                                client_uuid,
-                                avatar_hash,
-                                jpeg_bytes,
-                            } => {
-                                if avatar_hash == [0u8; 32] {
-                                    self.avatars.reset_to_identicon(client_uuid);
-                                } else {
-                                    self.avatars
-                                        .set_from_jpeg_option(client_uuid, jpeg_bytes.as_deref());
-                                }
-                            }
-                            MeshEvent::StreamCodecFallbackToH264 { reason } => {
-                                tracing::info!("Stream codec fell back to H.264: {reason}");
-                                self.share_codec = VideoCodec::H264;
-                                self.status_banner = Some(
-                                    "Switched stream to H.264 for viewer compatibility".to_string(),
-                                );
-                            }
-                            MeshEvent::LanRoomsUpdated(rooms) => {
-                                self.lan_rooms = rooms;
-                            }
-                            MeshEvent::FriendsStatusUpdated(list) => {
-                                self.friend_presences = list
-                                    .into_iter()
-                                    .filter(|f| f.online)
-                                    .map(|f| (f.pub_key, f))
-                                    .collect();
-                            }
-                            MeshEvent::IncomingFriendCall(call) => {
-                                self.incoming_call = Some(call);
-                                if self.is_in_tray {
-                                    pending_tasks.extend(self.restore_from_tray());
-                                } else if let Some(id) = self.main_window_id {
-                                    pending_tasks.push(iced::window::gain_focus(id));
-                                }
-                            }
-                            MeshEvent::ShortCodeGenerated {
+                        }
+                        MeshEvent::ShortCodeGenerated {
+                            code,
+                            expires_in_secs,
+                        } => {
+                            self.active_short_code = Some((
                                 code,
-                                expires_in_secs,
-                            } => {
-                                self.active_short_code = Some((
-                                    code,
-                                    std::time::Instant::now()
-                                        + Duration::from_secs(expires_in_secs as u64),
-                                ));
-                                self.short_code_copied_flash = false;
-                                self.status_banner = None;
-                            }
-                            MeshEvent::ShortCodeCleared => {
-                                self.active_short_code = None;
-                                self.short_code_copied_flash = false;
-                            }
-                            MeshEvent::FriendInviteSent { target_pub_key } => {
-                                self.invited_friends_session.insert(target_pub_key);
-                            }
-                            MeshEvent::Error(err) => {
-                                self.short_code_joining = false;
-                                self.status_banner = Some(err);
-                            }
+                                std::time::Instant::now()
+                                    + Duration::from_secs(expires_in_secs as u64),
+                            ));
+                            self.short_code_copied_flash = false;
+                            self.status_banner = None;
+                        }
+                        MeshEvent::ShortCodeCleared => {
+                            self.active_short_code = None;
+                            self.short_code_copied_flash = false;
+                        }
+                        MeshEvent::FriendInviteSent { target_pub_key } => {
+                            self.invited_friends_session.insert(target_pub_key);
+                        }
+                        MeshEvent::Error(err) => {
+                            self.short_code_joining = false;
+                            self.status_banner = Some(err);
+                        }
                     }
                 }
                 if overlay_sync_needed {
@@ -2004,11 +2002,9 @@ impl SquadApp {
             }
             Message::CallFriend(pub_key) => {
                 self.prepare_for_room_entry();
-                let _ = self
-                    .mesh_tx
-                    .try_send(MeshCommand::CallOrInviteFriend {
-                        target_pub_key: pub_key,
-                    });
+                let _ = self.mesh_tx.try_send(MeshCommand::CallOrInviteFriend {
+                    target_pub_key: pub_key,
+                });
                 self.status_banner = Some("Calling friend...".to_string());
                 Task::none()
             }
@@ -2023,11 +2019,9 @@ impl SquadApp {
                 Task::none()
             }
             Message::InviteFriendToParty(pub_key) => {
-                let _ = self
-                    .mesh_tx
-                    .try_send(MeshCommand::CallOrInviteFriend {
-                        target_pub_key: pub_key,
-                    });
+                let _ = self.mesh_tx.try_send(MeshCommand::CallOrInviteFriend {
+                    target_pub_key: pub_key,
+                });
                 Task::none()
             }
             Message::AcceptIncomingCall => {

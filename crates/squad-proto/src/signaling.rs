@@ -215,8 +215,8 @@ fn decode_nick(data: &[u8], cursor: &mut usize) -> Result<String, ProtoError> {
         return Err(ProtoError::InvalidHeader);
     }
     need_bytes(data, *cursor, nick_len)?;
-    let raw =
-        std::str::from_utf8(&data[*cursor..*cursor + nick_len]).map_err(|_| ProtoError::InvalidUtf8)?;
+    let raw = std::str::from_utf8(&data[*cursor..*cursor + nick_len])
+        .map_err(|_| ProtoError::InvalidUtf8)?;
     *cursor += nick_len;
     Ok(sanitize_display_str(raw, MAX_NICKNAME_LEN))
 }

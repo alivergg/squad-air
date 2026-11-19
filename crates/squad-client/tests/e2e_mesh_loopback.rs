@@ -909,3 +909,535 @@ async fn test_e2e_relay_framing_opus_decode_and_handoff_dedup() {
     );
     assert_eq!(jb.snapshot().loss_pct, 0.0);
 }
+
+#[tokio::test]
+async fn test_e2e_spake2_six_digit_code_join_and_wrong_code_rejection() {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        ChaCha20Poly1305, Nonce,
+    };
+    use rand::{rngs::OsRng, RngCore};
+    use spake2::{Ed25519Group, Identity, Password, Spake2};
+    use squad_proto::{SignalingErrorCode, Spake2Packet};
+    use std::sync::Arc;
+    use tokio::sync::watch;
+
+    let rv_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let rv_addr = rv_sock.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let rv_task = tokio::spawn(squad_rendezvous::run_server(
+        Arc::clone(&rv_sock),
+        shutdown_rx,
+    ));
+
+    let sock_host = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_joiner = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let invite = InviteLink::generate();
+
+    // Host registers room
+    let reg_host = SignalingPacket::C2sRegister {
+        room_id: invite.room_id,
+        client_uuid: [0x11; 16],
+        nickname: "CodeHost".to_string(),
+        lan_addrs: Vec::new(),
+    };
+    sock_host
+        .send_to(&reg_host.encode().unwrap(), rv_addr)
+        .await
+        .unwrap();
+    let mut rx_host = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock_host.recv_from(&mut rx_host))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        SignalingPacket::decode(&rx_host[..n]).unwrap(),
+        SignalingPacket::S2cRoomState {
+            assigned_peer_id: 1,
+            ..
+        }
+    ));
+
+    // Host registers 6-digit code
+    let code = 482_910u32;
+    let host_pk = [0xAA; 32];
+    let reg_code = SignalingPacket::C2sRegisterShortCode {
+        room_id: invite.room_id,
+        host_pub_key: host_pk,
+        code,
+    };
+    sock_host
+        .send_to(&reg_code.encode().unwrap(), rv_addr)
+        .await
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock_host.recv_from(&mut rx_host))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        SignalingPacket::decode(&rx_host[..n]).unwrap(),
+        SignalingPacket::S2cShortCodeRegistered {
+            code,
+            expires_in_secs: 600
+        }
+    );
+
+    // Phase 1: Full SPAKE2 resolution + AEAD envelope check (correct vs wrong code)
+    let pass = format!("{code:06}");
+    let (state_a, msg_a) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(pass.as_bytes()),
+        &Identity::new(b"squad-air-spake2-joiner-v1"),
+        &Identity::new(b"squad-air-spake2-host-v1"),
+    );
+    let resolve = SignalingPacket::C2sResolveShortCode {
+        code,
+        joiner_pub_key: [0xBB; 32],
+        joiner_lan_addrs: Vec::new(),
+        spake2_msg_a: msg_a.clone(),
+    };
+    sock_joiner
+        .send_to(&resolve.encode().unwrap(), rv_addr)
+        .await
+        .unwrap();
+
+    // Host gets Challenge; Joiner gets JoinerInfo
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock_host.recv_from(&mut rx_host))
+        .await
+        .unwrap()
+        .unwrap();
+    let SignalingPacket::S2cShortCodeChallenge {
+        code: chal_code,
+        joiner_public_addr,
+        spake2_msg_a,
+        ..
+    } = SignalingPacket::decode(&rx_host[..n]).unwrap()
+    else {
+        panic!("Expected S2cShortCodeChallenge at host");
+    };
+    assert_eq!(chal_code, code);
+    assert_eq!(spake2_msg_a, msg_a);
+
+    let mut rx_joiner = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        sock_joiner.recv_from(&mut rx_joiner),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(
+        SignalingPacket::decode(&rx_joiner[..n]).unwrap(),
+        SignalingPacket::S2cShortCodeJoinerInfo { code: c, .. } if c == code
+    ));
+
+    // Host completes SPAKE2 side B and seals InviteLink (zero visibility to Rendezvous)
+    let (state_b, msg_b) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(pass.as_bytes()),
+        &Identity::new(b"squad-air-spake2-joiner-v1"),
+        &Identity::new(b"squad-air-spake2-host-v1"),
+    );
+    let key_b = state_b.finish(&spake2_msg_a).unwrap();
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let mut pt = [0u8; 48];
+    pt[..16].copy_from_slice(&invite.room_id);
+    pt[16..48].copy_from_slice(&invite.secret);
+    let aad = format!("squad-air spake2 room invite v1:{code:06}");
+    let enc = ChaCha20Poly1305::new_from_slice(&key_b[..32])
+        .unwrap()
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &pt,
+                aad: aad.as_bytes(),
+            },
+        )
+        .unwrap();
+    let reply = Spake2Packet::HostReply {
+        code,
+        spake2_msg_b: msg_b.clone(),
+        nonce,
+        encrypted_invite: enc.clone(),
+    };
+    sock_host
+        .send_to(&reply.encode().unwrap(), joiner_public_addr)
+        .await
+        .unwrap();
+
+    let (n, _) = tokio::time::timeout(
+        Duration::from_secs(1),
+        sock_joiner.recv_from(&mut rx_joiner),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let Spake2Packet::HostReply {
+        spake2_msg_b,
+        nonce: rx_nonce,
+        encrypted_invite,
+        ..
+    } = Spake2Packet::decode(&rx_joiner[..n]).unwrap()
+    else {
+        panic!("Expected Spake2Packet::HostReply");
+    };
+
+    // Wrong password SPAKE2 side A must fail AEAD authentication
+    let (wrong_state_a, _) = Spake2::<Ed25519Group>::start_a(
+        &Password::new(b"999999"),
+        &Identity::new(b"squad-air-spake2-joiner-v1"),
+        &Identity::new(b"squad-air-spake2-host-v1"),
+    );
+    let wrong_key = wrong_state_a.finish(&spake2_msg_b).unwrap();
+    assert!(ChaCha20Poly1305::new_from_slice(&wrong_key[..32])
+        .unwrap()
+        .decrypt(
+            Nonce::from_slice(&rx_nonce),
+            Payload {
+                msg: &encrypted_invite,
+                aad: aad.as_bytes(),
+            },
+        )
+        .is_err());
+
+    // Correct SPAKE2 decrypts exact RoomCipher secret and joins same room
+    let key_a = state_a.finish(&spake2_msg_b).unwrap();
+    let opened = ChaCha20Poly1305::new_from_slice(&key_a[..32])
+        .unwrap()
+        .decrypt(
+            Nonce::from_slice(&rx_nonce),
+            Payload {
+                msg: &encrypted_invite,
+                aad: aad.as_bytes(),
+            },
+        )
+        .unwrap();
+    let mut joined_secret = [0u8; 32];
+    joined_secret.copy_from_slice(&opened[16..48]);
+    assert_eq!(joined_secret, invite.secret);
+
+    let cipher_joiner = RoomCipher::from_secret(&joined_secret);
+    let cipher_host = RoomCipher::from_secret(&invite.secret);
+    let mut wire = Vec::new();
+    cipher_host
+        .seal_packet(
+            &P2pHeader {
+                msg_type: P2pMsgType::ChatText,
+                room_prefix: invite.room_prefix(),
+                sender_peer_id: 1,
+                seq_num: 1,
+            },
+            &P2pPayload::ChatText {
+                sender_uuid: [0x11; 16],
+                sender_nickname: "CodeHost".to_string(),
+                msg_id: 7,
+                timestamp_ms: 99,
+                text: "SPAKE2 E2E ok".to_string(),
+            },
+            &mut wire,
+        )
+        .unwrap();
+    let (_, chat_payload) = cipher_joiner.open_packet(&mut wire).unwrap();
+    assert!(matches!(
+        chat_payload,
+        P2pPayload::ChatText { ref text, .. } if text == "SPAKE2 E2E ok"
+    ));
+
+    // Phase 2: 4 wrong attempts -> InvalidShortCode, 5th & 6th attempts -> RateLimited
+    let wrong_resolve = SignalingPacket::C2sResolveShortCode {
+        code: 482_911,
+        joiner_pub_key: [0xCC; 32],
+        joiner_lan_addrs: Vec::new(),
+        spake2_msg_a: vec![0x42; 33],
+    }
+    .encode()
+    .unwrap();
+    for attempt in 1..=6 {
+        sock_joiner.send_to(&wrong_resolve, rv_addr).await.unwrap();
+        let (n, _) = tokio::time::timeout(
+            Duration::from_secs(1),
+            sock_joiner.recv_from(&mut rx_joiner),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let expected_err = if attempt < 5 {
+            SignalingErrorCode::InvalidShortCode
+        } else {
+            SignalingErrorCode::RateLimited
+        };
+        assert_eq!(
+            SignalingPacket::decode(&rx_joiner[..n]).unwrap(),
+            SignalingPacket::S2cError { code: expected_err }
+        );
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = rv_task.await;
+}
+
+#[tokio::test]
+async fn test_e2e_x25519_friend_call_and_third_peer_party_invite() {
+    use chacha20poly1305::{
+        aead::{Aead, KeyInit, Payload},
+        ChaCha20Poly1305, Nonce,
+    };
+    use rand::{rngs::OsRng, RngCore};
+    use std::sync::Arc;
+    use tokio::sync::watch;
+    use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
+
+    let rv_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+    let rv_addr = rv_sock.local_addr().unwrap();
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let rv_task = tokio::spawn(squad_rendezvous::run_server(
+        Arc::clone(&rv_sock),
+        shutdown_rx,
+    ));
+
+    let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let sock_c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+    let sk_a = StaticSecret::random_from_rng(OsRng);
+    let sk_b = StaticSecret::random_from_rng(OsRng);
+    let sk_c = StaticSecret::random_from_rng(OsRng);
+    let pk_a = PublicKey::from(&sk_a).to_bytes();
+    let pk_b = PublicKey::from(&sk_b).to_bytes();
+    let pk_c = PublicKey::from(&sk_c).to_bytes();
+
+    for (sock, pk, nick) in [
+        (&sock_a, pk_a, "Alice"),
+        (&sock_b, pk_b, "Bob"),
+        (&sock_c, pk_c, "Charlie"),
+    ] {
+        let ping = SignalingPacket::C2sPresencePing {
+            pub_key: pk,
+            nickname: nick.to_string(),
+            in_room: false,
+        };
+        sock.send_to(&ping.encode().unwrap(), rv_addr)
+            .await
+            .unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+
+    // A queries B and C status
+    let query = SignalingPacket::C2sQueryFriends {
+        friend_pub_keys: vec![pk_b, pk_c],
+    };
+    sock_a
+        .send_to(&query.encode().unwrap(), rv_addr)
+        .await
+        .unwrap();
+    let mut rx_buf = [0u8; 2048];
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock_a.recv_from(&mut rx_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let SignalingPacket::S2cFriendsStatus { online_friends } =
+        SignalingPacket::decode(&rx_buf[..n]).unwrap()
+    else {
+        panic!("Expected S2cFriendsStatus");
+    };
+    assert_eq!(online_friends.len(), 2);
+
+    let seal_invite = |sender_sk: &StaticSecret,
+                       target_pk: &[u8; 32],
+                       invite: &InviteLink,
+                       nick: &str,
+                       party: bool| {
+        let target_pub = PublicKey::from(*target_pk);
+        let sender_pub = PublicKey::from(sender_sk).to_bytes();
+        let eph_sk = EphemeralSecret::random_from_rng(OsRng);
+        let eph_pub = PublicKey::from(&eph_sk).to_bytes();
+        let ss_s = sender_sk.diffie_hellman(&target_pub);
+        let ss_e = eph_sk.diffie_hellman(&target_pub);
+        let mut h = blake3::Hasher::new();
+        h.update(b"squad-air friend invite x25519 v1");
+        h.update(ss_s.as_bytes());
+        h.update(ss_e.as_bytes());
+        let key = h.finalize();
+        let mut nonce = [0u8; 12];
+        OsRng.fill_bytes(&mut nonce);
+        let mut pt = Vec::new();
+        pt.extend_from_slice(&invite.room_id);
+        pt.extend_from_slice(&invite.secret);
+        pt.push(u8::from(party));
+        pt.push(nick.len() as u8);
+        pt.extend_from_slice(nick.as_bytes());
+        let mut aad = Vec::with_capacity(96);
+        aad.extend_from_slice(&sender_pub);
+        aad.extend_from_slice(target_pk);
+        aad.extend_from_slice(&eph_pub);
+        let ct = ChaCha20Poly1305::new_from_slice(key.as_bytes())
+            .unwrap()
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: &pt,
+                    aad: &aad,
+                },
+            )
+            .unwrap();
+        (eph_pub, nonce, ct)
+    };
+
+    let open_invite = |recv_sk: &StaticSecret,
+                       sender_pk: &[u8; 32],
+                       eph_pk: &[u8; 32],
+                       nonce: &[u8; 12],
+                       ct: &[u8]|
+     -> Result<(InviteLink, bool), ()> {
+        let recv_pk = PublicKey::from(recv_sk).to_bytes();
+        let ss_s = recv_sk.diffie_hellman(&PublicKey::from(*sender_pk));
+        let ss_e = recv_sk.diffie_hellman(&PublicKey::from(*eph_pk));
+        let mut h = blake3::Hasher::new();
+        h.update(b"squad-air friend invite x25519 v1");
+        h.update(ss_s.as_bytes());
+        h.update(ss_e.as_bytes());
+        let key = h.finalize();
+        let mut aad = Vec::with_capacity(96);
+        aad.extend_from_slice(sender_pk);
+        aad.extend_from_slice(&recv_pk);
+        aad.extend_from_slice(eph_pk);
+        let pt = ChaCha20Poly1305::new_from_slice(key.as_bytes())
+            .unwrap()
+            .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &aad })
+            .map_err(|_| ())?;
+        let mut room_id = [0u8; 16];
+        let mut secret = [0u8; 32];
+        room_id.copy_from_slice(&pt[..16]);
+        secret.copy_from_slice(&pt[16..48]);
+        Ok((InviteLink { room_id, secret }, pt[48] != 0))
+    };
+
+    // A calls B -> B decrypts; unauthorized C cannot decrypt B's payload
+    let invite = InviteLink::generate();
+    let (eph_b, nonce_b, ct_b) = seal_invite(&sk_a, &pk_b, &invite, "Alice", false);
+    sock_a
+        .send_to(
+            &SignalingPacket::C2sRelayFriendInvite {
+                sender_pub_key: pk_a,
+                target_pub_key: pk_b,
+                ephemeral_pub_key: eph_b,
+                nonce: nonce_b,
+                ciphertext: ct_b,
+            }
+            .encode()
+            .unwrap(),
+            rv_addr,
+        )
+        .await
+        .unwrap();
+
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock_b.recv_from(&mut rx_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let SignalingPacket::S2cIncomingFriendInvite {
+        sender_pub_key,
+        ephemeral_pub_key,
+        nonce,
+        ciphertext,
+    } = SignalingPacket::decode(&rx_buf[..n]).unwrap()
+    else {
+        panic!("Expected S2cIncomingFriendInvite for Bob");
+    };
+    assert!(open_invite(
+        &sk_c,
+        &sender_pub_key,
+        &ephemeral_pub_key,
+        &nonce,
+        &ciphertext
+    )
+    .is_err());
+    let (b_invite, b_party) = open_invite(
+        &sk_b,
+        &sender_pub_key,
+        &ephemeral_pub_key,
+        &nonce,
+        &ciphertext,
+    )
+    .unwrap();
+    assert!(!b_party);
+    assert_eq!(b_invite.to_uri(), invite.to_uri());
+
+    // A invites C into the active room as a 3rd party member
+    let (eph_c, nonce_c, ct_c) = seal_invite(&sk_a, &pk_c, &invite, "Alice", true);
+    sock_a
+        .send_to(
+            &SignalingPacket::C2sRelayFriendInvite {
+                sender_pub_key: pk_a,
+                target_pub_key: pk_c,
+                ephemeral_pub_key: eph_c,
+                nonce: nonce_c,
+                ciphertext: ct_c,
+            }
+            .encode()
+            .unwrap(),
+            rv_addr,
+        )
+        .await
+        .unwrap();
+    let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock_c.recv_from(&mut rx_buf))
+        .await
+        .unwrap()
+        .unwrap();
+    let SignalingPacket::S2cIncomingFriendInvite {
+        sender_pub_key,
+        ephemeral_pub_key,
+        nonce,
+        ciphertext,
+    } = SignalingPacket::decode(&rx_buf[..n]).unwrap()
+    else {
+        panic!("Expected S2cIncomingFriendInvite for Charlie");
+    };
+    let (c_invite, c_party) = open_invite(
+        &sk_c,
+        &sender_pub_key,
+        &ephemeral_pub_key,
+        &nonce,
+        &ciphertext,
+    )
+    .unwrap();
+    assert!(c_party);
+    assert_eq!(c_invite.to_uri(), invite.to_uri());
+
+    // All 3 peers register in the same room via Rendezvous and receive unified peer list
+    for (idx, (sock, inv)) in [
+        (&sock_a, &invite),
+        (&sock_b, &b_invite),
+        (&sock_c, &c_invite),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sock.send_to(
+            &SignalingPacket::C2sRegister {
+                room_id: inv.room_id,
+                client_uuid: [(idx as u8) + 1; 16],
+                nickname: format!("Peer{}", idx + 1),
+                lan_addrs: Vec::new(),
+            }
+            .encode()
+            .unwrap(),
+            rv_addr,
+        )
+        .await
+        .unwrap();
+        let (n, _) = tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut rx_buf))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            SignalingPacket::decode(&rx_buf[..n]).unwrap(),
+            SignalingPacket::S2cRoomState {
+                assigned_peer_id,
+                ..
+            } if assigned_peer_id == (idx as u16) + 1
+        ));
+    }
+
+    let _ = shutdown_tx.send(true);
+    let _ = rv_task.await;
+}
