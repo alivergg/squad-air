@@ -1,3 +1,7 @@
+use crate::crypto_identity::{
+    open_friend_invite, seal_friend_invite, spake2_host_seal_invite, spake2_joiner_open_invite,
+    spake2_start_joiner,
+};
 use crate::net::lan::{
     bind_lan_broadcast_sender, bind_lan_discovery_listener, broadcast_lan_packet,
     start_embedded_rendezvous, DiscoveredLanRoom, EmbeddedRendezvousHandle,
@@ -8,14 +12,19 @@ use crate::net::transfer::{
 };
 use crate::net::PeerEndpoint;
 use crate::tray::release_os_memory;
+use rand::{rngs::OsRng, Rng};
+use spake2::{Ed25519Group, Spake2};
 use squad_dsp::{AudioEngineHandle, OutboundAudioFrame, SoundCue};
 use squad_proto::{
     encode_peer_relay_datagram_into, encode_relay_datagram_into, is_peer_relay_datagram,
-    is_relay_datagram, parse_peer_relay_header, parse_relay_header, rewrite_relay_peer_id,
-    ClientUuid, InviteLink, LanDiscoveryPacket, P2pHeader, P2pMsgType, P2pPayload, PeerId,
-    PeerRecord, RoomCipher, RoomId, SignalingPacket, LAN_DISCOVERY_PORT, MAX_RELAY_UDP_PAYLOAD,
+    is_relay_datagram, is_spake2_datagram, parse_peer_relay_header, parse_relay_header,
+    rewrite_relay_peer_id, sanitize_display_str, ClientUuid, InviteLink, LanDiscoveryPacket,
+    P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, RoomId,
+    SignalingErrorCode, SignalingPacket, Spake2Packet, LAN_DISCOVERY_PORT,
+    MAX_FRIENDS_STATUS_PER_PACKET, MAX_QUERY_FRIENDS_PER_PACKET, MAX_RELAY_UDP_PAYLOAD,
     MAX_ROOM_PEERS, MAX_UDP_PAYLOAD, RELAY_HEADER_LEN,
 };
+use x25519_dalek::{PublicKey, StaticSecret};
 use squad_video::{
     detect_hardware_encoder_backend, fragment_frame, is_hevc_hardware_supported, DecoderError,
     FrameReassembler, H264Decoder, H264Encoder, ScreenCapturer, StreamConfig, VideoCodec,
@@ -45,6 +54,12 @@ const LAN_BEACON_INTERVAL: Duration = Duration::from_millis(1500);
 const LAN_ROOM_TTL: Duration = Duration::from_secs(5);
 const LAN_RV_LOST_TIMEOUT: Duration = Duration::from_secs(7);
 const LAN_MIGRATION_GRACE: Duration = Duration::from_secs(3);
+const PRESENCE_PING_INTERVAL: Duration = Duration::from_secs(4);
+const PRESENCE_UI_TTL: Duration = Duration::from_secs(15);
+const SHORT_CODE_TTL: Duration = Duration::from_secs(600);
+const SHORT_CODE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHORT_CODE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const SPAKE2_HOST_MAX_REPLIES_PER_SEC: usize = 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerConnStatus {
@@ -98,6 +113,23 @@ pub struct PeerUiSnapshot {
     pub stream_info: Option<RemoteStreamInfo>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FriendPresenceUi {
+    pub pub_key: [u8; 32],
+    pub nickname: String,
+    pub online: bool,
+    pub in_room: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IncomingFriendCallUi {
+    pub sender_pub_key: [u8; 32],
+    pub sender_nickname: String,
+    pub invite: InviteLink,
+    pub is_party_invite: bool,
+    pub is_known_friend: bool,
+}
+
 #[derive(Debug, Clone)]
 pub enum MeshCommand {
     JoinRoom {
@@ -144,6 +176,23 @@ pub enum MeshCommand {
     SetTrayMode {
         in_tray: bool,
     },
+    UpdatePresenceConfig {
+        rendezvous_server: String,
+        nickname: String,
+        client_uuid: ClientUuid,
+        identity_secret: [u8; 32],
+        friend_pub_keys: Vec<[u8; 32]>,
+    },
+    CallOrInviteFriend {
+        target_pub_key: [u8; 32],
+    },
+    GenerateShortCode,
+    JoinByShortCode {
+        rendezvous_server: String,
+        code: u32,
+        nickname: String,
+        client_uuid: ClientUuid,
+    },
     Shutdown,
 }
 
@@ -178,6 +227,16 @@ pub enum MeshEvent {
         reason: String,
     },
     LanRoomsUpdated(Vec<DiscoveredLanRoom>),
+    FriendsStatusUpdated(Vec<FriendPresenceUi>),
+    IncomingFriendCall(IncomingFriendCallUi),
+    ShortCodeGenerated {
+        code: u32,
+        expires_in_secs: u16,
+    },
+    ShortCodeCleared,
+    FriendInviteSent {
+        target_pub_key: [u8; 32],
+    },
     Error(String),
 }
 
@@ -279,6 +338,30 @@ struct ActiveSession {
     migration_claimed_at: Option<Instant>,
     last_mesh_reachability_sent: Instant,
     last_advertised_direct_peers: Vec<PeerId>,
+    active_short_code: Option<(u32, Instant)>,
+    last_spake2_reply_times: Vec<Instant>,
+}
+
+struct PresenceWorkerState {
+    rendezvous_addr: Option<SocketAddr>,
+    nickname: String,
+    client_uuid: ClientUuid,
+    identity_secret: Option<StaticSecret>,
+    my_pub_key: [u8; 32],
+    friend_pub_keys: Vec<[u8; 32]>,
+    online_friends: HashMap<[u8; 32], (String, bool, Instant)>,
+}
+
+struct PendingShortCodeJoin {
+    code: u32,
+    rendezvous_addr: SocketAddr,
+    nickname: String,
+    client_uuid: ClientUuid,
+    spake2_state: Option<Spake2<Ed25519Group>>,
+    msg_a: Vec<u8>,
+    host_addrs: Vec<SocketAddr>,
+    started_at: Instant,
+    last_retry_sent: Instant,
 }
 
 #[derive(Clone)]
@@ -428,6 +511,19 @@ pub fn spawn_mesh_worker(
         let mut seal_buf = Vec::with_capacity(MAX_UDP_PAYLOAD);
         let mut relay_buf = Vec::with_capacity(MAX_RELAY_UDP_PAYLOAD);
 
+        let fallback_sk = StaticSecret::random_from_rng(OsRng);
+        let fallback_pk = PublicKey::from(&fallback_sk).to_bytes();
+        let mut presence = PresenceWorkerState {
+            rendezvous_addr: None,
+            nickname: String::new(),
+            client_uuid: [0u8; 16],
+            identity_secret: Some(fallback_sk),
+            my_pub_key: fallback_pk,
+            friend_pub_keys: Vec::new(),
+            online_friends: HashMap::new(),
+        };
+        let mut pending_short_code_join: Option<PendingShortCodeJoin> = None;
+
         let lan_rx_sock = bind_lan_discovery_listener(LAN_DISCOVERY_PORT)
             .map_err(|e| {
                 warn!("LAN discovery listener unavailable on UDP {LAN_DISCOVERY_PORT}: {e}")
@@ -445,6 +541,7 @@ pub fn spawn_mesh_worker(
         qos_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut ui_sync_tick = tokio::time::interval(Duration::from_millis(120));
         let mut lan_tick = tokio::time::interval(LAN_BEACON_INTERVAL);
+        let mut presence_tick = tokio::time::interval(PRESENCE_PING_INTERVAL);
 
         loop {
             let lan_work_active = session.as_ref().is_some_and(|s| s.embedded_rv.is_some())
@@ -471,50 +568,41 @@ pub fn spawn_mesh_worker(
                                     continue;
                                 }
                             };
-
-                            if let Some(old_sess) = session.take() {
-                                teardown_session(
-                                    &socket,
-                                    lan_tx_sock.as_ref(),
-                                    old_sess,
-                                    &mut seal_buf,
-                                    &mut relay_buf,
-                                    true,
-                                )
-                                .await;
-                            }
-
-                            let new_sess = init_session(
+                            pending_short_code_join = None;
+                            let mut act_ctx = SessionActivationCtx {
+                                socket: &socket,
+                                lan_tx_sock: lan_tx_sock.as_ref(),
+                                bound_port,
+                                pending_local_avatar: &pending_local_avatar,
+                                local_encoder_backend: &local_encoder_backend,
+                                hevc_decode_supported,
+                                audio_engine: &audio_engine,
+                                tr_tx: &tr_tx,
+                                tr_rx: &mut tr_rx,
+                                evt_tx: &evt_tx,
+                                capture_worker: &mut capture_worker,
+                                video_out_rx: &mut video_out_rx,
+                                decode_handle: &decode_handle,
+                                video_frame_slot: &video_frame_slot,
+                                discovered_lan: &mut discovered_lan,
+                                last_published_lan: &mut last_published_lan,
+                                last_snapshots: &mut last_snapshots,
+                                seal_buf: &mut seal_buf,
+                                relay_buf: &mut relay_buf,
+                                presence: &presence,
+                            };
+                            activate_joined_session(
+                                &mut session,
+                                &mut act_ctx,
                                 rv_addr,
                                 invite,
                                 nickname,
                                 client_uuid,
-                                bound_port,
-                                pending_local_avatar.clone(),
-                                local_encoder_backend.clone(),
-                                hevc_decode_supported,
                                 is_lan_room,
                                 room_name.unwrap_or_default(),
                                 None,
-                                &audio_engine,
-                                &tr_tx,
-                                &mut tr_rx,
-                                &evt_tx,
                             )
                             .await;
-
-                            discovered_lan.remove(&new_sess.invite.room_id);
-                            publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx).await;
-
-                            send_register(&socket, &new_sess).await;
-                            stop_capture_worker(&mut capture_worker);
-                            drain_video_out_rx(&mut video_out_rx);
-                            audio_engine.clear_stream_audio();
-                            decode_handle.reset();
-                            clear_video_slot(&video_frame_slot);
-                            last_snapshots.clear();
-                            session = Some(new_sess);
-                            audio_engine.play_cue(SoundCue::Join);
 
                             let _ = initial_volumes;
                         }
@@ -523,7 +611,11 @@ pub fn spawn_mesh_worker(
                             nickname,
                             client_uuid,
                         } => {
+                            pending_short_code_join = None;
                             if let Some(old_sess) = session.take() {
+                                if old_sess.active_short_code.is_some() {
+                                    evt_tx.send(MeshEvent::ShortCodeCleared).await;
+                                }
                                 teardown_session(
                                     &socket,
                                     lan_tx_sock.as_ref(),
@@ -554,40 +646,43 @@ pub fn spawn_mesh_worker(
                                 room_name.trim().to_string()
                             };
 
-                            let new_sess = init_session(
+                            let mut act_ctx = SessionActivationCtx {
+                                socket: &socket,
+                                lan_tx_sock: lan_tx_sock.as_ref(),
+                                bound_port,
+                                pending_local_avatar: &pending_local_avatar,
+                                local_encoder_backend: &local_encoder_backend,
+                                hevc_decode_supported,
+                                audio_engine: &audio_engine,
+                                tr_tx: &tr_tx,
+                                tr_rx: &mut tr_rx,
+                                evt_tx: &evt_tx,
+                                capture_worker: &mut capture_worker,
+                                video_out_rx: &mut video_out_rx,
+                                decode_handle: &decode_handle,
+                                video_frame_slot: &video_frame_slot,
+                                discovered_lan: &mut discovered_lan,
+                                last_published_lan: &mut last_published_lan,
+                                last_snapshots: &mut last_snapshots,
+                                seal_buf: &mut seal_buf,
+                                relay_buf: &mut relay_buf,
+                                presence: &presence,
+                            };
+                            activate_joined_session(
+                                &mut session,
+                                &mut act_ctx,
                                 rv_addr,
                                 invite,
                                 nickname,
                                 client_uuid,
-                                bound_port,
-                                pending_local_avatar.clone(),
-                                local_encoder_backend.clone(),
-                                hevc_decode_supported,
                                 true,
                                 clean_name,
                                 Some(embedded_rv),
-                                &audio_engine,
-                                &tr_tx,
-                                &mut tr_rx,
-                                &evt_tx,
                             )
                             .await;
-
-                            discovered_lan.remove(&new_sess.invite.room_id);
-                            publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx).await;
-
-                            send_register(&socket, &new_sess).await;
-                            broadcast_lan_announce(lan_tx_sock.as_ref(), &new_sess).await;
-                            stop_capture_worker(&mut capture_worker);
-                            drain_video_out_rx(&mut video_out_rx);
-                            audio_engine.clear_stream_audio();
-                            decode_handle.reset();
-                            clear_video_slot(&video_frame_slot);
-                            last_snapshots.clear();
-                            session = Some(new_sess);
-                            audio_engine.play_cue(SoundCue::Join);
                         }
                         MeshCommand::LeaveRoom => {
+                            pending_short_code_join = None;
                             stop_capture_worker(&mut capture_worker);
                             drain_video_out_rx(&mut video_out_rx);
                             audio_engine.set_share_stream_audio(false);
@@ -596,6 +691,7 @@ pub fn spawn_mesh_worker(
                             clear_video_slot(&video_frame_slot);
                             last_snapshots.clear();
                             if let Some(mut sess) = session.take() {
+                                let had_short_code = sess.active_short_code.take().is_some();
                                 sess.local_preview_enabled = false;
                                 if sess.local_stream_config.take().is_some() {
                                     broadcast_stream_announce(
@@ -619,7 +715,11 @@ pub fn spawn_mesh_worker(
                                 .await;
                                 audio_engine.clear_peers();
                                 audio_engine.play_cue(SoundCue::Leave);
+                                if had_short_code {
+                                    evt_tx.send(MeshEvent::ShortCodeCleared).await;
+                                }
                                 evt_tx.send(MeshEvent::LeftRoom).await;
+                                send_presence_ping(&socket, &presence, false).await;
                             }
                         }
                         MeshCommand::SendChatText { text } => {
@@ -939,6 +1039,213 @@ pub fn spawn_mesh_worker(
                                 release_os_memory();
                             }
                         }
+                        MeshCommand::UpdatePresenceConfig {
+                            rendezvous_server,
+                            nickname,
+                            client_uuid,
+                            identity_secret,
+                            friend_pub_keys,
+                        } => {
+                            let old_rv = presence.rendezvous_addr;
+                            presence.rendezvous_addr = resolve_host(&rendezvous_server).ok();
+                            presence.nickname = sanitize_display_str(
+                                nickname.trim(),
+                                squad_proto::MAX_NICKNAME_LEN,
+                            );
+                            presence.client_uuid = client_uuid;
+                            let sk = StaticSecret::from(identity_secret);
+                            presence.my_pub_key = PublicKey::from(&sk).to_bytes();
+                            presence.identity_secret = Some(sk);
+                            presence.friend_pub_keys = friend_pub_keys;
+                            let before = snapshot_friends(&presence.online_friends);
+                            if old_rv != presence.rendezvous_addr {
+                                presence.online_friends.clear();
+                            } else {
+                                presence
+                                    .online_friends
+                                    .retain(|k, _| presence.friend_pub_keys.contains(k));
+                            }
+                            let after = snapshot_friends(&presence.online_friends);
+                            if before != after {
+                                evt_tx.send(MeshEvent::FriendsStatusUpdated(after)).await;
+                            }
+                            if let Some(sess) = session.as_mut() {
+                                sess.nickname = nickname;
+                            }
+                            send_presence_ping_and_query(&socket, &presence, session.is_some())
+                                .await;
+                        }
+                        MeshCommand::CallOrInviteFriend { target_pub_key } => {
+                            let Some(identity_sk) = presence.identity_secret.as_ref() else {
+                                evt_tx
+                                    .send(MeshEvent::Error(
+                                        "Identity key is not initialized".to_string(),
+                                    ))
+                                    .await;
+                                continue;
+                            };
+                            let (invite, is_party_invite, relay_rv_addr) =
+                                if let Some(sess) = session.as_ref() {
+                                    if sess.embedded_rv.is_some() {
+                                        evt_tx
+                                            .send(MeshEvent::Error(
+                                                "Friend invites require a Rendezvous room rather than a LAN-only hosted room"
+                                                    .to_string(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    }
+                                    (
+                                        sess.invite.clone(),
+                                        true,
+                                        presence.rendezvous_addr.unwrap_or(sess.rendezvous_addr),
+                                    )
+                                } else {
+                                    let Some(rv_addr) = presence.rendezvous_addr else {
+                                        evt_tx
+                                            .send(MeshEvent::Error(
+                                                "Rendezvous server address is not configured"
+                                                    .to_string(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    };
+                                    (InviteLink::generate(), false, rv_addr)
+                                };
+
+                            let (ephemeral_pub_key, nonce, ciphertext) = match seal_friend_invite(
+                                identity_sk,
+                                &target_pub_key,
+                                &invite,
+                                &presence.nickname,
+                                is_party_invite,
+                            ) {
+                                Ok(sealed) => sealed,
+                                Err(e) => {
+                                    evt_tx.send(MeshEvent::Error(e)).await;
+                                    continue;
+                                }
+                            };
+
+                            let pkt = SignalingPacket::C2sRelayFriendInvite {
+                                sender_pub_key: presence.my_pub_key,
+                                target_pub_key,
+                                ephemeral_pub_key,
+                                nonce,
+                                ciphertext,
+                            };
+                            if let Ok(bytes) = pkt.encode() {
+                                let _ = socket.send_to(&bytes, relay_rv_addr).await;
+                            }
+
+                            if !is_party_invite {
+                                pending_short_code_join = None;
+                                let mut act_ctx = SessionActivationCtx {
+                                    socket: &socket,
+                                    lan_tx_sock: lan_tx_sock.as_ref(),
+                                    bound_port,
+                                    pending_local_avatar: &pending_local_avatar,
+                                    local_encoder_backend: &local_encoder_backend,
+                                    hevc_decode_supported,
+                                    audio_engine: &audio_engine,
+                                    tr_tx: &tr_tx,
+                                    tr_rx: &mut tr_rx,
+                                    evt_tx: &evt_tx,
+                                    capture_worker: &mut capture_worker,
+                                    video_out_rx: &mut video_out_rx,
+                                    decode_handle: &decode_handle,
+                                    video_frame_slot: &video_frame_slot,
+                                    discovered_lan: &mut discovered_lan,
+                                    last_published_lan: &mut last_published_lan,
+                                    last_snapshots: &mut last_snapshots,
+                                    seal_buf: &mut seal_buf,
+                                    relay_buf: &mut relay_buf,
+                                    presence: &presence,
+                                };
+                                activate_joined_session(
+                                    &mut session,
+                                    &mut act_ctx,
+                                    relay_rv_addr,
+                                    invite,
+                                    presence.nickname.clone(),
+                                    presence.client_uuid,
+                                    false,
+                                    String::new(),
+                                    None,
+                                )
+                                .await;
+                            }
+                            evt_tx
+                                .send(MeshEvent::FriendInviteSent { target_pub_key })
+                                .await;
+                        }
+                        MeshCommand::GenerateShortCode => {
+                            let Some(sess) = session.as_mut() else {
+                                evt_tx
+                                    .send(MeshEvent::Error(
+                                        "Join a room before generating a 6-digit code".to_string(),
+                                    ))
+                                    .await;
+                                continue;
+                            };
+                            if sess.embedded_rv.is_some() {
+                                evt_tx
+                                    .send(MeshEvent::Error(
+                                        "6-digit voice codes require a Rendezvous room rather than a LAN-only hosted room"
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                continue;
+                            }
+                            let code: u32 = rand::thread_rng().gen_range(100_000..=999_999);
+                            sess.active_short_code =
+                                Some((code, Instant::now() + SHORT_CODE_TTL));
+                            let pkt = SignalingPacket::C2sRegisterShortCode {
+                                room_id: sess.invite.room_id,
+                                host_pub_key: presence.my_pub_key,
+                                code,
+                            };
+                            if let Ok(bytes) = pkt.encode() {
+                                let _ = socket.send_to(&bytes, sess.rendezvous_addr).await;
+                            }
+                        }
+                        MeshCommand::JoinByShortCode {
+                            rendezvous_server,
+                            code,
+                            nickname,
+                            client_uuid,
+                        } => {
+                            let rv_addr = match resolve_host(&rendezvous_server) {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    evt_tx.send(MeshEvent::Error(e)).await;
+                                    continue;
+                                }
+                            };
+                            let (spake2_state, msg_a) = spake2_start_joiner(code);
+                            let lan_addrs = discover_lan_ipv4_addrs(bound_port);
+                            let now = Instant::now();
+                            pending_short_code_join = Some(PendingShortCodeJoin {
+                                code,
+                                rendezvous_addr: rv_addr,
+                                nickname,
+                                client_uuid,
+                                spake2_state: Some(spake2_state),
+                                msg_a: msg_a.clone(),
+                                host_addrs: Vec::new(),
+                                started_at: now,
+                                last_retry_sent: now,
+                            });
+                            let pkt = SignalingPacket::C2sResolveShortCode {
+                                code,
+                                joiner_pub_key: presence.my_pub_key,
+                                joiner_lan_addrs: lan_addrs,
+                                spake2_msg_a: msg_a,
+                            };
+                            if let Ok(bytes) = pkt.encode() {
+                                let _ = socket.send_to(&bytes, rv_addr).await;
+                            }
+                        }
                         MeshCommand::Shutdown => {
                             stop_capture_worker(&mut capture_worker);
                             decode_handle.reset();
@@ -1052,32 +1359,121 @@ pub fn spawn_mesh_worker(
                 }
 
                 Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) => {
-                    let Some(sess) = session.as_mut() else { continue; };
-                    if src_addr == sess.rendezvous_addr {
-                        sess.last_rv_rx = Instant::now();
-                    }
                     let datagram = &mut recv_buf[..len];
+                    if let Some(sess) = session.as_mut() {
+                        if src_addr == sess.rendezvous_addr {
+                            sess.last_rv_rx = Instant::now();
+                        }
+                    }
 
-                    let mut rx_ctx = MeshRxCtx {
-                        socket: &socket,
-                        audio_engine: &audio_engine,
-                        seal_buf: &mut seal_buf,
-                        relay_buf: &mut relay_buf,
-                        tr_tx: &tr_tx,
-                        evt_tx: &evt_tx,
-                        capture_worker: &mut capture_worker,
-                        video_out_tx: &video_out_tx,
-                        video_frame_slot: &video_frame_slot,
-                        video_notify: &video_notify,
-                        decode_handle: &decode_handle,
-                        lan_tx_sock: lan_tx_sock.as_ref(),
-                    };
-                    if is_relay_datagram(datagram) {
+                    if is_spake2_datagram(datagram) {
+                        if let Ok(spkt) = Spake2Packet::decode(datagram) {
+                            match spkt {
+                                Spake2Packet::HostReply {
+                                    code,
+                                    spake2_msg_b,
+                                    nonce,
+                                    encrypted_invite,
+                                } => {
+                                    if pending_short_code_join
+                                        .as_ref()
+                                        .is_some_and(|p| p.code == code)
+                                    {
+                                        if let Some(mut pending) = pending_short_code_join.take() {
+                                            if let Some(st) = pending.spake2_state.take() {
+                                                match spake2_joiner_open_invite(
+                                                    st,
+                                                    code,
+                                                    &spake2_msg_b,
+                                                    &nonce,
+                                                    &encrypted_invite,
+                                                ) {
+                                                    Ok(invite) => {
+                                                        let mut act_ctx = SessionActivationCtx {
+                                                            socket: &socket,
+                                                            lan_tx_sock: lan_tx_sock.as_ref(),
+                                                            bound_port,
+                                                            pending_local_avatar: &pending_local_avatar,
+                                                            local_encoder_backend: &local_encoder_backend,
+                                                            hevc_decode_supported,
+                                                            audio_engine: &audio_engine,
+                                                            tr_tx: &tr_tx,
+                                                            tr_rx: &mut tr_rx,
+                                                            evt_tx: &evt_tx,
+                                                            capture_worker: &mut capture_worker,
+                                                            video_out_rx: &mut video_out_rx,
+                                                            decode_handle: &decode_handle,
+                                                            video_frame_slot: &video_frame_slot,
+                                                            discovered_lan: &mut discovered_lan,
+                                                            last_published_lan: &mut last_published_lan,
+                                                            last_snapshots: &mut last_snapshots,
+                                                            seal_buf: &mut seal_buf,
+                                                            relay_buf: &mut relay_buf,
+                                                            presence: &presence,
+                                                        };
+                                                        activate_joined_session(
+                                                            &mut session,
+                                                            &mut act_ctx,
+                                                            pending.rendezvous_addr,
+                                                            invite,
+                                                            pending.nickname,
+                                                            pending.client_uuid,
+                                                            false,
+                                                            String::new(),
+                                                            None,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(err) => {
+                                                        evt_tx
+                                                            .send(MeshEvent::Error(format!(
+                                                                "6-digit code verification failed: {err}"
+                                                            )))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                Spake2Packet::JoinerRetry {
+                                    code,
+                                    spake2_msg_a,
+                                } => {
+                                    if let Some(sess) = session.as_mut() {
+                                        try_host_spake2_reply(
+                                            &socket,
+                                            sess,
+                                            code,
+                                            &spake2_msg_a,
+                                            &[src_addr],
+                                        )
+                                        .await;
+                                    }
+                                }
+                            }
+                        }
+                    } else if is_relay_datagram(datagram) {
+                        let Some(sess) = session.as_mut() else { continue; };
                         if src_addr == sess.rendezvous_addr {
                             if let Some((room_id, relay_sender_pid)) =
                                 parse_relay_header(datagram).ok().map(|(r, p, _)| (r, p))
                             {
                                 if room_id == sess.invite.room_id {
+                                    let mut rx_ctx = MeshRxCtx {
+                                        socket: &socket,
+                                        audio_engine: &audio_engine,
+                                        seal_buf: &mut seal_buf,
+                                        relay_buf: &mut relay_buf,
+                                        tr_tx: &tr_tx,
+                                        evt_tx: &evt_tx,
+                                        capture_worker: &mut capture_worker,
+                                        video_out_tx: &video_out_tx,
+                                        video_frame_slot: &video_frame_slot,
+                                        video_notify: &video_notify,
+                                        decode_handle: &decode_handle,
+                                        lan_tx_sock: lan_tx_sock.as_ref(),
+                                    };
                                     handle_p2p_rx(
                                         &socket,
                                         &mut datagram[RELAY_HEADER_LEN..],
@@ -1093,12 +1489,79 @@ pub fn spawn_mesh_worker(
                             }
                         }
                     } else if is_peer_relay_datagram(datagram) {
+                        let Some(sess) = session.as_mut() else { continue; };
+                        let mut rx_ctx = MeshRxCtx {
+                            socket: &socket,
+                            audio_engine: &audio_engine,
+                            seal_buf: &mut seal_buf,
+                            relay_buf: &mut relay_buf,
+                            tr_tx: &tr_tx,
+                            evt_tx: &evt_tx,
+                            capture_worker: &mut capture_worker,
+                            video_out_tx: &video_out_tx,
+                            video_frame_slot: &video_frame_slot,
+                            video_notify: &video_notify,
+                            decode_handle: &decode_handle,
+                            lan_tx_sock: lan_tx_sock.as_ref(),
+                        };
                         handle_peer_relay_datagram(&socket, datagram, src_addr, sess, &mut rx_ctx)
                             .await;
                         forward_transfer_events(&mut tr_rx, &evt_tx).await;
-                    } else if src_addr == sess.rendezvous_addr {
-                        handle_signaling_rx(datagram, sess, &mut rx_ctx).await;
+                    } else if Some(src_addr) == presence.rendezvous_addr
+                        || pending_short_code_join
+                            .as_ref()
+                            .is_some_and(|p| p.rendezvous_addr == src_addr)
+                        || session.as_ref().is_some_and(|s| src_addr == s.rendezvous_addr)
+                    {
+                        if let Ok(pkt) = SignalingPacket::decode(datagram) {
+                            let handled = handle_global_signaling_packet(
+                                &pkt,
+                                &socket,
+                                &audio_engine,
+                                &evt_tx,
+                                &mut presence,
+                                &mut session,
+                                &mut pending_short_code_join,
+                            )
+                            .await;
+                            if !handled {
+                                if let Some(sess) = session.as_mut() {
+                                    if src_addr == sess.rendezvous_addr {
+                                        let mut rx_ctx = MeshRxCtx {
+                                            socket: &socket,
+                                            audio_engine: &audio_engine,
+                                            seal_buf: &mut seal_buf,
+                                            relay_buf: &mut relay_buf,
+                                            tr_tx: &tr_tx,
+                                            evt_tx: &evt_tx,
+                                            capture_worker: &mut capture_worker,
+                                            video_out_tx: &video_out_tx,
+                                            video_frame_slot: &video_frame_slot,
+                                            video_notify: &video_notify,
+                                            decode_handle: &decode_handle,
+                                            lan_tx_sock: lan_tx_sock.as_ref(),
+                                        };
+                                        handle_signaling_rx(datagram, sess, &mut rx_ctx).await;
+                                    }
+                                }
+                            }
+                        }
                     } else {
+                        let Some(sess) = session.as_mut() else { continue; };
+                        let mut rx_ctx = MeshRxCtx {
+                            socket: &socket,
+                            audio_engine: &audio_engine,
+                            seal_buf: &mut seal_buf,
+                            relay_buf: &mut relay_buf,
+                            tr_tx: &tr_tx,
+                            evt_tx: &evt_tx,
+                            capture_worker: &mut capture_worker,
+                            video_out_tx: &video_out_tx,
+                            video_frame_slot: &video_frame_slot,
+                            video_notify: &video_notify,
+                            decode_handle: &decode_handle,
+                            lan_tx_sock: lan_tx_sock.as_ref(),
+                        };
                         handle_p2p_rx(
                             &socket,
                             datagram,
@@ -1356,11 +1819,35 @@ pub fn spawn_mesh_worker(
                 }
 
                 _ = punch_tick.tick() => {
+                    let now = Instant::now();
+                    if let Some(pending) = pending_short_code_join.as_mut() {
+                        if now.duration_since(pending.started_at) >= SHORT_CODE_JOIN_TIMEOUT {
+                            pending_short_code_join = None;
+                            evt_tx
+                                .send(MeshEvent::Error(
+                                    "Timed out connecting with 6-digit voice code".to_string(),
+                                ))
+                                .await;
+                        } else if !pending.host_addrs.is_empty()
+                            && now.duration_since(pending.last_retry_sent) >= SHORT_CODE_RETRY_INTERVAL
+                        {
+                            pending.last_retry_sent = now;
+                            let pkt = Spake2Packet::JoinerRetry {
+                                code: pending.code,
+                                spake2_msg_a: pending.msg_a.clone(),
+                            };
+                            if let Ok(bytes) = pkt.encode() {
+                                for &addr in &pending.host_addrs {
+                                    let _ = socket.send_to(&bytes, addr).await;
+                                }
+                            }
+                        }
+                    }
+
                     let Some(sess) = session.as_mut() else { continue; };
                     if sess.local_peer_id == 0 {
                         continue;
                     }
-                    let now = Instant::now();
                     let now_us = now_micros();
                     let mut relay_fallback_peers = Vec::new();
                     let mut degraded_to_server_relay = Vec::new();
@@ -1624,6 +2111,28 @@ pub fn spawn_mesh_worker(
                     } else if !last_snapshots.is_empty() {
                         last_snapshots.clear();
                     }
+                }
+
+                _ = presence_tick.tick() => {
+                    let now = Instant::now();
+                    if let Some(sess) = session.as_mut() {
+                        if sess
+                            .active_short_code
+                            .is_some_and(|(_, expires_at)| now >= expires_at)
+                        {
+                            sess.active_short_code = None;
+                            evt_tx.send(MeshEvent::ShortCodeCleared).await;
+                        }
+                    }
+                    let before = snapshot_friends(&presence.online_friends);
+                    presence
+                        .online_friends
+                        .retain(|_, (_, _, seen_at)| now.duration_since(*seen_at) <= PRESENCE_UI_TTL);
+                    let after = snapshot_friends(&presence.online_friends);
+                    if before != after {
+                        evt_tx.send(MeshEvent::FriendsStatusUpdated(after)).await;
+                    }
+                    send_presence_ping_and_query(&socket, &presence, session.is_some()).await;
                 }
             }
         }
@@ -3286,6 +3795,8 @@ async fn init_session(
         migration_claimed_at: None,
         last_mesh_reachability_sent: Instant::now() - MESH_REACHABILITY_INTERVAL,
         last_advertised_direct_peers: Vec::new(),
+        active_short_code: None,
+        last_spake2_reply_times: Vec::new(),
     }
 }
 
@@ -3448,6 +3959,357 @@ async fn recv_lan_opt(sock: Option<&UdpSocket>, buf: &mut [u8]) -> Option<(usize
     match sock {
         Some(s) => s.recv_from(buf).await.ok(),
         None => std::future::pending().await,
+    }
+}
+
+struct SessionActivationCtx<'a> {
+    socket: &'a UdpSocket,
+    lan_tx_sock: Option<&'a UdpSocket>,
+    bound_port: u16,
+    pending_local_avatar: &'a Option<([u8; 32], Vec<u8>)>,
+    local_encoder_backend: &'a str,
+    hevc_decode_supported: bool,
+    audio_engine: &'a AudioEngineHandle,
+    tr_tx: &'a mpsc::Sender<TransferEvent>,
+    tr_rx: &'a mut mpsc::Receiver<TransferEvent>,
+    evt_tx: &'a NotifyingEventTx,
+    capture_worker: &'a mut Option<CaptureWorkerHandle>,
+    video_out_rx: &'a mut mpsc::Receiver<Vec<VideoPacketOut>>,
+    decode_handle: &'a VideoDecodeHandle,
+    video_frame_slot: &'a Arc<Mutex<Option<DecodedVideoFrame>>>,
+    discovered_lan: &'a mut HashMap<RoomId, (DiscoveredLanRoom, Instant)>,
+    last_published_lan: &'a mut Vec<DiscoveredLanRoom>,
+    last_snapshots: &'a mut Vec<PeerUiSnapshot>,
+    seal_buf: &'a mut Vec<u8>,
+    relay_buf: &'a mut Vec<u8>,
+    presence: &'a PresenceWorkerState,
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn activate_joined_session(
+    session: &mut Option<ActiveSession>,
+    ctx: &mut SessionActivationCtx<'_>,
+    rv_addr: SocketAddr,
+    invite: InviteLink,
+    nickname: String,
+    client_uuid: ClientUuid,
+    is_lan_room: bool,
+    room_name: String,
+    embedded_rv: Option<EmbeddedRendezvousHandle>,
+) {
+    if let Some(old_sess) = session.take() {
+        if old_sess.active_short_code.is_some() {
+            ctx.evt_tx.send(MeshEvent::ShortCodeCleared).await;
+        }
+        teardown_session(
+            ctx.socket,
+            ctx.lan_tx_sock,
+            old_sess,
+            ctx.seal_buf,
+            ctx.relay_buf,
+            true,
+        )
+        .await;
+    }
+
+    let new_sess = init_session(
+        rv_addr,
+        invite,
+        nickname,
+        client_uuid,
+        ctx.bound_port,
+        ctx.pending_local_avatar.clone(),
+        ctx.local_encoder_backend.to_string(),
+        ctx.hevc_decode_supported,
+        is_lan_room,
+        room_name,
+        embedded_rv,
+        ctx.audio_engine,
+        ctx.tr_tx,
+        ctx.tr_rx,
+        ctx.evt_tx,
+    )
+    .await;
+
+    ctx.discovered_lan.remove(&new_sess.invite.room_id);
+    publish_lan_rooms(ctx.discovered_lan, ctx.last_published_lan, ctx.evt_tx).await;
+
+    send_register(ctx.socket, &new_sess).await;
+    if new_sess.embedded_rv.is_some() {
+        broadcast_lan_announce(ctx.lan_tx_sock, &new_sess).await;
+    }
+    stop_capture_worker(ctx.capture_worker);
+    drain_video_out_rx(ctx.video_out_rx);
+    ctx.audio_engine.clear_stream_audio();
+    ctx.decode_handle.reset();
+    clear_video_slot(ctx.video_frame_slot);
+    ctx.last_snapshots.clear();
+    *session = Some(new_sess);
+    ctx.audio_engine.play_cue(SoundCue::Join);
+    send_presence_ping(ctx.socket, ctx.presence, true).await;
+}
+
+fn snapshot_friends(map: &HashMap<[u8; 32], (String, bool, Instant)>) -> Vec<FriendPresenceUi> {
+    let mut out: Vec<FriendPresenceUi> = map
+        .iter()
+        .map(|(&pub_key, (nickname, in_room, _))| FriendPresenceUi {
+            pub_key,
+            nickname: nickname.clone(),
+            online: true,
+            in_room: *in_room,
+        })
+        .collect();
+    out.sort_by_key(|f| f.pub_key);
+    out
+}
+
+async fn send_presence_ping(
+    socket: &UdpSocket,
+    presence: &PresenceWorkerState,
+    in_room: bool,
+) {
+    let Some(rv_addr) = presence.rendezvous_addr else {
+        return;
+    };
+    if presence.nickname.is_empty() && presence.identity_secret.is_none() {
+        return;
+    }
+    let ping = SignalingPacket::C2sPresencePing {
+        pub_key: presence.my_pub_key,
+        nickname: presence.nickname.clone(),
+        in_room,
+    };
+    if let Ok(bytes) = ping.encode() {
+        let _ = socket.send_to(&bytes, rv_addr).await;
+    }
+}
+
+async fn send_presence_ping_and_query(
+    socket: &UdpSocket,
+    presence: &PresenceWorkerState,
+    in_room: bool,
+) {
+    let Some(rv_addr) = presence.rendezvous_addr else {
+        return;
+    };
+    send_presence_ping(socket, presence, in_room).await;
+    for chunk in presence.friend_pub_keys.chunks(MAX_QUERY_FRIENDS_PER_PACKET) {
+        let query = SignalingPacket::C2sQueryFriends {
+            friend_pub_keys: chunk.to_vec(),
+        };
+        if let Ok(bytes) = query.encode() {
+            let _ = socket.send_to(&bytes, rv_addr).await;
+        }
+    }
+}
+
+async fn try_host_spake2_reply(
+    socket: &UdpSocket,
+    sess: &mut ActiveSession,
+    code: u32,
+    spake2_msg_a: &[u8],
+    dest_addrs: &[SocketAddr],
+) {
+    let now = Instant::now();
+    let Some((active_code, expires_at)) = sess.active_short_code else {
+        return;
+    };
+    if active_code != code || now >= expires_at {
+        return;
+    }
+    sess.last_spake2_reply_times
+        .retain(|t| now.duration_since(*t) < Duration::from_secs(1));
+    if sess.last_spake2_reply_times.len() >= SPAKE2_HOST_MAX_REPLIES_PER_SEC {
+        return;
+    }
+    sess.last_spake2_reply_times.push(now);
+
+    match spake2_host_seal_invite(code, spake2_msg_a, &sess.invite) {
+        Ok((spake2_msg_b, nonce, encrypted_invite)) => {
+            let reply = Spake2Packet::HostReply {
+                code,
+                spake2_msg_b,
+                nonce,
+                encrypted_invite,
+            };
+            if let Ok(bytes) = reply.encode() {
+                for &addr in dest_addrs {
+                    let _ = socket.send_to(&bytes, addr).await;
+                }
+            }
+        }
+        Err(e) => {
+            debug!("SPAKE2 host seal failed for short code challenge: {e}");
+        }
+    }
+}
+
+async fn handle_global_signaling_packet(
+    pkt: &SignalingPacket,
+    socket: &UdpSocket,
+    audio_engine: &AudioEngineHandle,
+    evt_tx: &NotifyingEventTx,
+    presence: &mut PresenceWorkerState,
+    session: &mut Option<ActiveSession>,
+    pending_short_code_join: &mut Option<PendingShortCodeJoin>,
+) -> bool {
+    match pkt {
+        SignalingPacket::S2cFriendsStatus { online_friends } => {
+            let before = snapshot_friends(&presence.online_friends);
+            let now = Instant::now();
+            if presence.friend_pub_keys.len() <= MAX_QUERY_FRIENDS_PER_PACKET
+                && online_friends.len() < MAX_FRIENDS_STATUS_PER_PACKET
+            {
+                presence.online_friends.clear();
+            }
+            for info in online_friends {
+                if presence.friend_pub_keys.contains(&info.pub_key) {
+                    presence.online_friends.insert(
+                        info.pub_key,
+                        (info.nickname.clone(), info.in_room, now),
+                    );
+                }
+            }
+            presence
+                .online_friends
+                .retain(|_, (_, _, seen_at)| now.duration_since(*seen_at) <= PRESENCE_UI_TTL);
+            let after = snapshot_friends(&presence.online_friends);
+            if before != after {
+                evt_tx.send(MeshEvent::FriendsStatusUpdated(after)).await;
+            }
+            true
+        }
+        SignalingPacket::S2cIncomingFriendInvite {
+            sender_pub_key,
+            ephemeral_pub_key,
+            nonce,
+            ciphertext,
+        } => {
+            if *sender_pub_key == presence.my_pub_key {
+                return true;
+            }
+            let Some(sk) = presence.identity_secret.as_ref() else {
+                return true;
+            };
+            match open_friend_invite(sk, sender_pub_key, ephemeral_pub_key, nonce, ciphertext) {
+                Ok(dec) => {
+                    let is_known_friend = presence.friend_pub_keys.contains(sender_pub_key);
+                    audio_engine.play_cue(SoundCue::IncomingCall);
+                    evt_tx
+                        .send(MeshEvent::IncomingFriendCall(IncomingFriendCallUi {
+                            sender_pub_key: *sender_pub_key,
+                            sender_nickname: dec.sender_nickname,
+                            invite: dec.invite,
+                            is_party_invite: dec.is_party_invite,
+                            is_known_friend,
+                        }))
+                        .await;
+                }
+                Err(e) => {
+                    warn!("Ignored incoming friend invite that failed X25519 AEAD verification: {e}");
+                }
+            }
+            true
+        }
+        SignalingPacket::S2cShortCodeRegistered {
+            code,
+            expires_in_secs,
+        } => {
+            if let Some(sess) = session.as_mut() {
+                sess.active_short_code =
+                    Some((*code, Instant::now() + Duration::from_secs(*expires_in_secs as u64)));
+            }
+            evt_tx
+                .send(MeshEvent::ShortCodeGenerated {
+                    code: *code,
+                    expires_in_secs: *expires_in_secs,
+                })
+                .await;
+            true
+        }
+        SignalingPacket::S2cShortCodeChallenge {
+            code,
+            joiner_pub_key: _,
+            joiner_public_addr,
+            joiner_lan_addrs,
+            spake2_msg_a,
+        } => {
+            if let Some(sess) = session.as_mut() {
+                let mut dest_addrs = Vec::with_capacity(1 + joiner_lan_addrs.len());
+                dest_addrs.push(*joiner_public_addr);
+                for lan in joiner_lan_addrs {
+                    let sa = SocketAddr::V4(*lan);
+                    if !dest_addrs.contains(&sa) {
+                        dest_addrs.push(sa);
+                    }
+                }
+                try_host_spake2_reply(socket, sess, *code, spake2_msg_a, &dest_addrs).await;
+            }
+            true
+        }
+        SignalingPacket::S2cShortCodeJoinerInfo {
+            code,
+            host_pub_key: _,
+            host_public_addr,
+            host_lan_addrs,
+        } => {
+            if let Some(pending) = pending_short_code_join.as_mut() {
+                if pending.code == *code {
+                    let mut addrs = Vec::with_capacity(1 + host_lan_addrs.len());
+                    addrs.push(*host_public_addr);
+                    for lan in host_lan_addrs {
+                        let sa = SocketAddr::V4(*lan);
+                        if !addrs.contains(&sa) {
+                            addrs.push(sa);
+                        }
+                    }
+                    pending.host_addrs = addrs;
+                    pending.last_retry_sent = Instant::now();
+                    let retry = Spake2Packet::JoinerRetry {
+                        code: pending.code,
+                        spake2_msg_a: pending.msg_a.clone(),
+                    };
+                    if let Ok(bytes) = retry.encode() {
+                        for &addr in &pending.host_addrs {
+                            let _ = socket.send_to(&bytes, addr).await;
+                        }
+                    }
+                }
+            }
+            true
+        }
+        SignalingPacket::S2cError { code } => match code {
+            SignalingErrorCode::FriendOffline => {
+                evt_tx
+                    .send(MeshEvent::Error("Friend is offline or unreachable".to_string()))
+                    .await;
+                true
+            }
+            SignalingErrorCode::InvalidShortCode => {
+                if pending_short_code_join.take().is_some() {
+                    evt_tx
+                        .send(MeshEvent::Error(
+                            "Invalid or expired 6-digit voice code".to_string(),
+                        ))
+                        .await;
+                }
+                true
+            }
+            SignalingErrorCode::RateLimited => {
+                if pending_short_code_join.take().is_some() {
+                    evt_tx
+                        .send(MeshEvent::Error(
+                            "Too many wrong code attempts. Please wait 60 seconds.".to_string(),
+                        ))
+                        .await;
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        },
+        _ => false,
     }
 }
 
@@ -3631,6 +4493,8 @@ mod tests {
                 migration_claimed_at: None,
                 last_mesh_reachability_sent: now - MESH_REACHABILITY_INTERVAL,
                 last_advertised_direct_peers: Vec::new(),
+                active_short_code: None,
+                last_spake2_reply_times: Vec::new(),
             }
         };
 

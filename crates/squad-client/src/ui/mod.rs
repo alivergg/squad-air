@@ -893,6 +893,11 @@ impl SquadApp {
                             MeshEvent::LanRoomsUpdated(rooms) => {
                                 self.lan_rooms = rooms;
                             }
+                            MeshEvent::FriendsStatusUpdated(_)
+                            | MeshEvent::IncomingFriendCall(_)
+                            | MeshEvent::ShortCodeGenerated { .. }
+                            | MeshEvent::ShortCodeCleared
+                            | MeshEvent::FriendInviteSent { .. } => {}
                             MeshEvent::Error(err) => {
                                 self.status_banner = Some(err);
                             }

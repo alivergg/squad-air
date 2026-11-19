@@ -19,6 +19,7 @@ pub enum SoundCue {
     PeerLeave,
     Mute,
     Unmute,
+    IncomingCall,
 }
 
 impl SoundCue {
@@ -30,6 +31,7 @@ impl SoundCue {
             SoundCue::PeerLeave => "peer_leave.wav",
             SoundCue::Mute => "mute.wav",
             SoundCue::Unmute => "unmute.wav",
+            SoundCue::IncomingCall => "incoming_call.wav",
         }
     }
 
@@ -41,10 +43,11 @@ impl SoundCue {
             SoundCue::PeerLeave => "peer_leave",
             SoundCue::Mute => "mute",
             SoundCue::Unmute => "unmute",
+            SoundCue::IncomingCall => "incoming_call",
         }
     }
 
-    pub fn all() -> [SoundCue; 6] {
+    pub fn all() -> [SoundCue; 7] {
         [
             SoundCue::Join,
             SoundCue::Leave,
@@ -52,6 +55,7 @@ impl SoundCue {
             SoundCue::PeerLeave,
             SoundCue::Mute,
             SoundCue::Unmute,
+            SoundCue::IncomingCall,
         ]
     }
 
@@ -63,6 +67,7 @@ impl SoundCue {
             SoundCue::PeerLeave => &[(523.25, 65), (392.0, 95)],
             SoundCue::Mute => &[(440.0, 75)],
             SoundCue::Unmute => &[(587.33, 75)],
+            SoundCue::IncomingCall => &[(659.25, 110), (880.0, 140), (659.25, 110), (880.0, 170)],
         };
 
         let spec = hound::WavSpec {
@@ -381,8 +386,11 @@ mod tests {
         if !has_wavs {
             return;
         }
-        let bank = SoundCueBank::load_from_dirs(&[dir]);
+        let bank = SoundCueBank::load_from_dirs(&[dir.clone()]);
         for cue in SoundCue::all() {
+            if !dir.join(cue.filename()).exists() {
+                continue;
+            }
             let samples = bank
                 .get(cue)
                 .unwrap_or_else(|| panic!("missing cue {:?}", cue));

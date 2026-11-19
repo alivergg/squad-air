@@ -63,6 +63,8 @@ pub struct AppConfig {
     pub overlay_opacity: f32,
     #[serde(default)]
     pub skipped_update_version: Option<String>,
+    #[serde(default = "generate_identity_secret_b58")]
+    pub identity_secret_b58: String,
 }
 
 impl Default for AppConfig {
@@ -93,6 +95,7 @@ impl Default for AppConfig {
             overlay_speaking_only: false,
             overlay_opacity: default_overlay_opacity(),
             skipped_update_version: None,
+            identity_secret_b58: generate_identity_secret_b58(),
         }
     }
 }
@@ -113,7 +116,13 @@ impl AppConfig {
 
         if path.exists() {
             if let Ok(contents) = fs::read_to_string(&path) {
-                if let Ok(cfg) = toml::from_str::<Self>(&contents) {
+                if let Ok(mut cfg) = toml::from_str::<Self>(&contents) {
+                    if decode_identity_secret(&cfg.identity_secret_b58).is_none() {
+                        cfg.identity_secret_b58 = generate_identity_secret_b58();
+                        let _ = cfg.save();
+                    } else if !contents.contains("identity_secret_b58") {
+                        let _ = cfg.save();
+                    }
                     return cfg;
                 }
                 if !contents.trim().is_empty() {
@@ -131,51 +140,17 @@ impl AppConfig {
         let Some(path) = Self::config_path() else {
             return Ok(());
         };
-        if let Some(parent) = path.parent() {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
-                fs::DirBuilder::new()
-                    .recursive(true)
-                    .mode(0o700)
-                    .create(parent)?;
-                let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
-            }
-            #[cfg(not(unix))]
-            {
-                fs::create_dir_all(parent)?;
-            }
-        }
         let body = toml::to_string_pretty(self)?;
-        let tmp_path = path.with_extension("toml.tmp");
-        let mut opts = fs::OpenOptions::new();
-        opts.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let mut file = opts.open(&tmp_path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
-        }
-        let write_res = (|| -> Result<()> {
-            file.write_all(body.as_bytes())?;
-            file.sync_all()?;
-            Ok(())
-        })();
-        drop(file);
-        if let Err(err) = write_res {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err);
-        }
-        if let Err(err) = fs::rename(&tmp_path, &path) {
-            let _ = fs::remove_file(&tmp_path);
-            return Err(err.into());
-        }
-        Ok(())
+        write_file_private(&path, body.as_bytes())
+    }
+
+    pub fn identity_secret(&self) -> x25519_dalek::StaticSecret {
+        decode_identity_secret(&self.identity_secret_b58)
+            .unwrap_or_else(|| x25519_dalek::StaticSecret::from([0x42u8; 32]))
+    }
+
+    pub fn identity_pub_key(&self) -> [u8; 32] {
+        x25519_dalek::PublicKey::from(&self.identity_secret()).to_bytes()
     }
 
     pub fn client_uuid(&self) -> ClientUuid {
@@ -258,6 +233,69 @@ fn default_overlay_opacity() -> f32 {
 
 fn uuid_key(client_uuid: &ClientUuid) -> String {
     Uuid::from_bytes(*client_uuid).to_string()
+}
+
+pub(crate) fn write_file_private(path: &std::path::Path, body: &[u8]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+            fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+        }
+        #[cfg(not(unix))]
+        {
+            fs::create_dir_all(parent)?;
+        }
+    }
+    let tmp_ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| format!("{e}.tmp"))
+        .unwrap_or_else(|| "tmp".to_string());
+    let tmp_path = path.with_extension(tmp_ext);
+    let mut opts = fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut file = opts.open(&tmp_path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = file.set_permissions(fs::Permissions::from_mode(0o600));
+    }
+    let write_res = (|| -> Result<()> {
+        file.write_all(body)?;
+        file.sync_all()?;
+        Ok(())
+    })();
+    drop(file);
+    if let Err(err) = write_res {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err);
+    }
+    if let Err(err) = fs::rename(&tmp_path, path) {
+        let _ = fs::remove_file(&tmp_path);
+        return Err(err.into());
+    }
+    Ok(())
+}
+
+fn generate_identity_secret_b58() -> String {
+    let secret = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
+    bs58::encode(secret.to_bytes()).into_string()
+}
+
+fn decode_identity_secret(raw: &str) -> Option<x25519_dalek::StaticSecret> {
+    let decoded = bs58::decode(raw.trim()).into_vec().ok()?;
+    let bytes: [u8; 32] = decoded.try_into().ok()?;
+    Some(x25519_dalek::StaticSecret::from(bytes))
 }
 
 fn generate_default_nickname() -> String {
