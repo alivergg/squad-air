@@ -7,7 +7,7 @@ use crate::ui::{
         canvas_panel_style, floating_dock_style, m3_slider_style, m3_text_input_style,
         peer_card_style, pill_chip_button, pill_danger_button, pill_primary_button,
         pill_success_button, pill_tonal_button, surface_card_style, M3_ERROR, M3_ON_PRIMARY,
-        M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+        M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_WARNING,
     },
     Message, SquadApp,
 };
@@ -61,6 +61,14 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             .padding([4, 10])
             .style(canvas_panel_style),
         );
+
+    if app.active_lan_locked {
+        left_header = left_header.push(
+            container(text("LAN • Locked").size(11).color(M3_WARNING))
+                .padding([4, 10])
+                .style(canvas_panel_style),
+        );
+    }
 
     let online_friends_count = app
         .friends

@@ -11,15 +11,37 @@ use tracing::{info, warn};
 
 pub const DEFAULT_RENDEZVOUS_PORT: u16 = 3478;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct DiscoveredLanRoom {
     pub room_id: RoomId,
-    pub secret: [u8; 32],
+    pub secret: Option<[u8; 32]>,
     pub host_addr: SocketAddr,
+    pub auth_addr: Option<SocketAddr>,
     pub room_name: String,
     pub host_nickname: String,
     pub peer_count: u8,
     pub max_peers: u8,
+}
+
+impl DiscoveredLanRoom {
+    pub fn requires_password(&self) -> bool {
+        self.secret.is_none()
+    }
+}
+
+impl std::fmt::Debug for DiscoveredLanRoom {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DiscoveredLanRoom")
+            .field("room_id", &self.room_id)
+            .field("secret", &self.secret.map(|_| "[REDACTED]"))
+            .field("host_addr", &self.host_addr)
+            .field("auth_addr", &self.auth_addr)
+            .field("room_name", &self.room_name)
+            .field("host_nickname", &self.host_nickname)
+            .field("peer_count", &self.peer_count)
+            .field("max_peers", &self.max_peers)
+            .finish()
+    }
 }
 
 pub struct EmbeddedRendezvousHandle {

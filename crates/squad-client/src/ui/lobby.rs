@@ -165,13 +165,25 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     .padding(20)
     .style(surface_card_style);
 
-    let create_card =
-        container(
-            column![
+    let host_btn_label = if app.lan_room_password_input.trim().is_empty() {
+        "Host LAN Room"
+    } else {
+        "Host Locked LAN Room"
+    };
+    let host_eye_label = if app.lan_host_password_visible {
+        "Hide"
+    } else {
+        "Show"
+    };
+
+    let create_card = container(
+        column![
             text("Start a Private Room").size(18),
-            text("Create an internet room by link or host a zero-config room directly on your LAN.")
-                .size(13)
-                .color(M3_ON_SURFACE_VARIANT),
+            text(
+                "Create an internet room by link or host a zero-config room directly on your LAN."
+            )
+            .size(13)
+            .color(M3_ON_SURFACE_VARIANT),
             vertical_space().height(4),
             button(
                 text("Create Room & Copy Invite")
@@ -186,22 +198,36 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                 text_input("LAN room name (optional)", &app.lan_room_name_input)
                     .on_input(Message::LanRoomNameChanged)
                     .on_submit(Message::HostLanRoom)
+                    .width(Length::FillPortion(5))
                     .padding(10)
                     .size(13)
                     .style(m3_text_input_style),
-                button(text("Host LAN Room").size(13))
-                    .padding([10, 18])
+                text_input("Password (optional)", &app.lan_room_password_input)
+                    .on_input(Message::LanRoomPasswordChanged)
+                    .on_submit(Message::HostLanRoom)
+                    .secure(!app.lan_host_password_visible)
+                    .width(Length::FillPortion(5))
+                    .padding(10)
+                    .size(13)
+                    .style(m3_text_input_style),
+                button(text(host_eye_label).size(12))
+                    .padding([10, 12])
                     .style(pill_tonal_button)
-                    .on_press(Message::HostLanRoom),
+                    .on_press(Message::ToggleLanHostPasswordVisible),
             ]
-            .spacing(10)
+            .spacing(8)
             .align_y(Vertical::Center),
+            button(text(host_btn_label).size(13).align_x(Horizontal::Center))
+                .width(Length::Fill)
+                .padding([10, 18])
+                .style(pill_tonal_button)
+                .on_press(Message::HostLanRoom),
         ]
-            .spacing(10),
-        )
-        .width(Length::Fill)
-        .padding(22)
-        .style(surface_card_style);
+        .spacing(10),
+    )
+    .width(Length::Fill)
+    .padding(22)
+    .style(surface_card_style);
 
     let join_card = container(
         column![
@@ -253,21 +279,37 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         );
     } else {
         for room in &app.lan_rooms {
+            let is_locked = room.requires_password();
             let room_clone = room.clone();
             let subtitle = format!(
                 "Host: {}  •  {}/{} online  •  {}",
                 room.host_nickname, room.peer_count, room.max_peers, room.host_addr
             );
+            let mut title_row = row![text(&room.room_name).size(14)]
+                .spacing(8)
+                .align_y(Vertical::Center);
+            if is_locked {
+                title_row = title_row.push(
+                    container(text("LOCKED").size(10).color(M3_WARNING))
+                        .padding([2, 7])
+                        .style(surface_card_style),
+                );
+            }
+            let join_label = if is_locked {
+                "Unlock & Join"
+            } else {
+                "Join LAN"
+            };
             let lan_row = container(
                 row![
                     avatar_circle(app.avatars.room_handle_for(&room.room_id), 32.0, false),
                     column![
-                        text(&room.room_name).size(14),
+                        title_row,
                         text(subtitle).size(11).color(M3_ON_SURFACE_VARIANT),
                     ]
                     .spacing(2)
                     .width(Length::Fill),
-                    button(text("Join LAN").size(12))
+                    button(text(join_label).size(12))
                         .padding([8, 16])
                         .style(pill_primary_button)
                         .on_press(Message::JoinLanRoom(room_clone)),

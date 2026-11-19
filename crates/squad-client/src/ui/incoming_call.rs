@@ -1,5 +1,5 @@
 use crate::crypto_identity::format_friend_code;
-use crate::net::IncomingFriendCallUi;
+use crate::net::{DiscoveredLanRoom, IncomingFriendCallUi};
 use crate::ui::components::avatar_circle;
 use crate::ui::theme::{
     canvas_panel_style, m3_text_input_style, pill_danger_button, pill_primary_button,
@@ -314,6 +314,102 @@ pub fn view_invite_friends_modal(app: &SquadApp) -> Element<'_, Message> {
     .max_width(460)
     .padding(24)
     .style(modal_card_style);
+
+    container(card)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .center_x(Length::Fill)
+        .center_y(Length::Fill)
+        .padding(24)
+        .style(backdrop_style)
+        .into()
+}
+
+pub fn view_lan_password_modal<'a>(
+    app: &'a SquadApp,
+    room: &'a DiscoveredLanRoom,
+) -> Element<'a, Message> {
+    let eye_label = if app.lan_join_password_visible {
+        "Hide"
+    } else {
+        "Show"
+    };
+
+    let mut unlock_btn = button(
+        text(if app.lan_join_in_progress {
+            "Unlocking..."
+        } else {
+            "Unlock & Join"
+        })
+        .size(13),
+    )
+    .padding([10, 20])
+    .style(pill_primary_button);
+    if !app.lan_join_in_progress {
+        unlock_btn = unlock_btn.on_press(Message::ConfirmJoinLockedLanRoom);
+    }
+
+    let mut body = column![
+        row![
+            avatar_circle(app.avatars.room_handle_for(&room.room_id), 44.0, false),
+            column![
+                text(&room.room_name).size(18).color(M3_ON_SURFACE),
+                text(format!(
+                    "Host: {}  •  Protected LAN room (SPAKE2 E2EE)",
+                    room.host_nickname
+                ))
+                .size(12)
+                .color(M3_ON_SURFACE_VARIANT),
+            ]
+            .spacing(3)
+            .width(Length::Fill),
+        ]
+        .spacing(12)
+        .align_y(Vertical::Center),
+        column![
+            text("Room Password").size(12).color(M3_ON_SURFACE_VARIANT),
+            row![
+                text_input("Enter room password...", &app.lan_join_password_input)
+                    .on_input(Message::LanJoinPasswordChanged)
+                    .on_submit(Message::ConfirmJoinLockedLanRoom)
+                    .secure(!app.lan_join_password_visible)
+                    .padding(11)
+                    .size(13)
+                    .style(m3_text_input_style),
+                button(text(eye_label).size(12))
+                    .padding([11, 14])
+                    .style(pill_tonal_button)
+                    .on_press(Message::ToggleLanJoinPasswordVisible),
+            ]
+            .spacing(8)
+            .align_y(Vertical::Center),
+        ]
+        .spacing(6),
+    ]
+    .spacing(14)
+    .width(Length::Fill);
+
+    if let Some(ref err) = app.lan_join_password_error {
+        body = body.push(text(err).size(12).color(M3_ERROR));
+    }
+
+    body = body.push(
+        row![
+            horizontal_space(),
+            button(text("Cancel").size(13))
+                .padding([10, 18])
+                .style(pill_tonal_button)
+                .on_press(Message::CloseLanPasswordModal),
+            unlock_btn,
+        ]
+        .spacing(10)
+        .align_y(Vertical::Center),
+    );
+
+    let card = container(body)
+        .max_width(440)
+        .padding(24)
+        .style(modal_card_style);
 
     container(card)
         .width(Length::Fill)

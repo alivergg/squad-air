@@ -5,7 +5,7 @@ use chacha20poly1305::{
 };
 use rand::{rngs::OsRng, RngCore};
 use spake2::{Ed25519Group, Identity, Password, Spake2};
-use squad_proto::{sanitize_display_str, InviteLink, MAX_NICKNAME_LEN};
+use squad_proto::{sanitize_display_str, InviteLink, RoomId, MAX_NICKNAME_LEN};
 use std::path::PathBuf;
 use x25519_dalek::{EphemeralSecret, PublicKey, StaticSecret};
 
@@ -14,6 +14,10 @@ const FRIEND_INVITE_CONTEXT: &str = "squad-air friend invite x25519 v1";
 const SPAKE2_INVITE_CONTEXT: &str = "squad-air spake2 room invite v1";
 const SPAKE2_ID_JOINER: &[u8] = b"squad-air-spake2-joiner-v1";
 const SPAKE2_ID_HOST: &[u8] = b"squad-air-spake2-host-v1";
+const LAN_ANNOUNCE_ID_CONTEXT: &str = "squad-air lan announce id v1";
+const SPAKE2_LAN_CONTEXT: &str = "squad-air spake2 lan room secret v1";
+const SPAKE2_LAN_ID_JOINER: &[u8] = b"squad-air-spake2-lan-joiner-v1";
+const SPAKE2_LAN_ID_HOST: &[u8] = b"squad-air-spake2-lan-host-v1";
 const MAX_FRIENDS_STORED: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,34 +237,15 @@ pub fn spake2_host_seal_invite(
     invite: &InviteLink,
 ) -> Result<Spake2SealedInvite, String> {
     let pw = format!("{code:06}");
-    let (state_b, msg_b) = Spake2::<Ed25519Group>::start_b(
-        &Password::new(pw.as_bytes()),
-        &Identity::new(SPAKE2_ID_JOINER),
-        &Identity::new(SPAKE2_ID_HOST),
-    );
-    let shared_key = state_b
-        .finish(msg_a)
-        .map_err(|_| "SPAKE2 host verification failed".to_string())?;
-    let aead_key = blake3::derive_key(SPAKE2_INVITE_CONTEXT, &shared_key);
-    let cipher = ChaCha20Poly1305::new((&aead_key).into());
-
-    let mut nonce = [0u8; 12];
-    OsRng.fill_bytes(&mut nonce);
-    let mut plaintext = [0u8; 48];
-    plaintext[0..16].copy_from_slice(&invite.room_id);
-    plaintext[16..48].copy_from_slice(&invite.secret);
-    let aad = code.to_be_bytes();
-
-    let encrypted = cipher
-        .encrypt(
-            Nonce::from_slice(&nonce),
-            Payload {
-                msg: &plaintext,
-                aad: &aad,
-            },
-        )
-        .map_err(|_| "Failed to encrypt SPAKE2 room invite".to_string())?;
-    Ok((msg_b, nonce, encrypted))
+    spake2_seal_with_aad(
+        &pw,
+        SPAKE2_ID_JOINER,
+        SPAKE2_ID_HOST,
+        SPAKE2_INVITE_CONTEXT,
+        &code.to_be_bytes(),
+        msg_a,
+        invite,
+    )
 }
 
 pub fn spake2_joiner_open_invite(
@@ -270,22 +255,144 @@ pub fn spake2_joiner_open_invite(
     nonce: &[u8; 12],
     encrypted_invite: &[u8],
 ) -> Result<InviteLink, String> {
+    spake2_open_with_aad(
+        state_a,
+        SPAKE2_INVITE_CONTEXT,
+        &code.to_be_bytes(),
+        msg_b,
+        nonce,
+        encrypted_invite,
+        "Invalid 6-digit code or corrupted handshake",
+    )
+}
+
+pub fn derive_lan_announce_id(invite: &InviteLink) -> RoomId {
+    let mut input = [0u8; 48];
+    input[..16].copy_from_slice(&invite.room_id);
+    input[16..].copy_from_slice(&invite.secret);
+    let derived = blake3::derive_key(LAN_ANNOUNCE_ID_CONTEXT, &input);
+    let mut id = [0u8; 16];
+    id.copy_from_slice(&derived[..16]);
+    id
+}
+
+pub fn spake2_lan_start_joiner(password: &str) -> (Spake2<Ed25519Group>, Vec<u8>) {
+    Spake2::<Ed25519Group>::start_a(
+        &Password::new(password.as_bytes()),
+        &Identity::new(SPAKE2_LAN_ID_JOINER),
+        &Identity::new(SPAKE2_LAN_ID_HOST),
+    )
+}
+
+pub fn spake2_lan_host_seal_invite(
+    password: &str,
+    announce_id: &RoomId,
+    attempt_id: u64,
+    msg_a: &[u8],
+    invite: &InviteLink,
+) -> Result<Spake2SealedInvite, String> {
+    let mut aad = [0u8; 24];
+    aad[..16].copy_from_slice(announce_id);
+    aad[16..].copy_from_slice(&attempt_id.to_be_bytes());
+    spake2_seal_with_aad(
+        password,
+        SPAKE2_LAN_ID_JOINER,
+        SPAKE2_LAN_ID_HOST,
+        SPAKE2_LAN_CONTEXT,
+        &aad,
+        msg_a,
+        invite,
+    )
+}
+
+pub fn spake2_lan_joiner_open_invite(
+    state_a: Spake2<Ed25519Group>,
+    announce_id: &RoomId,
+    attempt_id: u64,
+    msg_b: &[u8],
+    nonce: &[u8; 12],
+    encrypted_invite: &[u8],
+) -> Result<InviteLink, String> {
+    let mut aad = [0u8; 24];
+    aad[..16].copy_from_slice(announce_id);
+    aad[16..].copy_from_slice(&attempt_id.to_be_bytes());
+    let invite = spake2_open_with_aad(
+        state_a,
+        SPAKE2_LAN_CONTEXT,
+        &aad,
+        msg_b,
+        nonce,
+        encrypted_invite,
+        "Incorrect room password",
+    )?;
+    if derive_lan_announce_id(&invite) != *announce_id {
+        return Err("LAN room identifier mismatch".to_string());
+    }
+    Ok(invite)
+}
+
+fn spake2_seal_with_aad(
+    password: &str,
+    id_joiner: &[u8],
+    id_host: &[u8],
+    context: &str,
+    aad: &[u8],
+    msg_a: &[u8],
+    invite: &InviteLink,
+) -> Result<Spake2SealedInvite, String> {
+    let (state_b, msg_b) = Spake2::<Ed25519Group>::start_b(
+        &Password::new(password.as_bytes()),
+        &Identity::new(id_joiner),
+        &Identity::new(id_host),
+    );
+    let shared_key = state_b
+        .finish(msg_a)
+        .map_err(|_| "SPAKE2 host verification failed".to_string())?;
+    let aead_key = blake3::derive_key(context, &shared_key);
+    let cipher = ChaCha20Poly1305::new((&aead_key).into());
+
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let mut plaintext = [0u8; 48];
+    plaintext[0..16].copy_from_slice(&invite.room_id);
+    plaintext[16..48].copy_from_slice(&invite.secret);
+
+    let encrypted = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: &plaintext,
+                aad,
+            },
+        )
+        .map_err(|_| "Failed to encrypt SPAKE2 room invite".to_string())?;
+    Ok((msg_b, nonce, encrypted))
+}
+
+fn spake2_open_with_aad(
+    state_a: Spake2<Ed25519Group>,
+    context: &str,
+    aad: &[u8],
+    msg_b: &[u8],
+    nonce: &[u8; 12],
+    encrypted_invite: &[u8],
+    auth_err_msg: &str,
+) -> Result<InviteLink, String> {
     let shared_key = state_a
         .finish(msg_b)
         .map_err(|_| "SPAKE2 exchange failed".to_string())?;
-    let aead_key = blake3::derive_key(SPAKE2_INVITE_CONTEXT, &shared_key);
+    let aead_key = blake3::derive_key(context, &shared_key);
     let cipher = ChaCha20Poly1305::new((&aead_key).into());
-    let aad = code.to_be_bytes();
 
     let plaintext = cipher
         .decrypt(
             Nonce::from_slice(nonce),
             Payload {
                 msg: encrypted_invite,
-                aad: &aad,
+                aad,
             },
         )
-        .map_err(|_| "Invalid 6-digit code or corrupted handshake".to_string())?;
+        .map_err(|_| auth_err_msg.to_string())?;
 
     if plaintext.len() != 48 {
         return Err("Invalid room invite payload length".to_string());
@@ -553,5 +660,63 @@ mod tests {
         let json = serialize_friends_json(&contacts);
         let parsed = parse_friends_json(&json);
         assert_eq!(parsed, contacts);
+    }
+
+    #[test]
+    fn test_spake2_lan_password_exchange_rejects_wrong_password_and_tampered_attempt() {
+        let invite = InviteLink::generate();
+        let announce_id = derive_lan_announce_id(&invite);
+        assert_ne!(announce_id, invite.room_id);
+
+        let attempt_id = 42_001u64;
+        let (state_a, msg_a) = spake2_lan_start_joiner("hunter2-lan");
+        let (msg_b, nonce, enc) =
+            spake2_lan_host_seal_invite("hunter2-lan", &announce_id, attempt_id, &msg_a, &invite)
+                .unwrap();
+
+        let opened =
+            spake2_lan_joiner_open_invite(state_a, &announce_id, attempt_id, &msg_b, &nonce, &enc)
+                .unwrap();
+        assert_eq!(opened, invite);
+
+        // Wrong password must fail
+        let (wrong_state, wrong_a) = spake2_lan_start_joiner("wrong-pw");
+        let (host_b2, nonce2, enc2) = spake2_lan_host_seal_invite(
+            "hunter2-lan",
+            &announce_id,
+            attempt_id + 1,
+            &wrong_a,
+            &invite,
+        )
+        .unwrap();
+        assert!(spake2_lan_joiner_open_invite(
+            wrong_state,
+            &announce_id,
+            attempt_id + 1,
+            &host_b2,
+            &nonce2,
+            &enc2,
+        )
+        .is_err());
+
+        // Replay / attempt_id mismatch must fail AAD check
+        let (replay_state, replay_a) = spake2_lan_start_joiner("hunter2-lan");
+        let (host_b3, nonce3, enc3) = spake2_lan_host_seal_invite(
+            "hunter2-lan",
+            &announce_id,
+            attempt_id + 2,
+            &replay_a,
+            &invite,
+        )
+        .unwrap();
+        assert!(spake2_lan_joiner_open_invite(
+            replay_state,
+            &announce_id,
+            attempt_id + 999,
+            &host_b3,
+            &nonce3,
+            &enc3,
+        )
+        .is_err());
     }
 }

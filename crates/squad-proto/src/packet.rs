@@ -29,9 +29,16 @@ pub const LAN_DISCOVERY_PORT: u16 = 3479;
 pub const OPCODE_LAN_ANNOUNCE: u8 = 0x06;
 pub const OPCODE_LAN_GOODBYE: u8 = 0x07;
 pub const OPCODE_PEER_RELAY: u8 = 0x08;
+pub const OPCODE_LAN_ANNOUNCE_LOCKED: u8 = 0x09;
 pub const MAX_LAN_ROOM_NAME_LEN: usize = 48;
+pub const MAX_LAN_PASSWORD_LEN: usize = 64;
 pub const OPCODE_SPAKE2_HOST_REPLY: u8 = 0x60;
 pub const OPCODE_SPAKE2_JOINER_RETRY: u8 = 0x61;
+pub const OPCODE_SPAKE2_LAN_AUTH_REQ: u8 = 0x62;
+pub const OPCODE_SPAKE2_LAN_AUTH_REPLY: u8 = 0x63;
+pub const LAN_AUTH_STATUS_OK: u8 = 0;
+pub const LAN_AUTH_STATUS_RATE_LIMITED: u8 = 1;
+pub const LAN_AUTH_STATUS_NOT_FOUND: u8 = 2;
 pub const MAX_SPAKE2_ENCRYPTED_INVITE: usize = 128;
 
 pub type RoomId = [u8; 16];
@@ -67,6 +74,21 @@ pub enum Spake2Packet {
     },
     /// `0x61` Joiner -> Host (retry packet during hole punching)
     JoinerRetry { code: u32, spake2_msg_a: Vec<u8> },
+    /// `0x62` LAN Joiner -> LAN Host (password-protected room SPAKE2 message A)
+    LanAuthReq {
+        announce_id: RoomId,
+        attempt_id: u64,
+        spake2_msg_a: Vec<u8>,
+    },
+    /// `0x63` LAN Host -> LAN Joiner (SPAKE2 message B + AEAD-sealed invite or error status)
+    LanAuthReply {
+        announce_id: RoomId,
+        attempt_id: u64,
+        status: u8,
+        spake2_msg_b: Vec<u8>,
+        nonce: [u8; 12],
+        encrypted_invite: Vec<u8>,
+    },
 }
 
 #[inline]
@@ -76,7 +98,10 @@ pub fn is_spake2_datagram(datagram: &[u8]) -> bool {
         && datagram[2] == PROTO_VERSION
         && matches!(
             datagram[3],
-            OPCODE_SPAKE2_HOST_REPLY | OPCODE_SPAKE2_JOINER_RETRY
+            OPCODE_SPAKE2_HOST_REPLY
+                | OPCODE_SPAKE2_JOINER_RETRY
+                | OPCODE_SPAKE2_LAN_AUTH_REQ
+                | OPCODE_SPAKE2_LAN_AUTH_REPLY
         )
 }
 
@@ -119,6 +144,49 @@ impl Spake2Packet {
                 buf.extend_from_slice(&code.to_be_bytes());
                 buf.push(spake2_msg_a.len() as u8);
                 buf.extend_from_slice(spake2_msg_a);
+            }
+            Spake2Packet::LanAuthReq {
+                announce_id,
+                attempt_id,
+                spake2_msg_a,
+            } => {
+                if spake2_msg_a.is_empty() || spake2_msg_a.len() > MAX_SPAKE2_MSG_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                buf.push(OPCODE_SPAKE2_LAN_AUTH_REQ);
+                buf.extend_from_slice(announce_id);
+                buf.extend_from_slice(&attempt_id.to_be_bytes());
+                buf.push(spake2_msg_a.len() as u8);
+                buf.extend_from_slice(spake2_msg_a);
+            }
+            Spake2Packet::LanAuthReply {
+                announce_id,
+                attempt_id,
+                status,
+                spake2_msg_b,
+                nonce,
+                encrypted_invite,
+            } => {
+                if *status > LAN_AUTH_STATUS_NOT_FOUND
+                    || spake2_msg_b.len() > MAX_SPAKE2_MSG_LEN
+                    || encrypted_invite.len() > MAX_SPAKE2_ENCRYPTED_INVITE
+                {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                if *status == LAN_AUTH_STATUS_OK
+                    && (spake2_msg_b.is_empty() || encrypted_invite.is_empty())
+                {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                buf.push(OPCODE_SPAKE2_LAN_AUTH_REPLY);
+                buf.extend_from_slice(announce_id);
+                buf.extend_from_slice(&attempt_id.to_be_bytes());
+                buf.push(*status);
+                buf.push(spake2_msg_b.len() as u8);
+                buf.extend_from_slice(spake2_msg_b);
+                buf.extend_from_slice(nonce);
+                buf.extend_from_slice(&(encrypted_invite.len() as u16).to_be_bytes());
+                buf.extend_from_slice(encrypted_invite);
             }
         }
 
@@ -194,6 +262,62 @@ impl Spake2Packet {
                 Ok(Spake2Packet::JoinerRetry {
                     code,
                     spake2_msg_a: data[cursor..cursor + msg_len].to_vec(),
+                })
+            }
+            OPCODE_SPAKE2_LAN_AUTH_REQ => {
+                need_bytes(data, cursor, 16 + 8 + 1)?;
+                let mut announce_id = [0u8; 16];
+                announce_id.copy_from_slice(&data[cursor..cursor + 16]);
+                cursor += 16;
+                let attempt_id = u64::from_be_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                let msg_len = data[cursor + 8] as usize;
+                cursor += 9;
+                if msg_len == 0 || msg_len > MAX_SPAKE2_MSG_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, msg_len)?;
+                Ok(Spake2Packet::LanAuthReq {
+                    announce_id,
+                    attempt_id,
+                    spake2_msg_a: data[cursor..cursor + msg_len].to_vec(),
+                })
+            }
+            OPCODE_SPAKE2_LAN_AUTH_REPLY => {
+                need_bytes(data, cursor, 16 + 8 + 1 + 1)?;
+                let mut announce_id = [0u8; 16];
+                announce_id.copy_from_slice(&data[cursor..cursor + 16]);
+                cursor += 16;
+                let attempt_id = u64::from_be_bytes(data[cursor..cursor + 8].try_into().unwrap());
+                let status = data[cursor + 8];
+                let msg_len = data[cursor + 9] as usize;
+                cursor += 10;
+                if status > LAN_AUTH_STATUS_NOT_FOUND || msg_len > MAX_SPAKE2_MSG_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                if status == LAN_AUTH_STATUS_OK && msg_len == 0 {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, msg_len + 14)?;
+                let spake2_msg_b = data[cursor..cursor + msg_len].to_vec();
+                cursor += msg_len;
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&data[cursor..cursor + 12]);
+                let enc_len = u16::from_be_bytes([data[cursor + 12], data[cursor + 13]]) as usize;
+                cursor += 14;
+                if enc_len > MAX_SPAKE2_ENCRYPTED_INVITE {
+                    return Err(ProtoError::PacketTooLarge(enc_len));
+                }
+                if status == LAN_AUTH_STATUS_OK && enc_len == 0 {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, enc_len)?;
+                Ok(Spake2Packet::LanAuthReply {
+                    announce_id,
+                    attempt_id,
+                    status,
+                    spake2_msg_b,
+                    nonce,
+                    encrypted_invite: data[cursor..cursor + enc_len].to_vec(),
                 })
             }
             other => Err(ProtoError::UnknownOpcode(other)),
@@ -320,6 +444,16 @@ pub enum LanDiscoveryPacket {
     },
     /// `0x07` UDP broadcast announcing that a LAN room closed or migrated.
     Goodbye { room_id: RoomId, rv_port: u16 },
+    /// `0x09` UDP broadcast advertising a password-protected LAN room without leaking its secret.
+    AnnounceLocked {
+        announce_id: RoomId,
+        rv_port: u16,
+        auth_port: u16,
+        peer_count: u8,
+        max_peers: u8,
+        room_name: String,
+        host_nickname: String,
+    },
 }
 
 impl std::fmt::Debug for LanDiscoveryPacket {
@@ -347,6 +481,24 @@ impl std::fmt::Debug for LanDiscoveryPacket {
                 .debug_struct("Goodbye")
                 .field("room_id", room_id)
                 .field("rv_port", rv_port)
+                .finish(),
+            Self::AnnounceLocked {
+                announce_id,
+                rv_port,
+                auth_port,
+                peer_count,
+                max_peers,
+                room_name,
+                host_nickname,
+            } => f
+                .debug_struct("AnnounceLocked")
+                .field("announce_id", announce_id)
+                .field("rv_port", rv_port)
+                .field("auth_port", auth_port)
+                .field("peer_count", peer_count)
+                .field("max_peers", max_peers)
+                .field("room_name", room_name)
+                .field("host_nickname", host_nickname)
                 .finish(),
         }
     }
@@ -387,6 +539,30 @@ impl LanDiscoveryPacket {
                 buf.push(OPCODE_LAN_GOODBYE);
                 buf.extend_from_slice(room_id);
                 buf.extend_from_slice(&rv_port.to_be_bytes());
+            }
+            LanDiscoveryPacket::AnnounceLocked {
+                announce_id,
+                rv_port,
+                auth_port,
+                peer_count,
+                max_peers,
+                room_name,
+                host_nickname,
+            } => {
+                buf.push(OPCODE_LAN_ANNOUNCE_LOCKED);
+                buf.extend_from_slice(announce_id);
+                buf.extend_from_slice(&rv_port.to_be_bytes());
+                buf.extend_from_slice(&auth_port.to_be_bytes());
+                buf.push(*peer_count);
+                buf.push(*max_peers);
+
+                let name_bytes = truncate_utf8(room_name, MAX_LAN_ROOM_NAME_LEN);
+                buf.push(name_bytes.len() as u8);
+                buf.extend_from_slice(name_bytes);
+
+                let nick_bytes = truncate_utf8(host_nickname, MAX_NICKNAME_LEN);
+                buf.push(nick_bytes.len() as u8);
+                buf.extend_from_slice(nick_bytes);
             }
         }
 
@@ -465,6 +641,48 @@ impl LanDiscoveryPacket {
                 room_id.copy_from_slice(&data[cursor..cursor + 16]);
                 let rv_port = u16::from_be_bytes([data[cursor + 16], data[cursor + 17]]);
                 Ok(LanDiscoveryPacket::Goodbye { room_id, rv_port })
+            }
+            OPCODE_LAN_ANNOUNCE_LOCKED => {
+                need_bytes(data, cursor, 16 + 2 + 2 + 1 + 1 + 1)?;
+                let mut announce_id = [0u8; 16];
+                announce_id.copy_from_slice(&data[cursor..cursor + 16]);
+                cursor += 16;
+
+                let rv_port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
+                let auth_port = u16::from_be_bytes([data[cursor + 2], data[cursor + 3]]);
+                let peer_count = data[cursor + 4];
+                let max_peers = data[cursor + 5];
+                let name_len = data[cursor + 6] as usize;
+                cursor += 7;
+
+                if name_len > MAX_LAN_ROOM_NAME_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, name_len + 1)?;
+                let room_name_raw = std::str::from_utf8(&data[cursor..cursor + name_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let room_name = sanitize_display_str(room_name_raw, MAX_LAN_ROOM_NAME_LEN);
+                cursor += name_len;
+
+                let nick_len = data[cursor] as usize;
+                cursor += 1;
+                if nick_len > MAX_NICKNAME_LEN {
+                    return Err(ProtoError::InvalidHeader);
+                }
+                need_bytes(data, cursor, nick_len)?;
+                let host_nickname_raw = std::str::from_utf8(&data[cursor..cursor + nick_len])
+                    .map_err(|_| ProtoError::InvalidUtf8)?;
+                let host_nickname = sanitize_display_str(host_nickname_raw, MAX_NICKNAME_LEN);
+
+                Ok(LanDiscoveryPacket::AnnounceLocked {
+                    announce_id,
+                    rv_port,
+                    auth_port,
+                    peer_count,
+                    max_peers,
+                    room_name,
+                    host_nickname,
+                })
             }
             other => Err(ProtoError::UnknownOpcode(other)),
         }
@@ -1774,5 +1992,59 @@ mod tests {
         }
         .encode()
         .is_err());
+
+        let locked_announce = LanDiscoveryPacket::AnnounceLocked {
+            announce_id: [0x5A; 16],
+            rv_port: 3478,
+            auth_port: 49152,
+            peer_count: 3,
+            max_peers: 10,
+            room_name: "Private WiFi Squad".to_string(),
+            host_nickname: "Alice".to_string(),
+        };
+        let locked_bytes = locked_announce.encode().unwrap();
+        assert_eq!(
+            LanDiscoveryPacket::decode(&locked_bytes).unwrap(),
+            locked_announce
+        );
+
+        let lan_req = Spake2Packet::LanAuthReq {
+            announce_id: [0x5A; 16],
+            attempt_id: 987_654_321,
+            spake2_msg_a: vec![0x71; 33],
+        };
+        let lan_req_bytes = lan_req.encode().unwrap();
+        assert!(is_spake2_datagram(&lan_req_bytes));
+        assert_eq!(Spake2Packet::decode(&lan_req_bytes).unwrap(), lan_req);
+
+        let lan_reply_ok = Spake2Packet::LanAuthReply {
+            announce_id: [0x5A; 16],
+            attempt_id: 987_654_321,
+            status: LAN_AUTH_STATUS_OK,
+            spake2_msg_b: vec![0x82; 33],
+            nonce: [0x12; 12],
+            encrypted_invite: vec![0x99; 64],
+        };
+        let lan_reply_ok_bytes = lan_reply_ok.encode().unwrap();
+        assert!(is_spake2_datagram(&lan_reply_ok_bytes));
+        assert_eq!(
+            Spake2Packet::decode(&lan_reply_ok_bytes).unwrap(),
+            lan_reply_ok
+        );
+
+        let lan_reply_rl = Spake2Packet::LanAuthReply {
+            announce_id: [0x5A; 16],
+            attempt_id: 987_654_321,
+            status: LAN_AUTH_STATUS_RATE_LIMITED,
+            spake2_msg_b: Vec::new(),
+            nonce: [0u8; 12],
+            encrypted_invite: Vec::new(),
+        };
+        let lan_reply_rl_bytes = lan_reply_rl.encode().unwrap();
+        assert!(is_spake2_datagram(&lan_reply_rl_bytes));
+        assert_eq!(
+            Spake2Packet::decode(&lan_reply_rl_bytes).unwrap(),
+            lan_reply_rl
+        );
     }
 }

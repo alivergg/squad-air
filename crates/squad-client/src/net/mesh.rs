@@ -1,6 +1,7 @@
 use crate::crypto_identity::{
-    open_friend_invite, seal_friend_invite, spake2_host_seal_invite, spake2_joiner_open_invite,
-    spake2_start_joiner,
+    derive_lan_announce_id, open_friend_invite, seal_friend_invite, spake2_host_seal_invite,
+    spake2_joiner_open_invite, spake2_lan_host_seal_invite, spake2_lan_joiner_open_invite,
+    spake2_lan_start_joiner, spake2_start_joiner,
 };
 use crate::net::lan::{
     bind_lan_broadcast_sender, bind_lan_discovery_listener, broadcast_lan_packet,
@@ -20,9 +21,10 @@ use squad_proto::{
     is_relay_datagram, is_spake2_datagram, parse_peer_relay_header, parse_relay_header,
     rewrite_relay_peer_id, sanitize_display_str, ClientUuid, InviteLink, LanDiscoveryPacket,
     P2pHeader, P2pMsgType, P2pPayload, PeerId, PeerRecord, RoomCipher, RoomId, SignalingErrorCode,
-    SignalingPacket, Spake2Packet, LAN_DISCOVERY_PORT, MAX_FRIENDS_STATUS_PER_PACKET,
-    MAX_QUERY_FRIENDS_PER_PACKET, MAX_RELAY_UDP_PAYLOAD, MAX_ROOM_PEERS, MAX_UDP_PAYLOAD,
-    RELAY_HEADER_LEN,
+    SignalingPacket, Spake2Packet, LAN_AUTH_STATUS_NOT_FOUND, LAN_AUTH_STATUS_OK,
+    LAN_AUTH_STATUS_RATE_LIMITED, LAN_DISCOVERY_PORT, MAX_FRIENDS_STATUS_PER_PACKET,
+    MAX_LAN_PASSWORD_LEN, MAX_QUERY_FRIENDS_PER_PACKET, MAX_RELAY_UDP_PAYLOAD, MAX_ROOM_PEERS,
+    MAX_UDP_PAYLOAD, RELAY_HEADER_LEN,
 };
 use squad_video::{
     detect_hardware_encoder_backend, fragment_frame, is_hevc_hardware_supported, DecoderError,
@@ -59,6 +61,12 @@ const PRESENCE_UI_TTL: Duration = Duration::from_secs(15);
 const SHORT_CODE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const SHORT_CODE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SPAKE2_HOST_MAX_REPLIES_PER_SEC: usize = 8;
+const LAN_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+const LAN_AUTH_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+const LAN_AUTH_MAX_ATTEMPTS_PER_MIN: usize = 5;
+const LAN_AUTH_BLOCK_DURATION: Duration = Duration::from_secs(60);
+const LAN_AUTH_MAX_BUCKETS: usize = 256;
+const LAN_AUTH_GLOBAL_MAX_PER_SEC: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PeerConnStatus {
@@ -142,9 +150,17 @@ pub enum MeshCommand {
     },
     HostLanRoom {
         room_name: String,
+        password: Option<String>,
         nickname: String,
         client_uuid: ClientUuid,
     },
+    JoinLockedLanRoom {
+        room: DiscoveredLanRoom,
+        password: String,
+        nickname: String,
+        client_uuid: ClientUuid,
+    },
+    CancelLanAuth,
     LeaveRoom,
     SendChatText {
         text: String,
@@ -192,6 +208,8 @@ pub enum MeshCommand {
         nickname: String,
         client_uuid: ClientUuid,
     },
+    #[cfg(test)]
+    TestGetSessionInfo(mpsc::Sender<Option<(SocketAddr, SocketAddr, RoomId, bool)>>),
     Shutdown,
 }
 
@@ -200,7 +218,9 @@ pub enum MeshEvent {
     JoinedRoom {
         local_peer_id: PeerId,
         invite_uri: String,
+        is_lan_locked: bool,
     },
+    LanAuthFailed(String),
     LeftRoom,
     PeersUpdated(Vec<PeerUiSnapshot>),
     ChatItemReceived(ChatItemUi),
@@ -339,6 +359,16 @@ struct ActiveSession {
     last_advertised_direct_peers: Vec<PeerId>,
     active_short_code: Option<(u32, Instant)>,
     last_spake2_reply_times: Vec<Instant>,
+    local_udp_port: u16,
+    lan_room_password: Option<String>,
+    lan_auth_buckets: HashMap<std::net::IpAddr, LanAuthRateBucket>,
+    lan_auth_global_times: Vec<Instant>,
+}
+
+struct LanAuthRateBucket {
+    attempts: Vec<Instant>,
+    blocked_until: Option<Instant>,
+    last_reply: Option<(u64, Vec<u8>, Instant)>,
 }
 
 struct PresenceWorkerState {
@@ -359,6 +389,19 @@ struct PendingShortCodeJoin {
     spake2_state: Option<Spake2<Ed25519Group>>,
     msg_a: Vec<u8>,
     host_addrs: Vec<SocketAddr>,
+    started_at: Instant,
+    last_retry_sent: Instant,
+}
+
+struct PendingLanAuth {
+    room: DiscoveredLanRoom,
+    auth_addr: SocketAddr,
+    attempt_id: u64,
+    password: String,
+    nickname: String,
+    client_uuid: ClientUuid,
+    spake2_state: Option<Spake2<Ed25519Group>>,
+    msg_a: Vec<u8>,
     started_at: Instant,
     last_retry_sent: Instant,
 }
@@ -522,6 +565,7 @@ pub fn spawn_mesh_worker(
             online_friends: HashMap::new(),
         };
         let mut pending_short_code_join: Option<PendingShortCodeJoin> = None;
+        let mut pending_lan_auth: Option<PendingLanAuth> = None;
 
         let lan_rx_sock = bind_lan_discovery_listener(LAN_DISCOVERY_PORT)
             .map_err(|e| {
@@ -568,6 +612,7 @@ pub fn spawn_mesh_worker(
                                 }
                             };
                             pending_short_code_join = None;
+                            pending_lan_auth = None;
                             let mut act_ctx = SessionActivationCtx {
                                 socket: &socket,
                                 lan_tx_sock: lan_tx_sock.as_ref(),
@@ -600,6 +645,7 @@ pub fn spawn_mesh_worker(
                                 is_lan_room,
                                 room_name.unwrap_or_default(),
                                 None,
+                                None,
                             )
                             .await;
 
@@ -607,10 +653,26 @@ pub fn spawn_mesh_worker(
                         }
                         MeshCommand::HostLanRoom {
                             room_name,
+                            password,
                             nickname,
                             client_uuid,
                         } => {
+                            let clean_password = password
+                                .map(|p| p.trim().to_string())
+                                .filter(|p| !p.is_empty());
+                            if clean_password
+                                .as_ref()
+                                .is_some_and(|p| p.len() > MAX_LAN_PASSWORD_LEN)
+                            {
+                                let _ = evt_tx
+                                    .send(MeshEvent::Error(format!(
+                                        "LAN room password exceeds maximum length of {MAX_LAN_PASSWORD_LEN} bytes"
+                                    )))
+                                    .await;
+                                continue;
+                            }
                             pending_short_code_join = None;
+                            pending_lan_auth = None;
                             if let Some(old_sess) = session.take() {
                                 if old_sess.active_short_code.is_some() {
                                     evt_tx.send(MeshEvent::ShortCodeCleared).await;
@@ -676,12 +738,66 @@ pub fn spawn_mesh_worker(
                                 client_uuid,
                                 true,
                                 clean_name,
+                                clean_password,
                                 Some(embedded_rv),
                             )
                             .await;
                         }
+                        MeshCommand::JoinLockedLanRoom {
+                            room,
+                            password,
+                            nickname,
+                            client_uuid,
+                        } => {
+                            let clean_pw = password.trim().to_string();
+                            if clean_pw.is_empty() || clean_pw.len() > MAX_LAN_PASSWORD_LEN {
+                                evt_tx
+                                    .send(MeshEvent::LanAuthFailed(format!(
+                                        "Password must be 1..={MAX_LAN_PASSWORD_LEN} characters"
+                                    )))
+                                    .await;
+                                continue;
+                            }
+                            let Some(auth_addr) = room.auth_addr else {
+                                evt_tx
+                                    .send(MeshEvent::LanAuthFailed(
+                                        "Host did not advertise a LAN authentication port"
+                                            .to_string(),
+                                    ))
+                                    .await;
+                                continue;
+                            };
+                            let (spake2_state, msg_a) = spake2_lan_start_joiner(&clean_pw);
+                            let attempt_id: u64 = rand::thread_rng().gen();
+                            let announce_id = room.room_id;
+                            let now = Instant::now();
+                            pending_lan_auth = Some(PendingLanAuth {
+                                room,
+                                auth_addr,
+                                attempt_id,
+                                password: clean_pw,
+                                nickname,
+                                client_uuid,
+                                spake2_state: Some(spake2_state),
+                                msg_a: msg_a.clone(),
+                                started_at: now,
+                                last_retry_sent: now,
+                            });
+                            let req = Spake2Packet::LanAuthReq {
+                                announce_id,
+                                attempt_id,
+                                spake2_msg_a: msg_a,
+                            };
+                            if let Ok(bytes) = req.encode() {
+                                let _ = socket.send_to(&bytes, auth_addr).await;
+                            }
+                        }
+                        MeshCommand::CancelLanAuth => {
+                            pending_lan_auth = None;
+                        }
                         MeshCommand::LeaveRoom => {
                             pending_short_code_join = None;
+                            pending_lan_auth = None;
                             stop_capture_worker(&mut capture_worker);
                             drain_video_out_rx(&mut video_out_rx);
                             audio_engine.set_share_stream_audio(false);
@@ -1139,6 +1255,7 @@ pub fn spawn_mesh_worker(
 
                             if !is_party_invite {
                                 pending_short_code_join = None;
+                                pending_lan_auth = None;
                                 let mut act_ctx = SessionActivationCtx {
                                     socket: &socket,
                                     lan_tx_sock: lan_tx_sock.as_ref(),
@@ -1170,6 +1287,7 @@ pub fn spawn_mesh_worker(
                                     presence.client_uuid,
                                     false,
                                     String::new(),
+                                    None,
                                     None,
                                 )
                                 .await;
@@ -1219,6 +1337,7 @@ pub fn spawn_mesh_worker(
                                     continue;
                                 }
                             };
+                            pending_lan_auth = None;
                             let (spake2_state, msg_a) = spake2_start_joiner(code);
                             let lan_addrs = discover_lan_ipv4_addrs(bound_port);
                             let now = Instant::now();
@@ -1242,6 +1361,18 @@ pub fn spawn_mesh_worker(
                             if let Ok(bytes) = pkt.encode() {
                                 let _ = socket.send_to(&bytes, rv_addr).await;
                             }
+                        }
+                        #[cfg(test)]
+                        MeshCommand::TestGetSessionInfo(reply_tx) => {
+                            let info = session.as_ref().map(|s| {
+                                (
+                                    s.rendezvous_addr,
+                                    SocketAddr::from(([127, 0, 0, 1], s.local_udp_port)),
+                                    derive_lan_announce_id(&s.invite),
+                                    s.embedded_rv.is_some(),
+                                )
+                            });
+                            let _ = reply_tx.try_send(info);
                         }
                         MeshCommand::Shutdown => {
                             stop_capture_worker(&mut capture_worker);
@@ -1418,6 +1549,7 @@ pub fn spawn_mesh_worker(
                                                             false,
                                                             String::new(),
                                                             None,
+                                                            None,
                                                         )
                                                         .await;
                                                     }
@@ -1446,6 +1578,119 @@ pub fn spawn_mesh_worker(
                                             &[src_addr],
                                         )
                                         .await;
+                                    }
+                                }
+                                Spake2Packet::LanAuthReq {
+                                    announce_id,
+                                    attempt_id,
+                                    spake2_msg_a,
+                                } => {
+                                    handle_lan_auth_req(
+                                        &socket,
+                                        session.as_mut(),
+                                        announce_id,
+                                        attempt_id,
+                                        &spake2_msg_a,
+                                        src_addr,
+                                    )
+                                    .await;
+                                }
+                                Spake2Packet::LanAuthReply {
+                                    announce_id,
+                                    attempt_id,
+                                    status,
+                                    spake2_msg_b,
+                                    nonce,
+                                    encrypted_invite,
+                                } => {
+                                    let matches_pending =
+                                        pending_lan_auth.as_ref().is_some_and(|p| {
+                                            p.room.room_id == announce_id
+                                                && p.attempt_id == attempt_id
+                                                && src_addr.port() == p.auth_addr.port()
+                                                && (src_addr.ip() == p.auth_addr.ip()
+                                                    || (src_addr.ip().is_loopback()
+                                                        && p.auth_addr.ip().is_loopback()))
+                                        });
+                                    if matches_pending {
+                                        if let Some(mut pending) = pending_lan_auth.take() {
+                                            if status == LAN_AUTH_STATUS_RATE_LIMITED {
+                                                evt_tx
+                                                    .send(MeshEvent::LanAuthFailed(
+                                                        "Too many wrong password attempts. Please wait 60 seconds."
+                                                            .to_string(),
+                                                    ))
+                                                    .await;
+                                            } else if status == LAN_AUTH_STATUS_NOT_FOUND {
+                                                evt_tx
+                                                    .send(MeshEvent::LanAuthFailed(
+                                                        "This LAN room is no longer available."
+                                                            .to_string(),
+                                                    ))
+                                                    .await;
+                                            } else if status != LAN_AUTH_STATUS_OK {
+                                                evt_tx
+                                                    .send(MeshEvent::LanAuthFailed(
+                                                        "Rejected by LAN room host.".to_string(),
+                                                    ))
+                                                    .await;
+                                            } else if let Some(st) = pending.spake2_state.take() {
+                                                match spake2_lan_joiner_open_invite(
+                                                    st,
+                                                    &announce_id,
+                                                    attempt_id,
+                                                    &spake2_msg_b,
+                                                    &nonce,
+                                                    &encrypted_invite,
+                                                ) {
+                                                    Ok(invite) => {
+                                                        let mut act_ctx = SessionActivationCtx {
+                                                            socket: &socket,
+                                                            lan_tx_sock: lan_tx_sock.as_ref(),
+                                                            bound_port,
+                                                            pending_local_avatar:
+                                                                &pending_local_avatar,
+                                                            local_encoder_backend:
+                                                                &local_encoder_backend,
+                                                            hevc_decode_supported,
+                                                            audio_engine: &audio_engine,
+                                                            tr_tx: &tr_tx,
+                                                            tr_rx: &mut tr_rx,
+                                                            evt_tx: &evt_tx,
+                                                            capture_worker: &mut capture_worker,
+                                                            video_out_rx: &mut video_out_rx,
+                                                            decode_handle: &decode_handle,
+                                                            video_frame_slot: &video_frame_slot,
+                                                            discovered_lan: &mut discovered_lan,
+                                                            last_published_lan:
+                                                                &mut last_published_lan,
+                                                            last_snapshots: &mut last_snapshots,
+                                                            seal_buf: &mut seal_buf,
+                                                            relay_buf: &mut relay_buf,
+                                                            presence: &presence,
+                                                        };
+                                                        activate_joined_session(
+                                                            &mut session,
+                                                            &mut act_ctx,
+                                                            pending.room.host_addr,
+                                                            invite,
+                                                            pending.nickname,
+                                                            pending.client_uuid,
+                                                            true,
+                                                            pending.room.room_name,
+                                                            Some(pending.password),
+                                                            None,
+                                                        )
+                                                        .await;
+                                                    }
+                                                    Err(err) => {
+                                                        evt_tx
+                                                            .send(MeshEvent::LanAuthFailed(err))
+                                                            .await;
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -1774,8 +2019,9 @@ pub fn spawn_mesh_worker(
                                     }
                                     let room = DiscoveredLanRoom {
                                         room_id,
-                                        secret,
+                                        secret: Some(secret),
                                         host_addr: SocketAddr::new(src_addr.ip(), rv_port),
+                                        auth_addr: None,
                                         room_name,
                                         host_nickname,
                                         peer_count,
@@ -1784,6 +2030,44 @@ pub fn spawn_mesh_worker(
                                     discovered_lan.insert(room_id, (room, now));
                                     publish_lan_rooms(&discovered_lan, &mut last_published_lan, &evt_tx)
                                         .await;
+                                }
+                            }
+                            LanDiscoveryPacket::AnnounceLocked {
+                                announce_id,
+                                rv_port,
+                                auth_port,
+                                peer_count,
+                                max_peers,
+                                room_name,
+                                host_nickname,
+                            } => {
+                                let is_own_active = session.as_ref().is_some_and(|s| {
+                                    s.invite.room_id == announce_id
+                                        || derive_lan_announce_id(&s.invite) == announce_id
+                                });
+                                if !is_own_active && rv_port != 0 && auth_port != 0 {
+                                    if !discovered_lan.contains_key(&announce_id)
+                                        && discovered_lan.len() >= 64
+                                    {
+                                        continue;
+                                    }
+                                    let room = DiscoveredLanRoom {
+                                        room_id: announce_id,
+                                        secret: None,
+                                        host_addr: SocketAddr::new(src_addr.ip(), rv_port),
+                                        auth_addr: Some(SocketAddr::new(src_addr.ip(), auth_port)),
+                                        room_name,
+                                        host_nickname,
+                                        peer_count,
+                                        max_peers,
+                                    };
+                                    discovered_lan.insert(announce_id, (room, now));
+                                    publish_lan_rooms(
+                                        &discovered_lan,
+                                        &mut last_published_lan,
+                                        &evt_tx,
+                                    )
+                                    .await;
                                 }
                             }
                             LanDiscoveryPacket::Goodbye { room_id, rv_port } => {
@@ -1837,6 +2121,30 @@ pub fn spawn_mesh_worker(
                                 for &addr in &pending.host_addrs {
                                     let _ = socket.send_to(&bytes, addr).await;
                                 }
+                            }
+                        }
+                    }
+
+                    if let Some(pending) = pending_lan_auth.as_mut() {
+                        if now.duration_since(pending.started_at) >= LAN_AUTH_TIMEOUT {
+                            pending_lan_auth = None;
+                            evt_tx
+                                .send(MeshEvent::LanAuthFailed(
+                                    "Timed out waiting for LAN host password verification"
+                                        .to_string(),
+                                ))
+                                .await;
+                        } else if now.duration_since(pending.last_retry_sent)
+                            >= LAN_AUTH_RETRY_INTERVAL
+                        {
+                            pending.last_retry_sent = now;
+                            let req = Spake2Packet::LanAuthReq {
+                                announce_id: pending.room.room_id,
+                                attempt_id: pending.attempt_id,
+                                spake2_msg_a: pending.msg_a.clone(),
+                            };
+                            if let Ok(bytes) = req.encode() {
+                                let _ = socket.send_to(&bytes, pending.auth_addr).await;
                             }
                         }
                     }
@@ -2227,6 +2535,7 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                         .send(MeshEvent::JoinedRoom {
                             local_peer_id: assigned_peer_id,
                             invite_uri: sess.invite.to_uri(),
+                            is_lan_locked: sess.is_lan_room && sess.lan_room_password.is_some(),
                         })
                         .await;
                 } else {
@@ -3744,6 +4053,7 @@ async fn init_session(
     hevc_decode_supported: bool,
     is_lan_room: bool,
     lan_room_name: String,
+    lan_room_password: Option<String>,
     embedded_rv: Option<EmbeddedRendezvousHandle>,
     audio_engine: &AudioEngineHandle,
     tr_tx: &mpsc::Sender<TransferEvent>,
@@ -3794,6 +4104,10 @@ async fn init_session(
         last_advertised_direct_peers: Vec::new(),
         active_short_code: None,
         last_spake2_reply_times: Vec::new(),
+        local_udp_port: bound_port,
+        lan_room_password,
+        lan_auth_buckets: HashMap::new(),
+        lan_auth_global_times: Vec::new(),
     }
 }
 
@@ -3848,8 +4162,13 @@ async fn teardown_session(
             }
         }
         if let Some(tx) = lan_tx_sock {
+            let bye_id = if sess.lan_room_password.is_some() {
+                derive_lan_announce_id(&sess.invite)
+            } else {
+                sess.invite.room_id
+            };
             let bye = LanDiscoveryPacket::Goodbye {
-                room_id: sess.invite.room_id,
+                room_id: bye_id,
                 rv_port: rv.port,
             };
             broadcast_lan_packet(tx, &bye).await;
@@ -3858,6 +4177,9 @@ async fn teardown_session(
         rv.stop().await;
     } else {
         send_leave(socket, &sess).await;
+    }
+    if let Some(mut pw) = sess.lan_room_password.take() {
+        pw.clear();
     }
 }
 
@@ -3923,14 +4245,27 @@ async fn broadcast_lan_announce(lan_tx_sock: Option<&UdpSocket>, sess: &ActiveSe
     let Some(rv) = sess.embedded_rv.as_ref() else {
         return;
     };
-    let pkt = LanDiscoveryPacket::Announce {
-        room_id: sess.invite.room_id,
-        secret: sess.invite.secret,
-        rv_port: rv.port,
-        peer_count: (sess.peers.len() + 1).min(MAX_ROOM_PEERS) as u8,
-        max_peers: MAX_ROOM_PEERS as u8,
-        room_name: sess.lan_room_name.clone(),
-        host_nickname: sess.nickname.clone(),
+    let peer_count = (sess.peers.len() + 1).min(MAX_ROOM_PEERS) as u8;
+    let pkt = if sess.lan_room_password.is_some() {
+        LanDiscoveryPacket::AnnounceLocked {
+            announce_id: derive_lan_announce_id(&sess.invite),
+            rv_port: rv.port,
+            auth_port: sess.local_udp_port,
+            peer_count,
+            max_peers: MAX_ROOM_PEERS as u8,
+            room_name: sess.lan_room_name.clone(),
+            host_nickname: sess.nickname.clone(),
+        }
+    } else {
+        LanDiscoveryPacket::Announce {
+            room_id: sess.invite.room_id,
+            secret: sess.invite.secret,
+            rv_port: rv.port,
+            peer_count,
+            max_peers: MAX_ROOM_PEERS as u8,
+            room_name: sess.lan_room_name.clone(),
+            host_nickname: sess.nickname.clone(),
+        }
     };
     broadcast_lan_packet(tx, &pkt).await;
 }
@@ -3992,6 +4327,7 @@ async fn activate_joined_session(
     client_uuid: ClientUuid,
     is_lan_room: bool,
     room_name: String,
+    lan_room_password: Option<String>,
     embedded_rv: Option<EmbeddedRendezvousHandle>,
 ) {
     if let Some(old_sess) = session.take() {
@@ -4020,6 +4356,7 @@ async fn activate_joined_session(
         ctx.hevc_decode_supported,
         is_lan_room,
         room_name,
+        lan_room_password,
         embedded_rv,
         ctx.audio_engine,
         ctx.tr_tx,
@@ -4029,6 +4366,8 @@ async fn activate_joined_session(
     .await;
 
     ctx.discovered_lan.remove(&new_sess.invite.room_id);
+    ctx.discovered_lan
+        .remove(&derive_lan_announce_id(&new_sess.invite));
     publish_lan_rooms(ctx.discovered_lan, ctx.last_published_lan, ctx.evt_tx).await;
 
     send_register(ctx.socket, &new_sess).await;
@@ -4322,6 +4661,175 @@ async fn handle_global_signaling_packet(
     }
 }
 
+async fn send_lan_auth_error(
+    socket: &UdpSocket,
+    dst: SocketAddr,
+    announce_id: RoomId,
+    attempt_id: u64,
+    status: u8,
+) {
+    let reply = Spake2Packet::LanAuthReply {
+        announce_id,
+        attempt_id,
+        status,
+        spake2_msg_b: Vec::new(),
+        nonce: [0u8; 12],
+        encrypted_invite: Vec::new(),
+    };
+    if let Ok(bytes) = reply.encode() {
+        let _ = socket.send_to(&bytes, dst).await;
+    }
+}
+
+async fn handle_lan_auth_req(
+    socket: &UdpSocket,
+    session: Option<&mut ActiveSession>,
+    announce_id: RoomId,
+    attempt_id: u64,
+    spake2_msg_a: &[u8],
+    src_addr: SocketAddr,
+) {
+    let Some(sess) = session else {
+        return;
+    };
+    if !sess.is_lan_room || sess.embedded_rv.is_none() {
+        return;
+    }
+
+    let now = Instant::now();
+    sess.lan_auth_global_times
+        .retain(|t| now.duration_since(*t) < Duration::from_secs(1));
+    if sess.lan_auth_global_times.len() >= LAN_AUTH_GLOBAL_MAX_PER_SEC {
+        return;
+    }
+    sess.lan_auth_global_times.push(now);
+
+    let expected_announce_id = derive_lan_announce_id(&sess.invite);
+    let Some(ref password) = sess.lan_room_password else {
+        send_lan_auth_error(
+            socket,
+            src_addr,
+            announce_id,
+            attempt_id,
+            LAN_AUTH_STATUS_NOT_FOUND,
+        )
+        .await;
+        return;
+    };
+    if announce_id != expected_announce_id {
+        send_lan_auth_error(
+            socket,
+            src_addr,
+            announce_id,
+            attempt_id,
+            LAN_AUTH_STATUS_NOT_FOUND,
+        )
+        .await;
+        return;
+    }
+
+    let src_ip = src_addr.ip();
+    if let Some(bucket) = sess.lan_auth_buckets.get(&src_ip) {
+        if let Some((cached_attempt, ref cached_bytes, ts)) = bucket.last_reply {
+            if cached_attempt == attempt_id && now.duration_since(ts) <= Duration::from_secs(6) {
+                let _ = socket.send_to(cached_bytes, src_addr).await;
+                return;
+            }
+        }
+    }
+
+    if !sess.lan_auth_buckets.contains_key(&src_ip)
+        && sess.lan_auth_buckets.len() >= LAN_AUTH_MAX_BUCKETS
+    {
+        sess.lan_auth_buckets.retain(|_, b| {
+            b.blocked_until.is_some_and(|u| now < u)
+                || b.attempts
+                    .iter()
+                    .any(|t| now.duration_since(*t) <= Duration::from_secs(60))
+        });
+        if sess.lan_auth_buckets.len() >= LAN_AUTH_MAX_BUCKETS {
+            send_lan_auth_error(
+                socket,
+                src_addr,
+                announce_id,
+                attempt_id,
+                LAN_AUTH_STATUS_RATE_LIMITED,
+            )
+            .await;
+            return;
+        }
+    }
+
+    let bucket = sess
+        .lan_auth_buckets
+        .entry(src_ip)
+        .or_insert_with(|| LanAuthRateBucket {
+            attempts: Vec::new(),
+            blocked_until: None,
+            last_reply: None,
+        });
+
+    if bucket.blocked_until.is_some_and(|until| now < until) {
+        send_lan_auth_error(
+            socket,
+            src_addr,
+            announce_id,
+            attempt_id,
+            LAN_AUTH_STATUS_RATE_LIMITED,
+        )
+        .await;
+        return;
+    }
+    if bucket.blocked_until.is_some_and(|until| now >= until) {
+        bucket.blocked_until = None;
+        bucket.attempts.clear();
+    }
+
+    bucket
+        .attempts
+        .retain(|t| now.duration_since(*t) <= Duration::from_secs(60));
+    bucket.attempts.push(now);
+
+    if bucket.attempts.len() > LAN_AUTH_MAX_ATTEMPTS_PER_MIN {
+        bucket.blocked_until = Some(now + LAN_AUTH_BLOCK_DURATION);
+        send_lan_auth_error(
+            socket,
+            src_addr,
+            announce_id,
+            attempt_id,
+            LAN_AUTH_STATUS_RATE_LIMITED,
+        )
+        .await;
+        return;
+    }
+
+    match spake2_lan_host_seal_invite(
+        password,
+        &announce_id,
+        attempt_id,
+        spake2_msg_a,
+        &sess.invite,
+    ) {
+        Ok((spake2_msg_b, nonce, encrypted_invite)) => {
+            let reply = Spake2Packet::LanAuthReply {
+                announce_id,
+                attempt_id,
+                status: LAN_AUTH_STATUS_OK,
+                spake2_msg_b,
+                nonce,
+                encrypted_invite,
+            };
+            if let Ok(bytes) = reply.encode() {
+                bucket.last_reply = Some((attempt_id, bytes.clone(), now));
+                let _ = socket.send_to(&bytes, src_addr).await;
+            }
+        }
+        Err(e) => {
+            debug!("SPAKE2 LAN host seal failed: {e}");
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4504,6 +5012,10 @@ mod tests {
                 last_advertised_direct_peers: Vec::new(),
                 active_short_code: None,
                 last_spake2_reply_times: Vec::new(),
+                local_udp_port: 0,
+                lan_room_password: None,
+                lan_auth_buckets: HashMap::new(),
+                lan_auth_global_times: Vec::new(),
             }
         };
 
@@ -5308,5 +5820,338 @@ mod tests {
         aud_b.shutdown();
         aud_c.shutdown();
         rv.stop().await;
+    }
+
+    async fn query_session_info(
+        tx: &mpsc::Sender<MeshCommand>,
+    ) -> Option<(SocketAddr, SocketAddr, RoomId, bool)> {
+        let (reply_tx, mut reply_rx) = mpsc::channel(1);
+        tx.send(MeshCommand::TestGetSessionInfo(reply_tx))
+            .await
+            .unwrap();
+        reply_rx.recv().await.flatten()
+    }
+
+    #[tokio::test]
+    async fn test_mesh_worker_locked_lan_room_spake2_auth_rate_limit_and_failover() {
+        let (aud_a, tx_a, mut rx_a, uuid_a) = spawn_test_node(0xF1);
+        let (aud_b, tx_b, mut rx_b, uuid_b) = spawn_test_node(0xF2);
+        let (aud_c, tx_c, mut rx_c, uuid_c) = spawn_test_node(0xF3);
+        let (aud_d, tx_d, mut rx_d, uuid_d) = spawn_test_node(0xF4);
+
+        // 1. Host A creates a password-protected LAN room.
+        tx_a.send(MeshCommand::HostLanRoom {
+            room_name: "Private LAN".to_string(),
+            password: Some("squad-lan-42".to_string()),
+            nickname: "LanHostA".to_string(),
+            client_uuid: uuid_a,
+        })
+        .await
+        .unwrap();
+
+        let join_deadline = Instant::now() + Duration::from_secs(4);
+        let mut uri_a: Option<String> = None;
+        while Instant::now() < join_deadline && uri_a.is_none() {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::JoinedRoom {
+                    invite_uri,
+                    is_lan_locked,
+                    ..
+                } = ev
+                {
+                    assert!(is_lan_locked, "Locked LAN host must set is_lan_locked=true");
+                    uri_a = Some(invite_uri);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let uri_a = uri_a.expect("Host A must emit JoinedRoom");
+        let invite_a = InviteLink::parse(&uri_a).unwrap();
+
+        let (rv_addr_a, auth_addr_a, announce_id_a, has_rv_a) = query_session_info(&tx_a)
+            .await
+            .expect("Host A active session");
+        assert!(has_rv_a);
+        assert_eq!(announce_id_a, derive_lan_announce_id(&invite_a));
+        assert_ne!(announce_id_a, invite_a.room_id);
+
+        // 2. Wire check: AnnounceLocked never leaks room_id or secret on broadcast.
+        let announce_pkt = LanDiscoveryPacket::AnnounceLocked {
+            announce_id: announce_id_a,
+            rv_port: rv_addr_a.port(),
+            auth_port: auth_addr_a.port(),
+            peer_count: 1,
+            max_peers: 10,
+            room_name: "Private LAN".to_string(),
+            host_nickname: "LanHostA".to_string(),
+        };
+        let announce_bytes = announce_pkt.encode().unwrap();
+        assert!(!announce_bytes.windows(32).any(|w| w == invite_a.secret));
+        assert!(!announce_bytes.windows(16).any(|w| w == invite_a.room_id));
+
+        let locked_room = DiscoveredLanRoom {
+            room_id: announce_id_a,
+            secret: None,
+            host_addr: rv_addr_a,
+            auth_addr: Some(auth_addr_a),
+            room_name: "Private LAN".to_string(),
+            host_nickname: "LanHostA".to_string(),
+            peer_count: 1,
+            max_peers: 10,
+        };
+        assert!(locked_room.requires_password());
+
+        // 3. Joiner B attempts wrong password (#1 from 127.0.0.1) -> must reject without joining.
+        tx_b.send(MeshCommand::JoinLockedLanRoom {
+            room: locked_room.clone(),
+            password: "wrong-pw".to_string(),
+            nickname: "JoinerB".to_string(),
+            client_uuid: uuid_b,
+        })
+        .await
+        .unwrap();
+
+        let err_deadline = Instant::now() + Duration::from_secs(3);
+        let mut wrong_err = None;
+        while Instant::now() < err_deadline && wrong_err.is_none() {
+            while let Ok(ev) = rx_b.try_recv() {
+                match ev {
+                    MeshEvent::LanAuthFailed(msg) => wrong_err = Some(msg),
+                    MeshEvent::JoinedRoom { .. } => {
+                        panic!("Wrong LAN password must never emit JoinedRoom");
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            wrong_err
+                .as_deref()
+                .is_some_and(|m| m.contains("Incorrect room password")),
+            "Expected Incorrect room password, got {wrong_err:?}"
+        );
+
+        // 4. Joiner B unlocks with right password (#2 from 127.0.0.1) -> joins & exchanges encrypted chat.
+        tx_b.send(MeshCommand::JoinLockedLanRoom {
+            room: locked_room.clone(),
+            password: "squad-lan-42".to_string(),
+            nickname: "JoinerB".to_string(),
+            client_uuid: uuid_b,
+        })
+        .await
+        .unwrap();
+
+        let connect_deadline = Instant::now() + Duration::from_secs(6);
+        let mut b_joined = false;
+        let mut a_connected = false;
+        let mut b_connected = false;
+        while Instant::now() < connect_deadline && !(b_joined && a_connected && b_connected) {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers.iter().any(|p| p.status == PeerConnStatus::Connected) {
+                        a_connected = true;
+                    }
+                }
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                match ev {
+                    MeshEvent::JoinedRoom {
+                        invite_uri,
+                        is_lan_locked,
+                        ..
+                    } => {
+                        assert_eq!(invite_uri, uri_a);
+                        assert!(is_lan_locked);
+                        b_joined = true;
+                    }
+                    MeshEvent::PeersUpdated(peers)
+                        if peers.iter().any(|p| p.status == PeerConnStatus::Connected) =>
+                    {
+                        b_connected = true;
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(b_joined && a_connected && b_connected);
+
+        tx_a.send(MeshCommand::SendChatText {
+            text: "Locked LAN chat ok!".to_string(),
+        })
+        .await
+        .unwrap();
+        let chat_deadline = Instant::now() + Duration::from_secs(3);
+        let mut b_got_chat = false;
+        while Instant::now() < chat_deadline && !b_got_chat {
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::ChatItemReceived(item) = ev {
+                    if matches!(item.content, ChatContentUi::Text(ref t) if t == "Locked LAN chat ok!")
+                    {
+                        b_got_chat = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(b_got_chat, "Joiner B must decrypt Host A chat");
+
+        // 5. Rate limiting on Host A: 3 more wrong attempts (#3..#5) succeed in SPAKE2 fail, #6 is blocked.
+        for attempt_idx in 3..=6 {
+            tx_c.send(MeshCommand::JoinLockedLanRoom {
+                room: locked_room.clone(),
+                password: format!("bad-{attempt_idx}"),
+                nickname: "AttackerC".to_string(),
+                client_uuid: uuid_c,
+            })
+            .await
+            .unwrap();
+
+            let rl_deadline = Instant::now() + Duration::from_secs(3);
+            let mut c_err = None;
+            while Instant::now() < rl_deadline && c_err.is_none() {
+                while let Ok(ev) = rx_c.try_recv() {
+                    if let MeshEvent::LanAuthFailed(msg) = ev {
+                        c_err = Some(msg);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+            let msg = c_err.expect("Expected LanAuthFailed for attempt");
+            if attempt_idx <= 5 {
+                assert!(
+                    msg.contains("Incorrect room password"),
+                    "Attempt #{attempt_idx} expected wrong password error, got: {msg}"
+                );
+            } else {
+                assert!(
+                    msg.contains("Too many wrong password attempts"),
+                    "6th attempt must trigger rate limit, got: {msg}"
+                );
+            }
+        }
+
+        // 6. LAN Host Failover preserves password & announce_id on promoted Host B.
+        tx_a.send(MeshCommand::LeaveRoom).await.unwrap();
+        let promo_deadline = Instant::now() + Duration::from_secs(6);
+        let mut promoted_info = None;
+        while Instant::now() < promo_deadline && promoted_info.is_none() {
+            if let Some((rv_b, auth_b, ann_b, true)) = query_session_info(&tx_b).await {
+                promoted_info = Some((rv_b, auth_b, ann_b));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(40)).await;
+        }
+        let (rv_addr_b, auth_addr_b, announce_id_b) =
+            promoted_info.expect("Peer B must promote to embedded LAN coordinator");
+        assert_eq!(announce_id_b, announce_id_a);
+
+        let migrated_room = DiscoveredLanRoom {
+            room_id: announce_id_b,
+            secret: None,
+            host_addr: rv_addr_b,
+            auth_addr: Some(auth_addr_b),
+            room_name: "Private LAN".to_string(),
+            host_nickname: "JoinerB".to_string(),
+            peer_count: 1,
+            max_peers: 10,
+        };
+
+        // Joiner D fails with wrong password against promoted Host B
+        tx_d.send(MeshCommand::JoinLockedLanRoom {
+            room: migrated_room.clone(),
+            password: "wrong-after-failover".to_string(),
+            nickname: "JoinerD".to_string(),
+            client_uuid: uuid_d,
+        })
+        .await
+        .unwrap();
+        let d_err_deadline = Instant::now() + Duration::from_secs(3);
+        let mut d_err = None;
+        while Instant::now() < d_err_deadline && d_err.is_none() {
+            while let Ok(ev) = rx_d.try_recv() {
+                if let MeshEvent::LanAuthFailed(msg) = ev {
+                    d_err = Some(msg);
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            d_err
+                .as_deref()
+                .is_some_and(|m| m.contains("Incorrect room password")),
+            "Promoted Host B must still reject wrong password, got {d_err:?}"
+        );
+
+        // Joiner D succeeds with original password against promoted Host B
+        tx_d.send(MeshCommand::JoinLockedLanRoom {
+            room: migrated_room,
+            password: "squad-lan-42".to_string(),
+            nickname: "JoinerD".to_string(),
+            client_uuid: uuid_d,
+        })
+        .await
+        .unwrap();
+
+        let d_join_deadline = Instant::now() + Duration::from_secs(6);
+        let mut d_joined = false;
+        let mut d_connected = false;
+        while Instant::now() < d_join_deadline && !(d_joined && d_connected) {
+            while let Ok(ev) = rx_d.try_recv() {
+                match ev {
+                    MeshEvent::JoinedRoom {
+                        invite_uri,
+                        is_lan_locked,
+                        ..
+                    } => {
+                        assert_eq!(invite_uri, uri_a);
+                        assert!(is_lan_locked);
+                        d_joined = true;
+                    }
+                    MeshEvent::PeersUpdated(peers)
+                        if peers.iter().any(|p| p.status == PeerConnStatus::Connected) =>
+                    {
+                        d_connected = true;
+                    }
+                    _ => {}
+                }
+            }
+            while rx_b.try_recv().is_ok() {}
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            d_joined && d_connected,
+            "Joiner D must unlock and connect to promoted LAN Host B"
+        );
+
+        tx_b.send(MeshCommand::SendChatText {
+            text: "Survived locked LAN failover!".to_string(),
+        })
+        .await
+        .unwrap();
+        let d_chat_deadline = Instant::now() + Duration::from_secs(3);
+        let mut d_got_chat = false;
+        while Instant::now() < d_chat_deadline && !d_got_chat {
+            while let Ok(ev) = rx_d.try_recv() {
+                if let MeshEvent::ChatItemReceived(item) = ev {
+                    if matches!(item.content, ChatContentUi::Text(ref t) if t == "Survived locked LAN failover!")
+                    {
+                        d_got_chat = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(d_got_chat, "Joiner D must decrypt promoted Host B chat");
+
+        let _ = tx_a.send(MeshCommand::Shutdown).await;
+        let _ = tx_b.send(MeshCommand::Shutdown).await;
+        let _ = tx_c.send(MeshCommand::Shutdown).await;
+        let _ = tx_d.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        aud_c.shutdown();
+        aud_d.shutdown();
     }
 }

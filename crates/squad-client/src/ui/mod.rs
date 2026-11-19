@@ -211,6 +211,12 @@ pub enum Message {
     JoinByShortCode,
     GenerateShortCode,
     CopyShortCode,
+    LanRoomPasswordChanged(String),
+    ToggleLanHostPasswordVisible,
+    LanJoinPasswordChanged(String),
+    ToggleLanJoinPasswordVisible,
+    ConfirmJoinLockedLanRoom,
+    CloseLanPasswordModal,
 }
 
 struct UiSyncState {
@@ -374,6 +380,14 @@ pub struct SquadApp {
     pub recording_hotkey: Option<HotkeySlot>,
     pub lan_rooms: Vec<DiscoveredLanRoom>,
     pub lan_room_name_input: String,
+    pub lan_room_password_input: String,
+    pub lan_host_password_visible: bool,
+    pub lan_password_modal_room: Option<DiscoveredLanRoom>,
+    pub lan_join_password_input: String,
+    pub lan_join_password_visible: bool,
+    pub lan_join_password_error: Option<String>,
+    pub lan_join_in_progress: bool,
+    pub active_lan_locked: bool,
     pub available_update: Option<crate::updater::ReleaseInfo>,
     pub update_modal_open: bool,
     pub update_in_progress: bool,
@@ -523,6 +537,14 @@ impl SquadApp {
             recording_hotkey: None,
             lan_rooms: Vec::new(),
             lan_room_name_input: String::new(),
+            lan_room_password_input: String::new(),
+            lan_host_password_visible: false,
+            lan_password_modal_room: None,
+            lan_join_password_input: String::new(),
+            lan_join_password_visible: false,
+            lan_join_password_error: None,
+            lan_join_in_progress: false,
+            active_lan_locked: false,
             available_update: None,
             update_modal_open: false,
             update_in_progress: false,
@@ -665,6 +687,7 @@ impl SquadApp {
                         MeshEvent::JoinedRoom {
                             local_peer_id,
                             invite_uri,
+                            is_lan_locked,
                         } => {
                             if self.screen != Screen::Room {
                                 self.prepare_for_room_entry();
@@ -685,6 +708,12 @@ impl SquadApp {
                             self.invite_friends_modal_open = false;
                             self.invited_friends_session.clear();
                             self.incoming_call = None;
+                            self.lan_password_modal_room = None;
+                            self.lan_join_password_input.clear();
+                            self.lan_join_password_visible = false;
+                            self.lan_join_password_error = None;
+                            self.lan_join_in_progress = false;
+                            self.active_lan_locked = is_lan_locked;
                             self.screen = Screen::Room;
                             self.status_banner = None;
                             self.audio.set_streams_active(true);
@@ -694,6 +723,14 @@ impl SquadApp {
                             self.ui_sync.in_settings.store(false, Ordering::Release);
                             self.ui_sync.audio_ui_notify.notify_one();
                             overlay_sync_needed = true;
+                        }
+                        MeshEvent::LanAuthFailed(err) => {
+                            self.lan_join_in_progress = false;
+                            if self.lan_password_modal_room.is_some() {
+                                self.lan_join_password_error = Some(err);
+                            } else {
+                                self.status_banner = Some(err);
+                            }
                         }
                         MeshEvent::LeftRoom => {
                             self.peers.clear();
@@ -712,6 +749,7 @@ impl SquadApp {
                             self.invite_friends_modal_open = false;
                             self.invited_friends_session.clear();
                             self.short_code_joining = false;
+                            self.active_lan_locked = false;
                             self.is_local_sharing = false;
                             self.local_stream_preview = false;
                             self.local_stream_subscribers = 0;
@@ -984,27 +1022,54 @@ impl SquadApp {
             }
             Message::HostLanRoom => {
                 let room_name = self.lan_room_name_input.trim().to_string();
+                let raw_pw = self.lan_room_password_input.trim().to_string();
+                if raw_pw.len() > squad_proto::MAX_LAN_PASSWORD_LEN {
+                    self.status_banner = Some(format!(
+                        "LAN room password exceeds maximum length of {} bytes",
+                        squad_proto::MAX_LAN_PASSWORD_LEN
+                    ));
+                    return Task::none();
+                }
+                let password = if raw_pw.is_empty() {
+                    None
+                } else {
+                    Some(raw_pw)
+                };
+                self.lan_room_password_input.clear();
+                self.lan_host_password_visible = false;
                 self.prepare_for_room_entry();
+                self.active_lan_locked = password.is_some();
                 let _ = self.mesh_tx.try_send(MeshCommand::HostLanRoom {
                     room_name,
+                    password,
                     nickname: self.config.nickname.clone(),
                     client_uuid: self.config.client_uuid(),
                 });
                 self.enter_room_ui_state()
             }
             Message::JoinLanRoom(room) => {
-                let invite = InviteLink {
-                    room_id: room.room_id,
-                    secret: room.secret,
-                };
-                self.active_invite_uri = invite.to_uri();
-                self.invite_copied_flash = false;
-                self.join_with_invite(
-                    invite,
-                    room.host_addr.to_string(),
-                    true,
-                    Some(room.room_name),
-                )
+                if let Some(secret) = room.secret {
+                    let invite = InviteLink {
+                        room_id: room.room_id,
+                        secret,
+                    };
+                    self.active_invite_uri = invite.to_uri();
+                    self.invite_copied_flash = false;
+                    self.active_lan_locked = false;
+                    self.join_with_invite(
+                        invite,
+                        room.host_addr.to_string(),
+                        true,
+                        Some(room.room_name),
+                    )
+                } else {
+                    self.lan_password_modal_room = Some(room);
+                    self.lan_join_password_input.clear();
+                    self.lan_join_password_visible = false;
+                    self.lan_join_password_error = None;
+                    self.lan_join_in_progress = false;
+                    Task::none()
+                }
             }
             Message::InviteInputChanged(val) => {
                 self.invite_input = val;
@@ -1032,6 +1097,7 @@ impl SquadApp {
                 self.invite_friends_modal_open = false;
                 self.invited_friends_session.clear();
                 self.short_code_joining = false;
+                self.active_lan_locked = false;
                 self.is_local_sharing = false;
                 self.local_stream_preview = false;
                 self.local_stream_subscribers = 0;
@@ -1446,6 +1512,7 @@ impl SquadApp {
                 self.share_modal_open = false;
                 self.add_friend_modal_open = false;
                 self.invite_friends_modal_open = false;
+                self.clear_lan_password_modal(true);
                 if !self.update_in_progress {
                     self.update_modal_open = false;
                 }
@@ -1679,6 +1746,7 @@ impl SquadApp {
                     self.share_modal_open = false;
                     self.add_friend_modal_open = false;
                     self.invite_friends_modal_open = false;
+                    self.clear_lan_password_modal(true);
                     self.lightbox_blob_id = None;
                     self.watched_peer_id = None;
                     self.local_stream_preview = false;
@@ -2105,6 +2173,55 @@ impl SquadApp {
                 }
                 Task::none()
             }
+            Message::LanRoomPasswordChanged(val) => {
+                self.lan_room_password_input = val;
+                Task::none()
+            }
+            Message::ToggleLanHostPasswordVisible => {
+                self.lan_host_password_visible = !self.lan_host_password_visible;
+                Task::none()
+            }
+            Message::LanJoinPasswordChanged(val) => {
+                self.lan_join_password_input = val;
+                self.lan_join_password_error = None;
+                Task::none()
+            }
+            Message::ToggleLanJoinPasswordVisible => {
+                self.lan_join_password_visible = !self.lan_join_password_visible;
+                Task::none()
+            }
+            Message::ConfirmJoinLockedLanRoom => {
+                if self.lan_join_in_progress {
+                    return Task::none();
+                }
+                if let Some(room) = self.lan_password_modal_room.clone() {
+                    let clean_pw = self.lan_join_password_input.trim().to_string();
+                    if clean_pw.is_empty() {
+                        self.lan_join_password_error = Some("Enter room password".to_string());
+                        return Task::none();
+                    }
+                    if clean_pw.len() > squad_proto::MAX_LAN_PASSWORD_LEN {
+                        self.lan_join_password_error = Some(format!(
+                            "Password exceeds maximum length of {} bytes",
+                            squad_proto::MAX_LAN_PASSWORD_LEN
+                        ));
+                        return Task::none();
+                    }
+                    self.lan_join_in_progress = true;
+                    self.lan_join_password_error = None;
+                    let _ = self.mesh_tx.try_send(MeshCommand::JoinLockedLanRoom {
+                        room,
+                        password: clean_pw,
+                        nickname: self.config.nickname.clone(),
+                        client_uuid: self.config.client_uuid(),
+                    });
+                }
+                Task::none()
+            }
+            Message::CloseLanPasswordModal => {
+                self.clear_lan_password_modal(true);
+                Task::none()
+            }
         }
     }
 
@@ -2142,7 +2259,9 @@ impl SquadApp {
             }
         }
 
-        if self.add_friend_modal_open {
+        if let Some(ref lan_room) = self.lan_password_modal_room {
+            stack![base, incoming_call::view_lan_password_modal(self, lan_room)].into()
+        } else if self.add_friend_modal_open {
             stack![base, incoming_call::view_add_friend_modal(self)].into()
         } else if self.invite_friends_modal_open {
             stack![base, incoming_call::view_invite_friends_modal(self)].into()
@@ -2223,6 +2342,17 @@ impl SquadApp {
         }
     }
 
+    fn clear_lan_password_modal(&mut self, cancel_auth: bool) {
+        let had_modal = self.lan_password_modal_room.take().is_some();
+        self.lan_join_password_input.clear();
+        self.lan_join_password_visible = false;
+        self.lan_join_password_error = None;
+        self.lan_join_in_progress = false;
+        if cancel_auth && had_modal {
+            let _ = self.mesh_tx.try_send(MeshCommand::CancelLanAuth);
+        }
+    }
+
     fn prepare_for_room_entry(&mut self) {
         self.chat_messages.clear();
         self.chat_text_editors.clear();
@@ -2237,6 +2367,8 @@ impl SquadApp {
         self.invite_friends_modal_open = false;
         self.invited_friends_session.clear();
         self.short_code_joining = false;
+        self.active_lan_locked = false;
+        self.clear_lan_password_modal(false);
     }
 
     fn sync_presence_to_mesh(&self) {
