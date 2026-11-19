@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 pub const VOICE_UNITY_SCALE: f32 = 1.9;
 const LOOPBACK_GAIN: f32 = 1.25;
+const CUE_UNITY_SCALE: f32 = 0.75;
 
 pub struct SoftLimiter {
     envelope: f32,
@@ -84,6 +85,7 @@ pub struct AudioMixer {
     stream_gain: f32,
     jitter_profile: JitterProfile,
     cue_bank: SoundCueBank,
+    cue_gain: f32,
     active_cues: Vec<ActiveCueCursor>,
     peer_scratch: [f32; FRAME_SAMPLES],
     loopback_frames: [[f32; FRAME_SAMPLES]; 2],
@@ -101,6 +103,7 @@ impl AudioMixer {
             stream_gain: 1.0,
             jitter_profile,
             cue_bank,
+            cue_gain: 1.0,
             active_cues: Vec::with_capacity(4),
             peer_scratch: [0.0; FRAME_SAMPLES],
             loopback_frames: [[0.0; FRAME_SAMPLES]; 2],
@@ -209,7 +212,26 @@ impl AudioMixer {
         self.stream_peers.clear();
     }
 
+    pub fn set_cue_gain(&mut self, gain: f32) {
+        let clamped = if gain.is_finite() {
+            gain.clamp(0.0, 2.0)
+        } else {
+            1.0
+        };
+        self.cue_gain = clamped;
+        if self.cue_gain <= 0.0001 {
+            self.active_cues.clear();
+        }
+    }
+
+    pub fn cue_gain(&self) -> f32 {
+        self.cue_gain
+    }
+
     pub fn trigger_cue(&mut self, cue: SoundCue) {
+        if self.cue_gain <= 0.0001 {
+            return;
+        }
         if let Some(samples) = self.cue_bank.get(cue) {
             self.active_cues.clear();
             self.active_cues.push(ActiveCueCursor { samples, pos: 0 });
@@ -264,18 +286,23 @@ impl AudioMixer {
             self.loopback_len -= 1;
         }
 
-        self.active_cues.retain_mut(|cursor| {
-            let remaining = cursor.samples.len().saturating_sub(cursor.pos);
-            let count = remaining.min(FRAME_SAMPLES);
-            if count > 0 {
-                had_audio = true;
-            }
-            for i in 0..count {
-                out_frame[i] += cursor.samples[cursor.pos + i] * 0.75;
-            }
-            cursor.pos += count;
-            cursor.pos < cursor.samples.len()
-        });
+        let cue_scale = self.cue_gain * CUE_UNITY_SCALE;
+        if cue_scale <= 0.0001 {
+            self.active_cues.clear();
+        } else {
+            self.active_cues.retain_mut(|cursor| {
+                let remaining = cursor.samples.len().saturating_sub(cursor.pos);
+                let count = remaining.min(FRAME_SAMPLES);
+                if count > 0 {
+                    had_audio = true;
+                }
+                for i in 0..count {
+                    out_frame[i] += cursor.samples[cursor.pos + i] * cue_scale;
+                }
+                cursor.pos += count;
+                cursor.pos < cursor.samples.len()
+            });
+        }
 
         if !had_audio {
             return false;
@@ -406,5 +433,64 @@ mod tests {
         let recovered = limiter.process_sample(0.25);
         assert!(recovered.is_finite());
         assert!((recovered - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_cue_gain_scaling_and_mute() {
+        let cue_bank = SoundCueBank::load_optional();
+        let mut mixer = AudioMixer::new(cue_bank, JitterProfile::Balanced);
+        assert!((mixer.cue_gain() - 1.0).abs() < 1e-6);
+
+        mixer.set_cue_gain(-1.0);
+        assert_eq!(mixer.cue_gain(), 0.0);
+        mixer.set_cue_gain(5.0);
+        assert_eq!(mixer.cue_gain(), 2.0);
+        mixer.set_cue_gain(f32::NAN);
+        assert_eq!(mixer.cue_gain(), 1.0);
+
+        mixer.set_cue_gain(0.0);
+        mixer.trigger_cue(SoundCue::Join);
+        assert!(!mixer.has_active_cues());
+        let mut muted_frame = [1.0f32; FRAME_SAMPLES];
+        assert!(!mixer.mix_frame(false, &mut muted_frame));
+        assert!(muted_frame.iter().all(|&x| x == 0.0));
+
+        let rms_for_gain = |gain: f32| -> f32 {
+            let bank = SoundCueBank::load_optional();
+            let mut m = AudioMixer::new(bank, JitterProfile::Balanced);
+            m.set_cue_gain(gain);
+            m.trigger_cue(SoundCue::Join);
+            assert!(m.has_active_cues());
+            let mut frame = [0.0f32; FRAME_SAMPLES];
+            let mut sum_sq = 0.0f64;
+            let mut count = 0usize;
+            while m.mix_frame(false, &mut frame) {
+                for &s in &frame {
+                    sum_sq += f64::from(s) * f64::from(s);
+                    count += 1;
+                }
+            }
+            (sum_sq / count.max(1) as f64).sqrt() as f32
+        };
+
+        let rms_half = rms_for_gain(0.5);
+        let rms_unity = rms_for_gain(1.0);
+        let rms_double = rms_for_gain(2.0);
+        assert!(rms_unity > 0.001, "Expected audible cue at unity gain");
+        let ratio = rms_half / rms_unity;
+        assert!(
+            (ratio - 0.5).abs() < 0.05,
+            "Expected ~0.5 RMS ratio for 50% vs 100% cue gain, got {ratio}"
+        );
+        assert!(
+            rms_double > rms_unity,
+            "Expected 200% cue gain RMS ({rms_double}) > 100% ({rms_unity})"
+        );
+
+        mixer.set_cue_gain(1.0);
+        mixer.trigger_cue(SoundCue::Join);
+        assert!(mixer.has_active_cues());
+        mixer.set_cue_gain(0.0);
+        assert!(!mixer.has_active_cues());
     }
 }

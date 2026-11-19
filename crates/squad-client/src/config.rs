@@ -55,6 +55,8 @@ pub struct AppConfig {
     pub minimize_to_tray: bool,
     #[serde(default = "default_stream_volume")]
     pub stream_volume: f32,
+    #[serde(default = "default_cue_volume")]
+    pub cue_volume: f32,
     #[serde(default = "default_overlay_enabled")]
     pub overlay_enabled: bool,
     #[serde(default)]
@@ -91,6 +93,7 @@ impl Default for AppConfig {
             custom_avatar_hash: None,
             minimize_to_tray: default_minimize_to_tray(),
             stream_volume: default_stream_volume(),
+            cue_volume: default_cue_volume(),
             overlay_enabled: default_overlay_enabled(),
             overlay_speaking_only: false,
             overlay_opacity: default_overlay_opacity(),
@@ -223,6 +226,10 @@ fn default_stream_volume() -> f32 {
     1.0
 }
 
+fn default_cue_volume() -> f32 {
+    1.0
+}
+
 fn default_overlay_enabled() -> bool {
     true
 }
@@ -313,6 +320,7 @@ mod tests {
     #[test]
     fn app_config_overlay_defaults_and_serde_roundtrip() {
         let mut cfg = AppConfig::default();
+        assert!((cfg.cue_volume - 1.0).abs() < 1e-4);
         assert!(cfg.overlay_enabled);
         assert!(!cfg.overlay_speaking_only);
         assert!((cfg.overlay_opacity - 0.82).abs() < 1e-4);
@@ -323,6 +331,7 @@ mod tests {
             format!("{:?}", JitterProfile::default())
         );
 
+        cfg.cue_volume = 0.45;
         cfg.overlay_enabled = false;
         cfg.overlay_speaking_only = true;
         cfg.overlay_opacity = 0.65;
@@ -331,6 +340,7 @@ mod tests {
 
         let encoded = toml::to_string_pretty(&cfg).unwrap();
         let decoded: AppConfig = toml::from_str(&encoded).unwrap();
+        assert!((decoded.cue_volume - 0.45).abs() < 1e-4);
         assert!(!decoded.overlay_enabled);
         assert!(decoded.overlay_speaking_only);
         assert!((decoded.overlay_opacity - 0.65).abs() < 1e-4);
@@ -347,10 +357,12 @@ mod tests {
                 !line.starts_with("hotkey_deafen =")
                     && !line.starts_with("jitter_profile =")
                     && !line.starts_with("opus_bitrate_bps =")
+                    && !line.starts_with("cue_volume =")
             })
             .collect::<Vec<_>>()
             .join("\n");
         let legacy_decoded: AppConfig = toml::from_str(&legacy_toml).unwrap();
+        assert!((legacy_decoded.cue_volume - 1.0).abs() < 1e-4);
         assert_eq!(legacy_decoded.hotkey_deafen, "F10");
         assert_eq!(legacy_decoded.opus_bitrate_bps, 40_000);
         assert_eq!(

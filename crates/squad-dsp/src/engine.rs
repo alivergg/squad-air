@@ -68,6 +68,7 @@ pub struct AudioEngineConfig {
     pub ns_mode: NoiseSuppressionMode,
     pub activation_mode: MicActivationMode,
     pub input_gain: f32,
+    pub cue_gain: f32,
     pub vad_threshold_db: f32,
     pub bitrate_bps: i32,
     pub jitter_profile: JitterProfile,
@@ -82,10 +83,19 @@ impl Default for AudioEngineConfig {
             ns_mode: NoiseSuppressionMode::Rnnoise,
             activation_mode: MicActivationMode::PushToMute,
             input_gain: 1.0,
+            cue_gain: 1.0,
             vad_threshold_db: -45.0,
             bitrate_bps: 40_000,
             jitter_profile: JitterProfile::default(),
         }
+    }
+}
+
+fn sanitize_cue_gain(gain: f32) -> f32 {
+    if gain.is_finite() {
+        gain.clamp(0.0, 2.0)
+    } else {
+        1.0
     }
 }
 
@@ -141,6 +151,7 @@ struct SharedAtomics {
     stream_audio_sharing: AtomicBool,
     activation_mode: AtomicU8,
     input_gain_bits: AtomicU32,
+    cue_gain_bits: AtomicU32,
     vad_threshold_db_bits: AtomicU32,
     mic_level_db_bits: AtomicU32,
     jitter_target_ms: AtomicU32,
@@ -180,6 +191,7 @@ impl AudioEngineHandle {
             stream_audio_sharing: AtomicBool::new(false),
             activation_mode: AtomicU8::new(config.activation_mode as u8),
             input_gain_bits: AtomicU32::new(config.input_gain.to_bits()),
+            cue_gain_bits: AtomicU32::new(sanitize_cue_gain(config.cue_gain).to_bits()),
             vad_threshold_db_bits: AtomicU32::new(
                 config.vad_threshold_db.clamp(-60.0, 0.0).to_bits(),
             ),
@@ -341,7 +353,20 @@ impl AudioEngineHandle {
     }
 
     pub fn play_cue(&self, cue: SoundCue) {
+        if self.cue_gain() <= 0.0001 {
+            return;
+        }
         let _ = self.cmd_tx.try_send(EngineCmd::PlayCue(cue));
+    }
+
+    pub fn set_cue_gain(&self, gain: f32) {
+        self.atomics
+            .cue_gain_bits
+            .store(sanitize_cue_gain(gain).to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn cue_gain(&self) -> f32 {
+        f32::from_bits(self.atomics.cue_gain_bits.load(Ordering::Relaxed))
     }
 
     pub fn set_mic_muted(&self, muted: bool) {
@@ -1052,7 +1077,12 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
                 drop(ctx.stream_loopback.take());
             }
         }
-        EngineCmd::PlayCue(cue) => ctx.mixer.trigger_cue(cue),
+        EngineCmd::PlayCue(cue) => {
+            ctx.mixer.set_cue_gain(f32::from_bits(
+                ctx.atomics.cue_gain_bits.load(Ordering::Relaxed),
+            ));
+            ctx.mixer.trigger_cue(cue);
+        }
         EngineCmd::Shutdown => return false,
     }
     true
@@ -1085,6 +1115,9 @@ fn run_audio_worker(
     let mut encoder = OpusEncoder10ms::new(config.bitrate_bps).expect("Opus encoder init");
     let cue_bank = SoundCueBank::load_optional();
     let mut mixer = AudioMixer::new(cue_bank, config.jitter_profile);
+    mixer.set_cue_gain(f32::from_bits(
+        atomics.cue_gain_bits.load(Ordering::Relaxed),
+    ));
 
     let mut raw_in_buf = [0.0f32; 960];
     let mut frame_48k = [0.0f32; FRAME_SAMPLES];
@@ -1257,6 +1290,9 @@ fn run_audio_worker(
         }
 
         let deafened = atomics.deafened.load(Ordering::Relaxed);
+        mixer.set_cue_gain(f32::from_bits(
+            atomics.cue_gain_bits.load(Ordering::Relaxed),
+        ));
         let has_audio = mixer.mix_frame(deafened, &mut mixed_48k);
         if has_audio || silent_out_frames < 4 {
             if has_audio {

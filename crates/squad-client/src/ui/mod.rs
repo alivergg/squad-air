@@ -117,6 +117,9 @@ pub enum Message {
     SetJitterProfile(JitterProfile),
     SetOpusBitrate(i32),
     InputGainChanged(f32),
+    CueVolumeChanged(f32),
+    CueVolumeReleased,
+    TestCueSound,
     VadThresholdChanged(f32),
     NicknameChanged(String),
     RendezvousServerChanged(String),
@@ -423,6 +426,7 @@ impl SquadApp {
             ns_mode: config.ns_mode,
             activation_mode: config.activation_mode,
             input_gain: config.input_gain,
+            cue_gain: config.cue_volume,
             vad_threshold_db: config.vad_threshold_db,
             bitrate_bps: config.opus_bitrate_bps,
             jitter_profile: config.jitter_profile,
@@ -1221,6 +1225,24 @@ impl SquadApp {
             Message::InputGainChanged(gain) => {
                 self.config.input_gain = gain;
                 self.audio.set_input_gain(gain);
+                Task::none()
+            }
+            Message::CueVolumeChanged(gain) => {
+                let clamped = if gain.is_finite() {
+                    gain.clamp(0.0, 2.0)
+                } else {
+                    1.0
+                };
+                self.config.cue_volume = clamped;
+                self.audio.set_cue_gain(clamped);
+                Task::none()
+            }
+            Message::CueVolumeReleased => {
+                let _ = self.config.save();
+                Task::none()
+            }
+            Message::TestCueSound => {
+                self.audio.play_cue(SoundCue::Join);
                 Task::none()
             }
             Message::VadThresholdChanged(threshold_db) => {

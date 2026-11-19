@@ -177,6 +177,14 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
         "Enhanced (Auto)"
     };
 
+    let cue_vol = app.config.cue_volume.clamp(0.0, 2.0);
+    let cue_pct = (cue_vol * 100.0).round() as u32;
+    let cue_label = if cue_pct == 0 {
+        "Muted".to_string()
+    } else {
+        format!("{cue_pct}%")
+    };
+
     let dsp_section = container(
         column![
             text("Voice & Audio Processing").size(16),
@@ -267,6 +275,22 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                     pill_tonal_button
                 })
                 .on_press(Message::ToggleMicLoopback),
+            ]
+            .spacing(12)
+            .align_y(Vertical::Center),
+            row![
+                text("System Sounds Volume:")
+                    .size(14)
+                    .width(Length::Fixed(330.0)),
+                slider(0.0..=2.0, cue_vol, Message::CueVolumeChanged)
+                    .step(0.05_f32)
+                    .on_release(Message::CueVolumeReleased)
+                    .style(m3_slider_style),
+                text(cue_label).size(13).width(Length::Fixed(52.0)),
+                button(text("Test").size(12))
+                    .padding([7, 14])
+                    .style(pill_tonal_button)
+                    .on_press_maybe((cue_pct > 0).then_some(Message::TestCueSound)),
             ]
             .spacing(12)
             .align_y(Vertical::Center),
