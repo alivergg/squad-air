@@ -301,6 +301,16 @@ impl AvatarCache {
         handle
     }
 
+    pub fn handle_for_pub_key(&self, pub_key: &[u8; 32]) -> iced_image::Handle {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"squad-air-friend-pubkey-v1");
+        hasher.update(pub_key);
+        let digest = hasher.finalize();
+        let mut key = [0u8; 16];
+        key.copy_from_slice(&digest.as_bytes()[..16]);
+        self.handle_for(&key)
+    }
+
     pub fn room_handle_for(&self, room_id: &RoomId) -> iced_image::Handle {
         if let Ok(map) = self.room_handles.lock() {
             if let Some(existing) = map.get(room_id) {

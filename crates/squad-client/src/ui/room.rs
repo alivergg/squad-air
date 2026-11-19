@@ -28,9 +28,9 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
 
     let total_members = app.peers.len() + 1;
     let copy_label = if app.invite_copied_flash {
-        "Copied Invite!"
+        "Copied!"
     } else {
-        "Copy Invite"
+        "Copy Link"
     };
     let saved_channel = app
         .config
@@ -62,43 +62,93 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             .style(canvas_panel_style),
         );
 
+    let online_friends_count = app
+        .friends
+        .iter()
+        .filter(|f| app.friend_presences.contains_key(&f.pub_key))
+        .count();
+    let invite_btn_label = if online_friends_count > 0 {
+        format!("Invite ({online_friends_count})")
+    } else {
+        "Invite Friends".to_string()
+    };
+
     let mut header_row = row![
         left_header,
         horizontal_space(),
         text_input("Room name...", &app.save_channel_name_input)
             .on_input(Message::SaveChannelNameChanged)
             .on_submit(Message::SaveActiveChannel)
-            .width(Length::Fixed(165.0))
-            .padding([8, 10])
+            .width(Length::Fixed(130.0))
+            .padding([7, 10])
             .size(12)
             .style(m3_text_input_style),
         button(
             text(if already_saved {
                 "Saved ✓"
             } else {
-                "Save Channel"
+                "Save"
             })
             .size(12)
         )
-        .padding([9, 14])
+        .padding([8, 11])
         .style(if already_saved {
             pill_success_button
         } else {
             pill_tonal_button
         })
         .on_press(Message::SaveActiveChannel),
-        button(text(copy_label).size(12))
-            .padding([9, 14])
-            .style(pill_primary_button)
-            .on_press(Message::CopyInviteUri),
     ]
-    .spacing(8)
+    .spacing(6)
     .align_y(Vertical::Center);
+
+    if let Some((code, _expires_at)) = app.active_short_code {
+        let formatted = crate::ui::format_short_code(code);
+        let code_label = if app.short_code_copied_flash {
+            format!("Copied {formatted}!")
+        } else {
+            format!("Code: {formatted}")
+        };
+        header_row = header_row
+            .push(
+                button(text(code_label).size(12))
+                    .padding([8, 11])
+                    .style(pill_success_button)
+                    .on_press(Message::CopyShortCode),
+            )
+            .push(
+                button(text("↻").size(12))
+                    .padding([8, 10])
+                    .style(pill_tonal_button)
+                    .on_press(Message::GenerateShortCode),
+            );
+    } else {
+        header_row = header_row.push(
+            button(text("6-Digit Code").size(12))
+                .padding([8, 11])
+                .style(pill_tonal_button)
+                .on_press(Message::GenerateShortCode),
+        );
+    }
+
+    header_row = header_row
+        .push(
+            button(text(invite_btn_label).size(12))
+                .padding([8, 11])
+                .style(pill_tonal_button)
+                .on_press(Message::OpenInviteFriendsModal),
+        )
+        .push(
+            button(text(copy_label).size(12))
+                .padding([8, 11])
+                .style(pill_primary_button)
+                .on_press(Message::CopyInviteUri),
+        );
 
     if let Some(ref info) = app.available_update {
         header_row = header_row.push(
             button(text(format!("Update {}", info.tag_name)).size(12))
-                .padding([9, 14])
+                .padding([8, 11])
                 .style(pill_success_button)
                 .on_press(Message::OpenUpdateModal),
         );
@@ -108,13 +158,13 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
         header_row
             .push(
                 button(text("Settings").size(12))
-                    .padding([9, 14])
+                    .padding([8, 11])
                     .style(pill_tonal_button)
                     .on_press(Message::OpenSettings),
             )
             .push(
                 button(text("Leave").size(12))
-                    .padding([9, 14])
+                    .padding([8, 11])
                     .style(pill_danger_button)
                     .on_press(Message::LeaveRoom),
             ),

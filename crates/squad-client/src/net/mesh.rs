@@ -56,7 +56,6 @@ const LAN_RV_LOST_TIMEOUT: Duration = Duration::from_secs(7);
 const LAN_MIGRATION_GRACE: Duration = Duration::from_secs(3);
 const PRESENCE_PING_INTERVAL: Duration = Duration::from_secs(4);
 const PRESENCE_UI_TTL: Duration = Duration::from_secs(15);
-const SHORT_CODE_TTL: Duration = Duration::from_secs(600);
 const SHORT_CODE_JOIN_TIMEOUT: Duration = Duration::from_secs(10);
 const SHORT_CODE_RETRY_INTERVAL: Duration = Duration::from_millis(250);
 const SPAKE2_HOST_MAX_REPLIES_PER_SEC: usize = 8;
@@ -1198,8 +1197,6 @@ pub fn spawn_mesh_worker(
                                 continue;
                             }
                             let code: u32 = rand::thread_rng().gen_range(100_000..=999_999);
-                            sess.active_short_code =
-                                Some((code, Instant::now() + SHORT_CODE_TTL));
                             let pkt = SignalingPacket::C2sRegisterShortCode {
                                 room_id: sess.invite.room_id,
                                 host_pub_key: presence.my_pub_key,
@@ -4290,6 +4287,18 @@ async fn handle_global_signaling_packet(
                     evt_tx
                         .send(MeshEvent::Error(
                             "Invalid or expired 6-digit voice code".to_string(),
+                        ))
+                        .await;
+                } else {
+                    if let Some(sess) = session.as_mut() {
+                        if sess.active_short_code.take().is_some() {
+                            evt_tx.send(MeshEvent::ShortCodeCleared).await;
+                        }
+                    }
+                    evt_tx
+                        .send(MeshEvent::Error(
+                            "Short code collision or room not registered yet; try again."
+                                .to_string(),
                         ))
                         .await;
                 }

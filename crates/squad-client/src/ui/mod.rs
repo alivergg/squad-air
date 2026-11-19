@@ -1,6 +1,7 @@
 pub mod avatar;
 pub mod chat;
 pub mod components;
+pub mod incoming_call;
 pub mod lobby;
 pub mod overlay;
 pub mod overlay_platform;
@@ -11,10 +12,14 @@ pub mod stream_view;
 pub mod theme;
 
 use crate::config::AppConfig;
+use crate::crypto_identity::{
+    format_friend_code, load_friends, parse_friend_code, save_friends, FriendContact,
+};
 use crate::hotkeys::{is_supported_hotkey_name, request_macos_permissions, HotkeyController};
 use crate::net::{
     downloads_root_dir, spawn_mesh_worker, ChatContentUi, ChatItemUi, DecodedVideoFrame,
-    DiscoveredLanRoom, MeshCommand, MeshEvent, PeerUiSnapshot,
+    DiscoveredLanRoom, FriendPresenceUi, IncomingFriendCallUi, MeshCommand, MeshEvent,
+    PeerUiSnapshot,
 };
 use crate::tray::{release_os_memory, SystemTray, TrayAction};
 use crate::ui::avatar::{
@@ -50,7 +55,7 @@ use squad_video::{
     StreamFps, StreamResolution, VideoCodec,
 };
 use std::borrow::Cow;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::Cursor;
 use std::path::PathBuf;
 use std::sync::{
@@ -189,6 +194,23 @@ pub enum Message {
     SkipUpdateVersion,
     StartOneClickUpdate,
     UpdateInstallFinished(Result<String, String>),
+    CopyMyFriendId,
+    OpenAddFriendModal,
+    CloseAddFriendModal,
+    AddFriendCodeChanged(String),
+    AddFriendNickChanged(String),
+    ConfirmAddFriend,
+    RemoveFriend([u8; 32]),
+    CallFriend([u8; 32]),
+    OpenInviteFriendsModal,
+    CloseInviteFriendsModal,
+    InviteFriendToParty([u8; 32]),
+    AcceptIncomingCall,
+    DeclineIncomingCall,
+    ShortCodeInputChanged(String),
+    JoinByShortCode,
+    GenerateShortCode,
+    CopyShortCode,
 }
 
 struct UiSyncState {
@@ -357,12 +379,27 @@ pub struct SquadApp {
     pub update_in_progress: bool,
     pub update_status_text: Option<String>,
     update_manual_check: bool,
+    pub friends: Vec<FriendContact>,
+    pub friend_presences: HashMap<[u8; 32], FriendPresenceUi>,
+    pub friend_id_copied_flash: bool,
+    pub add_friend_modal_open: bool,
+    pub add_friend_code_input: String,
+    pub add_friend_nick_input: String,
+    pub add_friend_error: Option<String>,
+    pub invite_friends_modal_open: bool,
+    pub invited_friends_session: HashSet<[u8; 32]>,
+    pub incoming_call: Option<IncomingFriendCallUi>,
+    pub short_code_input: String,
+    pub short_code_joining: bool,
+    pub active_short_code: Option<(u32, std::time::Instant)>,
+    pub short_code_copied_flash: bool,
     ui_sync: Arc<UiSyncState>,
 }
 
 impl SquadApp {
     pub fn new() -> (Self, Task<Message>) {
         let config = AppConfig::load_or_create();
+        let friends = load_friends();
         let (audio_out_tx, audio_out_rx) = mpsc::channel(256);
 
         let engine_cfg = AudioEngineConfig {
@@ -491,8 +528,23 @@ impl SquadApp {
             update_in_progress: false,
             update_status_text: None,
             update_manual_check: false,
+            friends,
+            friend_presences: HashMap::new(),
+            friend_id_copied_flash: false,
+            add_friend_modal_open: false,
+            add_friend_code_input: String::new(),
+            add_friend_nick_input: String::new(),
+            add_friend_error: None,
+            invite_friends_modal_open: false,
+            invited_friends_session: HashSet::new(),
+            incoming_call: None,
+            short_code_input: String::new(),
+            short_code_joining: false,
+            active_short_code: None,
+            short_code_copied_flash: false,
             ui_sync,
         };
+        app.sync_presence_to_mesh();
 
         let update_task = Task::perform(
             async {
@@ -570,54 +622,7 @@ impl SquadApp {
                 Task::none()
             }
             Message::TrayEventsPending => match self.tray.poll_action(&self.audio) {
-                Some(TrayAction::ShowWindow) => {
-                    self.is_in_tray = false;
-                    self.ui_sync.in_tray.store(false, Ordering::Release);
-                    self.ui_sync.audio_ui_notify.notify_one();
-                    for item in &self.chat_messages {
-                        match &item.content {
-                            ChatContentUi::Text(body_text) => {
-                                self.chat_text_editors
-                                    .entry((item.sender_uuid, item.msg_id))
-                                    .or_insert_with(|| text_editor::Content::with_text(body_text));
-                            }
-                            ChatContentUi::InlineImage {
-                                blob_id,
-                                filename,
-                                bytes: Some(raw),
-                                ..
-                            } => {
-                                self.image_handles
-                                    .entry(*blob_id)
-                                    .or_insert_with(|| iced_image::Handle::from_bytes(raw.clone()));
-                                self.inline_image_bytes
-                                    .entry(*blob_id)
-                                    .or_insert_with(|| (filename.clone(), raw.clone()));
-                            }
-                            _ => {}
-                        }
-                    }
-                    if self.screen == Screen::Room {
-                        self.audio.set_streams_active(true);
-                    } else if self.screen == Screen::Settings {
-                        self.audio.set_streams_active(true);
-                        self.audio.set_monitoring_in_settings(true);
-                        self.ui_sync.in_settings.store(true, Ordering::Release);
-                    }
-                    let _ = self
-                        .mesh_tx
-                        .try_send(MeshCommand::SetTrayMode { in_tray: false });
-                    if let Some(id) = self.main_window_id {
-                        Task::batch([
-                            iced::window::change_mode(id, iced::window::Mode::Windowed),
-                            iced::window::gain_focus(id),
-                        ])
-                    } else {
-                        let (id, open_task) = iced::window::open(main_window_settings());
-                        self.main_window_id = Some(id);
-                        open_task.map(Message::WindowOpened)
-                    }
-                }
+                Some(TrayAction::ShowWindow) => Task::batch(self.restore_from_tray()),
                 Some(TrayAction::Quit) => {
                     self.hotkeys.shutdown();
                     let _ = self.mesh_tx.try_send(MeshCommand::Shutdown);
@@ -649,13 +654,21 @@ impl SquadApp {
             Message::MeshEventsPending => {
                 let mut pending_tasks = Vec::new();
                 let mut overlay_sync_needed = false;
+                let mut events = Vec::new();
                 if let Ok(mut rx) = self.mesh_rx.try_lock() {
                     while let Ok(evt) = rx.try_recv() {
-                        match evt {
+                        events.push(evt);
+                    }
+                }
+                for evt in events {
+                    match evt {
                             MeshEvent::JoinedRoom {
                                 local_peer_id,
                                 invite_uri,
                             } => {
+                                if self.screen != Screen::Room {
+                                    self.prepare_for_room_entry();
+                                }
                                 self.local_peer_id = local_peer_id;
                                 self.active_invite_uri = invite_uri.clone();
                                 self.save_channel_name_input = self
@@ -665,6 +678,13 @@ impl SquadApp {
                                     .find(|c| c.invite_uri == invite_uri)
                                     .map(|c| c.name.clone())
                                     .unwrap_or_default();
+                                self.short_code_joining = false;
+                                self.short_code_input.clear();
+                                self.active_short_code = None;
+                                self.short_code_copied_flash = false;
+                                self.invite_friends_modal_open = false;
+                                self.invited_friends_session.clear();
+                                self.incoming_call = None;
                                 self.screen = Screen::Room;
                                 self.status_banner = None;
                                 self.audio.set_streams_active(true);
@@ -687,6 +707,11 @@ impl SquadApp {
                                 self.chat_input.clear();
                                 self.local_peer_id = 0;
                                 self.share_modal_open = false;
+                                self.active_short_code = None;
+                                self.short_code_copied_flash = false;
+                                self.invite_friends_modal_open = false;
+                                self.invited_friends_session.clear();
+                                self.short_code_joining = false;
                                 self.is_local_sharing = false;
                                 self.local_stream_preview = false;
                                 self.local_stream_subscribers = 0;
@@ -893,15 +918,44 @@ impl SquadApp {
                             MeshEvent::LanRoomsUpdated(rooms) => {
                                 self.lan_rooms = rooms;
                             }
-                            MeshEvent::FriendsStatusUpdated(_)
-                            | MeshEvent::IncomingFriendCall(_)
-                            | MeshEvent::ShortCodeGenerated { .. }
-                            | MeshEvent::ShortCodeCleared
-                            | MeshEvent::FriendInviteSent { .. } => {}
+                            MeshEvent::FriendsStatusUpdated(list) => {
+                                self.friend_presences = list
+                                    .into_iter()
+                                    .filter(|f| f.online)
+                                    .map(|f| (f.pub_key, f))
+                                    .collect();
+                            }
+                            MeshEvent::IncomingFriendCall(call) => {
+                                self.incoming_call = Some(call);
+                                if self.is_in_tray {
+                                    pending_tasks.extend(self.restore_from_tray());
+                                } else if let Some(id) = self.main_window_id {
+                                    pending_tasks.push(iced::window::gain_focus(id));
+                                }
+                            }
+                            MeshEvent::ShortCodeGenerated {
+                                code,
+                                expires_in_secs,
+                            } => {
+                                self.active_short_code = Some((
+                                    code,
+                                    std::time::Instant::now()
+                                        + Duration::from_secs(expires_in_secs as u64),
+                                ));
+                                self.short_code_copied_flash = false;
+                                self.status_banner = None;
+                            }
+                            MeshEvent::ShortCodeCleared => {
+                                self.active_short_code = None;
+                                self.short_code_copied_flash = false;
+                            }
+                            MeshEvent::FriendInviteSent { target_pub_key } => {
+                                self.invited_friends_session.insert(target_pub_key);
+                            }
                             MeshEvent::Error(err) => {
+                                self.short_code_joining = false;
                                 self.status_banner = Some(err);
                             }
-                        }
                     }
                 }
                 if overlay_sync_needed {
@@ -975,6 +1029,11 @@ impl SquadApp {
                 self.lightbox_blob_id = None;
                 self.chat_input.clear();
                 self.share_modal_open = false;
+                self.active_short_code = None;
+                self.short_code_copied_flash = false;
+                self.invite_friends_modal_open = false;
+                self.invited_friends_session.clear();
+                self.short_code_joining = false;
                 self.is_local_sharing = false;
                 self.local_stream_preview = false;
                 self.local_stream_subscribers = 0;
@@ -1029,6 +1088,7 @@ impl SquadApp {
                 self.audio.set_mic_loopback(false);
                 let _ = self.config.save();
                 self.rebind_hotkeys();
+                self.sync_presence_to_mesh();
                 self.screen = self.previous_screen;
                 self.audio.set_monitoring_in_settings(false);
                 if self.screen != Screen::Room {
@@ -1386,6 +1446,8 @@ impl SquadApp {
             Message::EscapePressed => {
                 self.lightbox_blob_id = None;
                 self.share_modal_open = false;
+                self.add_friend_modal_open = false;
+                self.invite_friends_modal_open = false;
                 if !self.update_in_progress {
                     self.update_modal_open = false;
                 }
@@ -1617,6 +1679,8 @@ impl SquadApp {
                     self.is_in_tray = true;
                     self.main_window_id = None;
                     self.share_modal_open = false;
+                    self.add_friend_modal_open = false;
+                    self.invite_friends_modal_open = false;
                     self.lightbox_blob_id = None;
                     self.watched_peer_id = None;
                     self.local_stream_preview = false;
@@ -1849,6 +1913,204 @@ impl SquadApp {
                 }
                 Task::none()
             }
+            Message::CopyMyFriendId => {
+                self.friend_id_copied_flash = true;
+                let code =
+                    format_friend_code(&self.config.identity_pub_key(), &self.config.nickname);
+                clipboard::write(code)
+            }
+            Message::OpenAddFriendModal => {
+                self.add_friend_modal_open = true;
+                self.add_friend_error = None;
+                self.friend_id_copied_flash = false;
+                Task::none()
+            }
+            Message::CloseAddFriendModal => {
+                self.add_friend_modal_open = false;
+                self.add_friend_error = None;
+                Task::none()
+            }
+            Message::AddFriendCodeChanged(val) => {
+                self.add_friend_code_input = val;
+                self.add_friend_error = None;
+                Task::none()
+            }
+            Message::AddFriendNickChanged(val) => {
+                self.add_friend_nick_input = val;
+                Task::none()
+            }
+            Message::ConfirmAddFriend => {
+                match parse_friend_code(&self.add_friend_code_input) {
+                    Ok((pub_key, code_nick)) => {
+                        if pub_key == self.config.identity_pub_key() {
+                            self.add_friend_error =
+                                Some("Cannot add your own Friend ID".to_string());
+                            return Task::none();
+                        }
+                        let explicit = squad_proto::sanitize_display_str(
+                            self.add_friend_nick_input.trim(),
+                            squad_proto::MAX_NICKNAME_LEN,
+                        );
+                        let from_code = code_nick
+                            .map(|n| {
+                                squad_proto::sanitize_display_str(
+                                    n.trim(),
+                                    squad_proto::MAX_NICKNAME_LEN,
+                                )
+                            })
+                            .unwrap_or_default();
+                        let final_nick = if !explicit.is_empty() {
+                            explicit
+                        } else if !from_code.is_empty() {
+                            from_code
+                        } else {
+                            "Friend".to_string()
+                        };
+                        if let Some(existing) =
+                            self.friends.iter_mut().find(|f| f.pub_key == pub_key)
+                        {
+                            existing.nickname = final_nick;
+                        } else {
+                            let now_ms = SystemTime::now()
+                                .duration_since(UNIX_EPOCH)
+                                .unwrap_or_default()
+                                .as_millis() as u64;
+                            self.friends.push(FriendContact {
+                                pub_key,
+                                nickname: final_nick,
+                                added_at_ms: now_ms,
+                            });
+                        }
+                        save_friends(&self.friends);
+                        self.sync_presence_to_mesh();
+                        self.add_friend_modal_open = false;
+                        self.add_friend_code_input.clear();
+                        self.add_friend_nick_input.clear();
+                        self.add_friend_error = None;
+                        self.status_banner = None;
+                    }
+                    Err(err) => {
+                        self.add_friend_error = Some(err);
+                    }
+                }
+                Task::none()
+            }
+            Message::RemoveFriend(pub_key) => {
+                self.friends.retain(|f| f.pub_key != pub_key);
+                self.friend_presences.remove(&pub_key);
+                save_friends(&self.friends);
+                self.sync_presence_to_mesh();
+                Task::none()
+            }
+            Message::CallFriend(pub_key) => {
+                self.prepare_for_room_entry();
+                let _ = self
+                    .mesh_tx
+                    .try_send(MeshCommand::CallOrInviteFriend {
+                        target_pub_key: pub_key,
+                    });
+                self.status_banner = Some("Calling friend...".to_string());
+                Task::none()
+            }
+            Message::OpenInviteFriendsModal => {
+                if self.screen == Screen::Room {
+                    self.invite_friends_modal_open = true;
+                }
+                Task::none()
+            }
+            Message::CloseInviteFriendsModal => {
+                self.invite_friends_modal_open = false;
+                Task::none()
+            }
+            Message::InviteFriendToParty(pub_key) => {
+                let _ = self
+                    .mesh_tx
+                    .try_send(MeshCommand::CallOrInviteFriend {
+                        target_pub_key: pub_key,
+                    });
+                Task::none()
+            }
+            Message::AcceptIncomingCall => {
+                if let Some(call) = self.incoming_call.take() {
+                    if !self
+                        .friends
+                        .iter()
+                        .any(|f| f.pub_key == call.sender_pub_key)
+                    {
+                        let now_ms = SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_millis() as u64;
+                        let nick = squad_proto::sanitize_display_str(
+                            call.sender_nickname.trim(),
+                            squad_proto::MAX_NICKNAME_LEN,
+                        );
+                        let final_nick = if nick.is_empty() {
+                            "Friend".to_string()
+                        } else {
+                            nick
+                        };
+                        self.friends.push(FriendContact {
+                            pub_key: call.sender_pub_key,
+                            nickname: final_nick,
+                            added_at_ms: now_ms,
+                        });
+                        save_friends(&self.friends);
+                        self.sync_presence_to_mesh();
+                    }
+                    let invite = call.invite;
+                    self.active_invite_uri = invite.to_uri();
+                    self.invite_copied_flash = false;
+                    return self.join_with_invite(
+                        invite,
+                        self.config.rendezvous_server.clone(),
+                        false,
+                        None,
+                    );
+                }
+                Task::none()
+            }
+            Message::DeclineIncomingCall => {
+                self.incoming_call = None;
+                Task::none()
+            }
+            Message::ShortCodeInputChanged(val) => {
+                self.short_code_input = val;
+                Task::none()
+            }
+            Message::JoinByShortCode => {
+                if self.short_code_joining {
+                    return Task::none();
+                }
+                match parse_short_code_input(&self.short_code_input) {
+                    Ok(code) => {
+                        self.short_code_joining = true;
+                        self.status_banner = None;
+                        let _ = self.mesh_tx.try_send(MeshCommand::JoinByShortCode {
+                            rendezvous_server: self.config.rendezvous_server.clone(),
+                            code,
+                            nickname: self.config.nickname.clone(),
+                            client_uuid: self.config.client_uuid(),
+                        });
+                    }
+                    Err(err) => {
+                        self.status_banner = Some(err);
+                    }
+                }
+                Task::none()
+            }
+            Message::GenerateShortCode => {
+                self.short_code_copied_flash = false;
+                let _ = self.mesh_tx.try_send(MeshCommand::GenerateShortCode);
+                Task::none()
+            }
+            Message::CopyShortCode => {
+                if let Some((code, _)) = self.active_short_code {
+                    self.short_code_copied_flash = true;
+                    return clipboard::write(format_short_code(code));
+                }
+                Task::none()
+            }
         }
     }
 
@@ -1871,6 +2133,10 @@ impl SquadApp {
             .height(Length::Fill)
             .style(root_container_style);
 
+        if let Some(ref call) = self.incoming_call {
+            return stack![base, incoming_call::view_incoming_call_modal(self, call)].into();
+        }
+
         if let Some(blob_id) = self.lightbox_blob_id {
             if let Some(handle) = self.image_handles.get(&blob_id) {
                 let title = self
@@ -1882,7 +2148,11 @@ impl SquadApp {
             }
         }
 
-        if self.share_modal_open {
+        if self.add_friend_modal_open {
+            stack![base, incoming_call::view_add_friend_modal(self)].into()
+        } else if self.invite_friends_modal_open {
+            stack![base, incoming_call::view_invite_friends_modal(self)].into()
+        } else if self.share_modal_open {
             stack![base, share_modal::view_share_modal(self)].into()
         } else if self.update_modal_open {
             if let Some(ref info) = self.available_update {
@@ -1968,6 +2238,71 @@ impl SquadApp {
         self.copied_msg_id = None;
         self.lightbox_blob_id = None;
         self.chat_input.clear();
+        self.active_short_code = None;
+        self.short_code_copied_flash = false;
+        self.invite_friends_modal_open = false;
+        self.invited_friends_session.clear();
+        self.short_code_joining = false;
+    }
+
+    fn sync_presence_to_mesh(&self) {
+        let friend_pub_keys = self.friends.iter().map(|f| f.pub_key).collect();
+        let _ = self.mesh_tx.try_send(MeshCommand::UpdatePresenceConfig {
+            rendezvous_server: self.config.rendezvous_server.clone(),
+            nickname: self.config.nickname.clone(),
+            client_uuid: self.config.client_uuid(),
+            identity_secret: self.config.identity_secret().to_bytes(),
+            friend_pub_keys,
+        });
+    }
+
+    fn restore_from_tray(&mut self) -> Vec<Task<Message>> {
+        self.is_in_tray = false;
+        self.ui_sync.in_tray.store(false, Ordering::Release);
+        self.ui_sync.audio_ui_notify.notify_one();
+        for item in &self.chat_messages {
+            match &item.content {
+                ChatContentUi::Text(body_text) => {
+                    self.chat_text_editors
+                        .entry((item.sender_uuid, item.msg_id))
+                        .or_insert_with(|| text_editor::Content::with_text(body_text));
+                }
+                ChatContentUi::InlineImage {
+                    blob_id,
+                    filename,
+                    bytes: Some(raw),
+                    ..
+                } => {
+                    self.image_handles
+                        .entry(*blob_id)
+                        .or_insert_with(|| iced_image::Handle::from_bytes(raw.clone()));
+                    self.inline_image_bytes
+                        .entry(*blob_id)
+                        .or_insert_with(|| (filename.clone(), raw.clone()));
+                }
+                _ => {}
+            }
+        }
+        if self.screen == Screen::Room {
+            self.audio.set_streams_active(true);
+        } else if self.screen == Screen::Settings {
+            self.audio.set_streams_active(true);
+            self.audio.set_monitoring_in_settings(true);
+            self.ui_sync.in_settings.store(true, Ordering::Release);
+        }
+        let _ = self
+            .mesh_tx
+            .try_send(MeshCommand::SetTrayMode { in_tray: false });
+        if let Some(id) = self.main_window_id {
+            vec![
+                iced::window::change_mode(id, iced::window::Mode::Windowed),
+                iced::window::gain_focus(id),
+            ]
+        } else {
+            let (id, open_task) = iced::window::open(main_window_settings());
+            self.main_window_id = Some(id);
+            vec![open_task.map(Message::WindowOpened)]
+        }
     }
 
     fn enter_room_ui_state(&mut self) -> Task<Message> {
@@ -2047,6 +2382,23 @@ impl SquadApp {
 
 fn overlay_left_center_position(win: Size, screen: Size) -> Point {
     Point::new(18.0, ((screen.height - win.height) * 0.5).max(32.0))
+}
+
+pub fn format_short_code(code: u32) -> String {
+    format!("{:03}-{:03}", code / 1000, code % 1000)
+}
+
+fn parse_short_code_input(raw: &str) -> Result<u32, String> {
+    let digits: String = raw
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '-')
+        .collect();
+    if digits.len() != 6 || !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err("Enter a 6-digit code (e.g. 482-910)".to_string());
+    }
+    digits
+        .parse::<u32>()
+        .map_err(|_| "Enter a valid 6-digit voice code".to_string())
 }
 
 fn view_image_lightbox<'a>(

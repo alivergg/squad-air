@@ -2,8 +2,9 @@ use crate::ui::{
     components::avatar_circle,
     theme::{
         canvas_panel_style, channel_nav_button, m3_text_input_style, pill_danger_button,
-        pill_primary_button, pill_tonal_button, sidebar_panel_style, surface_card_style, M3_ERROR,
-        M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+        pill_primary_button, pill_success_button, pill_tonal_button, sidebar_panel_style,
+        surface_card_style, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY,
+        M3_SUCCESS, M3_WARNING,
     },
     Message, SquadApp,
 };
@@ -121,10 +122,48 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         .width(Length::Fill)
         .height(Length::Fill),
     )
-    .width(Length::Fixed(290.0))
+    .width(Length::Fixed(240.0))
     .height(Length::Fill)
-    .padding(16)
+    .padding(14)
     .style(sidebar_panel_style);
+
+    let mut join_code_btn = button(
+        text(if app.short_code_joining {
+            "Connecting..."
+        } else {
+            "Join Code"
+        })
+        .size(13),
+    )
+    .padding([11, 18])
+    .style(pill_primary_button);
+    if !app.short_code_joining {
+        join_code_btn = join_code_btn.on_press(Message::JoinByShortCode);
+    }
+
+    let quick_code_card = container(
+        column![
+            text("Quick Voice Code").size(18),
+            text("Enter a 6-digit code (e.g. 482-910) for instant SPAKE2 encrypted join.")
+                .size(13)
+                .color(M3_ON_SURFACE_VARIANT),
+            row![
+                text_input("482-910", &app.short_code_input)
+                    .on_input(Message::ShortCodeInputChanged)
+                    .on_submit(Message::JoinByShortCode)
+                    .padding(11)
+                    .size(14)
+                    .style(m3_text_input_style),
+                join_code_btn,
+            ]
+            .spacing(10)
+            .align_y(Vertical::Center),
+        ]
+        .spacing(10),
+    )
+    .width(Length::Fill)
+    .padding(20)
+    .style(surface_card_style);
 
     let create_card =
         container(
@@ -260,6 +299,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             horizontal_space(),
         ]
         .align_y(Vertical::Center),
+        quick_code_card,
         create_card,
         join_card,
         lan_card,
@@ -276,13 +316,166 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         );
     }
 
-    let workspace = container(scrollable(main_col).height(Length::Fill))
-        .width(Length::Fill)
+    let left_workspace = container(scrollable(main_col).height(Length::Fill))
+        .width(Length::FillPortion(6))
         .height(Length::Fill)
-        .padding(24)
+        .padding(20)
         .style(canvas_panel_style);
 
-    row![sidebar, workspace]
+    let mut sorted_friend_indices: Vec<usize> = (0..app.friends.len()).collect();
+    sorted_friend_indices.sort_by(|&a, &b| {
+        let fa = &app.friends[a];
+        let fb = &app.friends[b];
+        let oa = app.friend_presences.contains_key(&fa.pub_key);
+        let ob = app.friend_presences.contains_key(&fb.pub_key);
+        ob.cmp(&oa).then_with(|| {
+            fa.nickname
+                .to_lowercase()
+                .cmp(&fb.nickname.to_lowercase())
+        })
+    });
+    let online_friends_count = app
+        .friends
+        .iter()
+        .filter(|f| app.friend_presences.contains_key(&f.pub_key))
+        .count();
+
+    let mut friends_list = column![].spacing(8).width(Length::Fill);
+    if sorted_friend_indices.is_empty() {
+        friends_list = friends_list.push(
+            container(
+                text("No friends added yet.\nClick \"+ Add\" to paste a friend's sqf_ ID, or click \"Copy My ID\" below to share yours.")
+                    .size(12)
+                    .color(M3_ON_SURFACE_VARIANT),
+            )
+            .padding(12)
+            .width(Length::Fill)
+            .style(canvas_panel_style),
+        );
+    } else {
+        for idx in sorted_friend_indices {
+            let friend = &app.friends[idx];
+            let presence = app.friend_presences.get(&friend.pub_key);
+            let online = presence.is_some();
+            let display_name = presence
+                .filter(|p| !p.nickname.trim().is_empty())
+                .map(|p| p.nickname.as_str())
+                .unwrap_or(friend.nickname.as_str());
+            let (status_text, status_color) = match presence {
+                Some(p) if p.in_room => ("In Voice Room", M3_WARNING),
+                Some(_) => ("Online", M3_SUCCESS),
+                None => ("Offline", M3_ON_SURFACE_VARIANT),
+            };
+
+            let mut call_btn = button(text("Call").size(12))
+                .padding([7, 12])
+                .style(if online {
+                    pill_success_button
+                } else {
+                    pill_tonal_button
+                });
+            if online {
+                call_btn = call_btn.on_press(Message::CallFriend(friend.pub_key));
+            }
+
+            let friend_row = container(
+                row![
+                    avatar_circle(app.avatars.handle_for_pub_key(&friend.pub_key), 34.0, online),
+                    column![
+                        text(display_name)
+                            .size(13)
+                            .color(M3_ON_SURFACE)
+                            .wrapping(text::Wrapping::None),
+                        text(status_text).size(11).color(status_color),
+                    ]
+                    .spacing(2)
+                    .width(Length::Fill),
+                    call_btn,
+                    button(text("×").size(13))
+                        .padding([7, 10])
+                        .style(pill_danger_button)
+                        .on_press(Message::RemoveFriend(friend.pub_key)),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center),
+            )
+            .padding(10)
+            .width(Length::Fill)
+            .style(canvas_panel_style);
+
+            friends_list = friends_list.push(friend_row);
+        }
+    }
+
+    let copy_id_label = if app.friend_id_copied_flash {
+        "Copied ID!"
+    } else {
+        "Copy My ID"
+    };
+    let friends_header = row![
+        column![
+            text("Friends").size(18).color(M3_ON_SURFACE),
+            text(format!("{online_friends_count} online"))
+                .size(11)
+                .color(if online_friends_count > 0 {
+                    M3_SUCCESS
+                } else {
+                    M3_ON_SURFACE_VARIANT
+                }),
+        ]
+        .spacing(2),
+        horizontal_space(),
+        button(text("+ Add").size(12))
+            .padding([8, 12])
+            .style(pill_primary_button)
+            .on_press(Message::OpenAddFriendModal),
+    ]
+    .align_y(Vertical::Center);
+
+    let my_id_strip = container(
+        row![
+            column![
+                text("My X25519 Friend ID")
+                    .size(12)
+                    .color(M3_ON_SURFACE),
+                text("Zero-server E2EE contact key")
+                    .size(10)
+                    .color(M3_ON_SURFACE_VARIANT),
+            ]
+            .spacing(2)
+            .width(Length::Fill),
+            button(text(copy_id_label).size(12))
+                .padding([8, 12])
+                .style(if app.friend_id_copied_flash {
+                    pill_success_button
+                } else {
+                    pill_tonal_button
+                })
+                .on_press(Message::CopyMyFriendId),
+        ]
+        .spacing(8)
+        .align_y(Vertical::Center),
+    )
+    .padding(10)
+    .width(Length::Fill)
+    .style(canvas_panel_style);
+
+    let friends_sidebar = container(
+        column![
+            friends_header,
+            scrollable(friends_list).height(Length::Fill),
+            my_id_strip,
+        ]
+        .spacing(12)
+        .width(Length::Fill)
+        .height(Length::Fill),
+    )
+    .width(Length::FillPortion(4))
+    .height(Length::Fill)
+    .padding(16)
+    .style(sidebar_panel_style);
+
+    row![sidebar, left_workspace, friends_sidebar]
         .spacing(14)
         .padding(14)
         .width(Length::Fill)
