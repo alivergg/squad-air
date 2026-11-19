@@ -10,6 +10,7 @@ pub mod settings;
 pub mod share_modal;
 pub mod stream_view;
 pub mod theme;
+pub mod video_shader;
 
 use crate::config::AppConfig;
 use crate::crypto_identity::{
@@ -249,7 +250,6 @@ impl Recipe for AppWorkerRecipe {
         let sync = self.0;
         Box::pin(stream::channel(64, |mut output| async move {
             let mut last_audio_snapshot: Option<(bool, bool, bool, i32, u32)> = None;
-            let mut last_video_sent = std::time::Instant::now() - Duration::from_millis(20);
             let mut poll_interval = tokio::time::interval(Duration::from_millis(66));
             poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
@@ -274,11 +274,6 @@ impl Recipe for AppWorkerRecipe {
                         let _ = output.send(Message::TrayEventsPending).await;
                     }
                     _ = sync.video_notify.notified(), if sync.watching_video.load(Ordering::Acquire) => {
-                        let elapsed = last_video_sent.elapsed();
-                        if elapsed < Duration::from_millis(14) {
-                            tokio::time::sleep(Duration::from_millis(14) - elapsed).await;
-                        }
-                        last_video_sent = std::time::Instant::now();
                         let _ = output.send(Message::VideoFrameReady).await;
                     }
                     _ = sync.audio_ui_notify.notified() => {
@@ -374,7 +369,7 @@ pub struct SquadApp {
     pub local_stream_preview: bool,
     pub local_stream_subscribers: usize,
     pub watched_peer_id: Option<PeerId>,
-    pub active_stream_frame: Option<iced_image::Handle>,
+    pub active_stream_frame: Option<Arc<DecodedVideoFrame>>,
     pub stream_expanded: bool,
     pub stream_fullscreen: bool,
     pub is_in_tray: bool,
@@ -666,11 +661,7 @@ impl SquadApp {
                             let matches_preview = self.local_stream_preview
                                 && frame.streamer_peer_id == self.local_peer_id;
                             if matches_watch || matches_preview {
-                                self.active_stream_frame = Some(iced_image::Handle::from_rgba(
-                                    frame.width,
-                                    frame.height,
-                                    frame.rgba,
-                                ));
+                                self.active_stream_frame = Some(Arc::new(frame));
                             }
                         }
                     }

@@ -142,6 +142,77 @@ impl ReplayWindow {
     }
 }
 
+const LARGE_REPLAY_WINDOW_BITS: u64 = 2048;
+
+/// 2048-packet sliding replay window using a 32-word bitmask anchored at `highest_seq`.
+#[derive(Debug, Clone, Default)]
+pub struct LargeReplayWindow {
+    highest_seq: u64,
+    words: [u64; 32],
+    initialized: bool,
+}
+
+impl LargeReplayWindow {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn reset(&mut self) {
+        self.highest_seq = 0;
+        self.words = [0; 32];
+        self.initialized = false;
+    }
+
+    pub fn check_and_accept(&mut self, seq_num: u64) -> bool {
+        if !self.initialized {
+            self.initialized = true;
+            self.highest_seq = seq_num;
+            self.words = [0; 32];
+            self.words[0] = 1;
+            return true;
+        }
+
+        if seq_num > self.highest_seq {
+            let shift = seq_num - self.highest_seq;
+            if shift >= LARGE_REPLAY_WINDOW_BITS {
+                self.words = [0; 32];
+                self.words[0] = 1;
+            } else {
+                let word_shift = (shift / 64) as usize;
+                let bit_shift = (shift % 64) as u32;
+                for i in (0..32).rev() {
+                    let mut val = 0u64;
+                    if i >= word_shift {
+                        let src = self.words[i - word_shift];
+                        val |= src << bit_shift;
+                        if bit_shift > 0 && i > word_shift {
+                            val |= self.words[i - word_shift - 1] >> (64 - bit_shift);
+                        }
+                    }
+                    self.words[i] = val;
+                }
+                self.words[0] |= 1;
+            }
+            self.highest_seq = seq_num;
+            return true;
+        }
+
+        let diff = self.highest_seq - seq_num;
+        if diff >= LARGE_REPLAY_WINDOW_BITS {
+            return false;
+        }
+
+        let w = (diff / 64) as usize;
+        let b = (diff % 64) as u32;
+        let mask = 1u64 << b;
+        if (self.words[w] & mask) != 0 {
+            return false;
+        }
+        self.words[w] |= mask;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +299,96 @@ mod tests {
         assert!(window.check_and_accept(1));
         assert!(window.check_and_accept(130));
         assert!(!window.check_and_accept(130));
+    }
+
+    #[test]
+    fn test_large_replay_window_in_order_and_duplicates() {
+        let mut window = LargeReplayWindow::new();
+
+        for seq in 0..=150 {
+            assert!(window.check_and_accept(seq));
+        }
+
+        for dup in [0, 1, 63, 64, 65, 128, 150] {
+            assert!(!window.check_and_accept(dup));
+        }
+    }
+
+    #[test]
+    fn test_large_replay_window_out_of_order_word_boundaries() {
+        let mut window = LargeReplayWindow::new();
+        assert!(window.check_and_accept(3000));
+
+        for offset in [63, 64, 65, 128, 1024, 2047] {
+            let seq = 3000 - offset;
+            assert!(
+                window.check_and_accept(seq),
+                "expected offset {offset} to be accepted"
+            );
+            assert!(
+                !window.check_and_accept(seq),
+                "expected duplicate at offset {offset} to be rejected"
+            );
+        }
+        assert!(!window.check_and_accept(3000 - 2048));
+
+        // Verify bit_shift == 0 (shift by 64) and carry across word boundaries
+        let mut shifted = LargeReplayWindow::new();
+        assert!(shifted.check_and_accept(0));
+        assert!(shifted.check_and_accept(64));
+        assert!(shifted.check_and_accept(128));
+        assert!(shifted.check_and_accept(129));
+        assert!(!shifted.check_and_accept(0));
+        assert!(!shifted.check_and_accept(64));
+        assert!(!shifted.check_and_accept(128));
+        assert!(shifted.check_and_accept(1));
+        assert!(shifted.check_and_accept(63));
+        assert!(shifted.check_and_accept(65));
+
+        // Advancing by 1 evicts diff 2048 while preserving diff 2047
+        let mut edge = LargeReplayWindow::new();
+        assert!(edge.check_and_accept(0));
+        assert!(edge.check_and_accept(2047));
+        assert!(!edge.check_and_accept(0));
+        assert!(edge.check_and_accept(2048));
+        assert!(!edge.check_and_accept(0));
+        assert!(edge.check_and_accept(1));
+        assert!(!edge.check_and_accept(1));
+    }
+
+    #[test]
+    fn test_large_replay_window_forward_jumps_and_reset() {
+        let mut window = LargeReplayWindow::new();
+        assert!(window.check_and_accept(5));
+        assert!(window.check_and_accept(11));
+
+        // Jump forward by 700 (spans 10 words + 60-bit shift with carry into word 11)
+        assert!(window.check_and_accept(711));
+        assert!(!window.check_and_accept(5));
+        assert!(!window.check_and_accept(11));
+        assert!(window.check_and_accept(6));
+        assert!(!window.check_and_accept(6));
+        assert!(window.check_and_accept(12));
+        assert!(!window.check_and_accept(12));
+
+        // Jump forward > 2048 clears prior window
+        assert!(window.check_and_accept(3211));
+        assert!(!window.check_and_accept(711));
+        assert!(!window.check_and_accept(3211 - 2048));
+        assert!(window.check_and_accept(3211 - 2047));
+        assert!(!window.check_and_accept(3211 - 2047));
+
+        // Exact 2048 jump also clears prior window
+        assert!(window.check_and_accept(5259));
+        assert!(!window.check_and_accept(3211));
+        assert!(window.check_and_accept(3212));
+
+        // Reset restores empty initial state
+        window.reset();
+        assert!(window.check_and_accept(0));
+        assert!(window.check_and_accept(1));
+        assert!(window.check_and_accept(5259));
+        assert!(!window.check_and_accept(0));
+        assert!(!window.check_and_accept(5259));
     }
 }

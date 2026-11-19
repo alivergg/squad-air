@@ -257,6 +257,10 @@ pub struct ScreenCapturer {
     out_width: u32,
     out_height: u32,
     synthetic: SyntheticPatternCapture,
+    #[cfg(target_os = "macos")]
+    mac: macos_impl::MacCapturer,
+    #[cfg(target_os = "windows")]
+    win: windows_impl::WinCapturer,
 }
 
 impl ScreenCapturer {
@@ -270,6 +274,10 @@ impl ScreenCapturer {
             config.fps.as_u8()
         );
         Self {
+            #[cfg(target_os = "macos")]
+            mac: macos_impl::MacCapturer::new(out_width, out_height),
+            #[cfg(target_os = "windows")]
+            win: windows_impl::WinCapturer::new(&config.target, out_width, out_height),
             config,
             out_width,
             out_height,
@@ -285,7 +293,8 @@ impl ScreenCapturer {
         #[cfg(target_os = "macos")]
         {
             if let Some(frame) =
-                macos_impl::capture_target(&self.config.target, self.out_width, self.out_height)
+                self.mac
+                    .capture_target(&self.config.target, self.out_width, self.out_height)
             {
                 return frame;
             }
@@ -294,7 +303,8 @@ impl ScreenCapturer {
         #[cfg(target_os = "windows")]
         {
             if let Some(frame) =
-                windows_impl::capture_target(&self.config.target, self.out_width, self.out_height)
+                self.win
+                    .capture_target(&self.config.target, self.out_width, self.out_height)
             {
                 return frame;
             }
@@ -330,6 +340,7 @@ mod macos_impl {
     const K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST: u32 = 1;
     const K_CG_IMAGE_BYTE_ORDER_32_BIG: u32 = 4 << 12;
     const K_CG_INTERPOLATION_LOW: i32 = 1;
+    const K_CG_BLEND_MODE_COPY: i32 = 17;
 
     #[repr(C)]
     #[derive(Clone, Copy, Default)]
@@ -393,8 +404,7 @@ mod macos_impl {
             bitmap_info: u32,
         ) -> CGContextRef;
         fn CGContextSetInterpolationQuality(ctx: CGContextRef, quality: i32);
-        fn CGContextSetRGBFillColor(ctx: CGContextRef, red: f64, green: f64, blue: f64, alpha: f64);
-        fn CGContextFillRect(ctx: CGContextRef, rect: CGRect);
+        fn CGContextSetBlendMode(ctx: CGContextRef, mode: i32);
         fn CGContextDrawImage(ctx: CGContextRef, rect: CGRect, image: CGImageRef);
         fn CGContextRelease(ctx: CGContextRef);
         fn CGImageRelease(image: CGImageRef);
@@ -522,69 +532,119 @@ mod macos_impl {
         out
     }
 
-    pub fn capture_target(target: &CaptureTarget, out_w: u32, out_h: u32) -> Option<RawRgbaFrame> {
-        unsafe {
-            let cg_image = match target {
-                CaptureTarget::Monitor { id, .. } => CGDisplayCreateImage(*id as CGDirectDisplayID),
-                CaptureTarget::Window { id, .. } => CGWindowListCreateImage(
-                    CGRectNull,
-                    K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW,
-                    *id as u32,
-                    K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING | K_CG_WINDOW_IMAGE_NOMINAL_RESOLUTION,
-                ),
-            };
-            if cg_image.is_null() {
+    pub(crate) struct MacCapturer {
+        width: u32,
+        height: u32,
+        color_space: CGColorSpaceRef,
+        ctx: CGContextRef,
+        backing_rgba: Box<[u8]>,
+    }
+
+    unsafe impl Send for MacCapturer {}
+
+    impl MacCapturer {
+        pub fn new(out_w: u32, out_h: u32) -> Self {
+            let w = out_w.max(2);
+            let h = out_h.max(2);
+            let stride = (w as usize) * 4;
+            let mut backing_rgba = vec![255u8; stride * (h as usize)].into_boxed_slice();
+
+            unsafe {
+                let color_space = CGColorSpaceCreateDeviceRGB();
+                let ctx = if !color_space.is_null() {
+                    let bitmap_info =
+                        K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | K_CG_IMAGE_BYTE_ORDER_32_BIG;
+                    let c = CGBitmapContextCreate(
+                        backing_rgba.as_mut_ptr() as *mut c_void,
+                        w as usize,
+                        h as usize,
+                        8,
+                        stride,
+                        color_space,
+                        bitmap_info,
+                    );
+                    if !c.is_null() {
+                        CGContextSetInterpolationQuality(c, K_CG_INTERPOLATION_LOW);
+                        CGContextSetBlendMode(c, K_CG_BLEND_MODE_COPY);
+                    }
+                    c
+                } else {
+                    std::ptr::null()
+                };
+
+                Self {
+                    width: w,
+                    height: h,
+                    color_space,
+                    ctx,
+                    backing_rgba,
+                }
+            }
+        }
+
+        pub fn capture_target(
+            &mut self,
+            target: &CaptureTarget,
+            out_w: u32,
+            out_h: u32,
+        ) -> Option<RawRgbaFrame> {
+            let w = out_w.max(2);
+            let h = out_h.max(2);
+            if self.width != w || self.height != h || self.ctx.is_null() {
+                *self = Self::new(w, h);
+            }
+            if self.ctx.is_null() {
                 return None;
             }
 
-            let stride = (out_w as usize) * 4;
-            let mut rgba = vec![0u8; stride * (out_h as usize)];
-            let space = CGColorSpaceCreateDeviceRGB();
-            if space.is_null() {
+            unsafe {
+                let cg_image = match target {
+                    CaptureTarget::Monitor { id, .. } => {
+                        CGDisplayCreateImage(*id as CGDirectDisplayID)
+                    }
+                    CaptureTarget::Window { id, .. } => CGWindowListCreateImage(
+                        CGRectNull,
+                        K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW,
+                        *id as u32,
+                        K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING
+                            | K_CG_WINDOW_IMAGE_NOMINAL_RESOLUTION,
+                    ),
+                };
+                if cg_image.is_null() {
+                    return None;
+                }
+
+                let draw_rect = CGRect {
+                    origin: CGPoint { x: 0.0, y: 0.0 },
+                    size: CGSize {
+                        width: w as f64,
+                        height: h as f64,
+                    },
+                };
+                CGContextDrawImage(self.ctx, draw_rect, cg_image);
                 CGImageRelease(cg_image);
-                return None;
+
+                Some(RawRgbaFrame {
+                    width: w,
+                    height: h,
+                    rgba: self.backing_rgba.to_vec(),
+                })
             }
+        }
+    }
 
-            let bitmap_info = K_CG_IMAGE_ALPHA_PREMULTIPLIED_LAST | K_CG_IMAGE_BYTE_ORDER_32_BIG;
-            let ctx = CGBitmapContextCreate(
-                rgba.as_mut_ptr() as *mut c_void,
-                out_w as usize,
-                out_h as usize,
-                8,
-                stride,
-                space,
-                bitmap_info,
-            );
-            CGColorSpaceRelease(space);
-
-            if ctx.is_null() {
-                CGImageRelease(cg_image);
-                return None;
+    impl Drop for MacCapturer {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.ctx.is_null() {
+                    CGContextRelease(self.ctx);
+                    self.ctx = std::ptr::null();
+                }
+                if !self.color_space.is_null() {
+                    CGColorSpaceRelease(self.color_space);
+                    self.color_space = std::ptr::null();
+                }
             }
-
-            let draw_rect = CGRect {
-                origin: CGPoint { x: 0.0, y: 0.0 },
-                size: CGSize {
-                    width: out_w as f64,
-                    height: out_h as f64,
-                },
-            };
-            CGContextSetInterpolationQuality(ctx, K_CG_INTERPOLATION_LOW);
-            CGContextSetRGBFillColor(ctx, 0.0, 0.0, 0.0, 1.0);
-            CGContextFillRect(ctx, draw_rect);
-            CGContextDrawImage(ctx, draw_rect, cg_image);
-            CGContextRelease(ctx);
-            CGImageRelease(cg_image);
-
-            for chunk in rgba.as_chunks_mut::<4>().0 {
-                chunk[3] = 255;
-            }
-
-            Some(RawRgbaFrame {
-                width: out_w,
-                height: out_h,
-                rgba,
-            })
         }
     }
 
@@ -656,14 +716,30 @@ mod windows_impl {
     use std::ffi::c_void;
     use std::mem::size_of;
     use std::path::Path;
-    use windows::Win32::Foundation::{BOOL, HWND, LPARAM, RECT};
+    use std::time::{Duration, Instant};
+    use windows::core::Interface;
+    use windows::Win32::Foundation::{BOOL, HMODULE, HWND, LPARAM, RECT};
+    use windows::Win32::Graphics::Direct3D::{D3D_DRIVER_TYPE_UNKNOWN, D3D_FEATURE_LEVEL};
+    use windows::Win32::Graphics::Direct3D11::{
+        D3D11CreateDevice, ID3D11Device, ID3D11DeviceContext, ID3D11Resource, ID3D11Texture2D,
+        D3D11_CPU_ACCESS_READ, D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE,
+        D3D11_MAP_READ, D3D11_SDK_VERSION, D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
+    };
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_CLOAKED};
+    use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+    use windows::Win32::Graphics::Dxgi::{
+        CreateDXGIFactory1, IDXGIAdapter, IDXGIFactory1, IDXGIOutput1, IDXGIOutputDuplication,
+        IDXGIResource, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+        DXGI_OUTPUT_DESC,
+    };
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateDIBSection, DeleteDC,
         DeleteObject, EnumDisplayMonitors, GdiFlush, GetDC, GetMonitorInfoW, ReleaseDC,
         SelectObject, SetStretchBltMode, StretchBlt, BITMAPINFO, BITMAPINFOHEADER, BI_RGB,
-        COLORONCOLOR, DIB_RGB_COLORS, HDC, HMONITOR, MONITORINFO, MONITORINFOEXW, SRCCOPY,
+        COLORONCOLOR, DIB_RGB_COLORS, HBITMAP, HDC, HGDIOBJ, HMONITOR, MONITORINFO, MONITORINFOEXW,
+        SRCCOPY,
     };
+    use windows::Win32::Media::{timeBeginPeriod, timeEndPeriod};
     use windows::Win32::System::Threading::{
         GetCurrentProcessId, OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32,
         PROCESS_QUERY_LIMITED_INFORMATION,
@@ -679,6 +755,555 @@ mod windows_impl {
     #[link(name = "user32")]
     extern "system" {
         fn PrintWindow(hwnd: HWND, hdcblt: HDC, nflags: u32) -> BOOL;
+    }
+
+    struct WinTimerPeriodGuard {
+        active: bool,
+    }
+
+    impl WinTimerPeriodGuard {
+        fn new() -> Self {
+            let ok = unsafe { timeBeginPeriod(1) == 0 };
+            Self { active: ok }
+        }
+    }
+
+    impl Drop for WinTimerPeriodGuard {
+        fn drop(&mut self) {
+            if self.active {
+                unsafe {
+                    let _ = timeEndPeriod(1);
+                }
+            }
+        }
+    }
+
+    struct PersistentGdiDib {
+        out_w: u32,
+        out_h: u32,
+        mem_dc: HDC,
+        dib: HBITMAP,
+        old_obj: HGDIOBJ,
+        bits_ptr: *mut u8,
+    }
+
+    impl PersistentGdiDib {
+        unsafe fn new(out_w: u32, out_h: u32) -> Option<Self> {
+            if out_w == 0 || out_h == 0 || out_w > 4096 || out_h > 4096 {
+                return None;
+            }
+            let screen_dc = GetDC(HWND::default());
+            if screen_dc.is_invalid() {
+                return None;
+            }
+            let mem_dc = CreateCompatibleDC(screen_dc);
+            let _ = ReleaseDC(HWND::default(), screen_dc);
+            if mem_dc.is_invalid() {
+                return None;
+            }
+
+            let bmi = BITMAPINFO {
+                bmiHeader: BITMAPINFOHEADER {
+                    biSize: size_of::<BITMAPINFOHEADER>() as u32,
+                    biWidth: out_w as i32,
+                    biHeight: -(out_h as i32),
+                    biPlanes: 1,
+                    biBitCount: 32,
+                    biCompression: BI_RGB.0,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+
+            let mut bits_void: *mut c_void = std::ptr::null_mut();
+            let Ok(dib) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_void, None, 0)
+            else {
+                let _ = DeleteDC(mem_dc);
+                return None;
+            };
+            if dib.is_invalid() || bits_void.is_null() {
+                if !dib.is_invalid() {
+                    let _ = DeleteObject(dib);
+                }
+                let _ = DeleteDC(mem_dc);
+                return None;
+            }
+
+            let old_obj = SelectObject(mem_dc, dib);
+            let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
+
+            Some(Self {
+                out_w,
+                out_h,
+                mem_dc,
+                dib,
+                old_obj,
+                bits_ptr: bits_void as *mut u8,
+            })
+        }
+
+        unsafe fn copy_from_dc(
+            &mut self,
+            src_dc: HDC,
+            src_x: i32,
+            src_y: i32,
+            src_w: i32,
+            src_h: i32,
+        ) -> Option<RawRgbaFrame> {
+            let out_w = self.out_w;
+            let out_h = self.out_h;
+            let ok = if src_w == out_w as i32 && src_h == out_h as i32 {
+                BitBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    src_w,
+                    src_h,
+                    src_dc,
+                    src_x,
+                    src_y,
+                    SRCCOPY,
+                )
+                .is_ok()
+            } else {
+                StretchBlt(
+                    self.mem_dc,
+                    0,
+                    0,
+                    out_w as i32,
+                    out_h as i32,
+                    src_dc,
+                    src_x,
+                    src_y,
+                    src_w,
+                    src_h,
+                    SRCCOPY,
+                )
+                .as_bool()
+            };
+            if !ok {
+                return None;
+            }
+
+            let _ = GdiFlush();
+
+            let row_bytes = (out_w as usize) * 4;
+            let src_stride = (row_bytes + 3) & !3;
+            let src_slice =
+                std::slice::from_raw_parts(self.bits_ptr, src_stride * (out_h as usize));
+            let mut rgba = vec![0u8; row_bytes * (out_h as usize)];
+            for row in 0..out_h as usize {
+                let src_row = &src_slice[row * src_stride..row * src_stride + row_bytes];
+                let dst_row = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
+                for (dst, bgra) in dst_row
+                    .as_chunks_mut::<4>()
+                    .0
+                    .iter_mut()
+                    .zip(src_row.as_chunks::<4>().0.iter())
+                {
+                    dst[0] = bgra[2];
+                    dst[1] = bgra[1];
+                    dst[2] = bgra[0];
+                    dst[3] = 255;
+                }
+            }
+            Some(RawRgbaFrame {
+                width: out_w,
+                height: out_h,
+                rgba,
+            })
+        }
+    }
+
+    impl Drop for PersistentGdiDib {
+        fn drop(&mut self) {
+            unsafe {
+                if !self.mem_dc.is_invalid() {
+                    if !self.old_obj.is_invalid() {
+                        SelectObject(self.mem_dc, self.old_obj);
+                    }
+                    if !self.dib.is_invalid() {
+                        let _ = DeleteObject(self.dib);
+                    }
+                    let _ = DeleteDC(self.mem_dc);
+                }
+            }
+        }
+    }
+
+    struct DxgiDuplicator {
+        monitor_id: u64,
+        device: ID3D11Device,
+        context: ID3D11DeviceContext,
+        dupl: IDXGIOutputDuplication,
+        staging: Option<ID3D11Texture2D>,
+        staging_w: u32,
+        staging_h: u32,
+        cached_rgba: Vec<u8>,
+    }
+
+    enum DxgiCaptureResult {
+        Frame(RawRgbaFrame),
+        TimeoutNoCache,
+        AccessLost,
+    }
+
+    impl DxgiDuplicator {
+        unsafe fn new(monitor_id: u64) -> Option<Self> {
+            let hmon = HMONITOR(monitor_id as isize);
+            let factory: IDXGIFactory1 = CreateDXGIFactory1().ok()?;
+            let mut adapter_idx = 0u32;
+
+            while let Ok(adapter1) = factory.EnumAdapters1(adapter_idx) {
+                adapter_idx += 1;
+                let mut output_idx = 0u32;
+                while let Ok(output) = adapter1.EnumOutputs(output_idx) {
+                    output_idx += 1;
+                    let mut desc = DXGI_OUTPUT_DESC::default();
+                    if output.GetDesc(&mut desc).is_err() || desc.Monitor != hmon {
+                        continue;
+                    }
+                    let Ok(output1) = output.cast::<IDXGIOutput1>() else {
+                        continue;
+                    };
+                    let Ok(base_adapter) = adapter1.cast::<IDXGIAdapter>() else {
+                        continue;
+                    };
+                    let mut device: Option<ID3D11Device> = None;
+                    let mut context: Option<ID3D11DeviceContext> = None;
+                    let mut feature_level = D3D_FEATURE_LEVEL::default();
+                    if D3D11CreateDevice(
+                        &base_adapter,
+                        D3D_DRIVER_TYPE_UNKNOWN,
+                        HMODULE::default(),
+                        D3D11_CREATE_DEVICE_BGRA_SUPPORT,
+                        None,
+                        D3D11_SDK_VERSION,
+                        Some(&mut device),
+                        Some(&mut feature_level),
+                        Some(&mut context),
+                    )
+                    .is_err()
+                    {
+                        continue;
+                    }
+                    let (Some(device), Some(context)) = (device, context) else {
+                        continue;
+                    };
+                    let Ok(dupl) = output1.DuplicateOutput(&device) else {
+                        continue;
+                    };
+                    return Some(Self {
+                        monitor_id,
+                        device,
+                        context,
+                        dupl,
+                        staging: None,
+                        staging_w: 0,
+                        staging_h: 0,
+                        cached_rgba: Vec::new(),
+                    });
+                }
+            }
+            None
+        }
+
+        unsafe fn capture_scaled(&mut self, out_w: u32, out_h: u32) -> DxgiCaptureResult {
+            let expected_bytes = (out_w as usize) * (out_h as usize) * 4;
+            let mut frame_info = DXGI_OUTDUPL_FRAME_INFO::default();
+            let mut resource: Option<IDXGIResource> = None;
+
+            match self
+                .dupl
+                .AcquireNextFrame(0, &mut frame_info, &mut resource)
+            {
+                Ok(()) => {}
+                Err(err) if err.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    if self.cached_rgba.len() == expected_bytes {
+                        return DxgiCaptureResult::Frame(RawRgbaFrame {
+                            width: out_w,
+                            height: out_h,
+                            rgba: self.cached_rgba.clone(),
+                        });
+                    }
+                    return DxgiCaptureResult::TimeoutNoCache;
+                }
+                Err(err) if err.code() == DXGI_ERROR_ACCESS_LOST => {
+                    return DxgiCaptureResult::AccessLost;
+                }
+                Err(_) => return DxgiCaptureResult::AccessLost,
+            }
+
+            let Some(res) = resource else {
+                let _ = self.dupl.ReleaseFrame();
+                return DxgiCaptureResult::TimeoutNoCache;
+            };
+            let Ok(src_tex) = res.cast::<ID3D11Texture2D>() else {
+                let _ = self.dupl.ReleaseFrame();
+                return DxgiCaptureResult::AccessLost;
+            };
+
+            let mut src_desc = D3D11_TEXTURE2D_DESC::default();
+            src_tex.GetDesc(&mut src_desc);
+            let src_w = src_desc.Width;
+            let src_h = src_desc.Height;
+            if src_w == 0 || src_h == 0 {
+                let _ = self.dupl.ReleaseFrame();
+                return DxgiCaptureResult::AccessLost;
+            }
+
+            if self.staging.is_none() || self.staging_w != src_w || self.staging_h != src_h {
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Width: src_w,
+                    Height: src_h,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: DXGI_FORMAT_B8G8R8A8_UNORM,
+                    SampleDesc: DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                };
+                let mut new_staging: Option<ID3D11Texture2D> = None;
+                if self
+                    .device
+                    .CreateTexture2D(&staging_desc, None, Some(&mut new_staging))
+                    .is_err()
+                    || new_staging.is_none()
+                {
+                    let _ = self.dupl.ReleaseFrame();
+                    return DxgiCaptureResult::AccessLost;
+                }
+                self.staging = new_staging;
+                self.staging_w = src_w;
+                self.staging_h = src_h;
+            }
+
+            let Some(ref staging_tex) = self.staging else {
+                let _ = self.dupl.ReleaseFrame();
+                return DxgiCaptureResult::AccessLost;
+            };
+
+            let Ok(dst_res) = staging_tex.cast::<ID3D11Resource>() else {
+                let _ = self.dupl.ReleaseFrame();
+                return DxgiCaptureResult::AccessLost;
+            };
+            let Ok(src_res) = src_tex.cast::<ID3D11Resource>() else {
+                let _ = self.dupl.ReleaseFrame();
+                return DxgiCaptureResult::AccessLost;
+            };
+
+            self.context.CopyResource(&dst_res, &src_res);
+            let _ = self.dupl.ReleaseFrame();
+
+            let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+            if self
+                .context
+                .Map(&dst_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                .is_err()
+                || mapped.pData.is_null()
+            {
+                return DxgiCaptureResult::AccessLost;
+            }
+
+            let pitch = mapped.RowPitch as usize;
+            let total_mapped = pitch.saturating_mul(src_h as usize);
+            let src_bytes = std::slice::from_raw_parts(mapped.pData as *const u8, total_mapped);
+
+            self.cached_rgba.resize(expected_bytes, 255);
+            let dw = out_w as usize;
+            let dh = out_h as usize;
+            let sw = src_w as usize;
+            let sh = src_h as usize;
+
+            if dw == sw && dh == sh {
+                let row_bytes = dw * 4;
+                for y in 0..dh {
+                    let srow = &src_bytes[y * pitch..y * pitch + row_bytes];
+                    let drow = &mut self.cached_rgba[y * row_bytes..(y + 1) * row_bytes];
+                    for (dst, bgra) in drow
+                        .as_chunks_mut::<4>()
+                        .0
+                        .iter_mut()
+                        .zip(srow.as_chunks::<4>().0.iter())
+                    {
+                        dst[0] = bgra[2];
+                        dst[1] = bgra[1];
+                        dst[2] = bgra[0];
+                        dst[3] = 255;
+                    }
+                }
+            } else {
+                for dy in 0..dh {
+                    let sy = (dy * sh / dh).min(sh - 1);
+                    let srow = &src_bytes[sy * pitch..];
+                    let drow = &mut self.cached_rgba[dy * dw * 4..(dy + 1) * dw * 4];
+                    for dx in 0..dw {
+                        let sx = (dx * sw / dw).min(sw - 1);
+                        let sidx = sx * 4;
+                        let didx = dx * 4;
+                        drow[didx] = srow[sidx + 2];
+                        drow[didx + 1] = srow[sidx + 1];
+                        drow[didx + 2] = srow[sidx];
+                        drow[didx + 3] = 255;
+                    }
+                }
+            }
+
+            self.context.Unmap(&dst_res, 0);
+
+            DxgiCaptureResult::Frame(RawRgbaFrame {
+                width: out_w,
+                height: out_h,
+                rgba: self.cached_rgba.clone(),
+            })
+        }
+    }
+
+    pub(crate) struct WinCapturer {
+        _timer_guard: WinTimerPeriodGuard,
+        dxgi: Option<DxgiDuplicator>,
+        last_dxgi_retry: Instant,
+        gdi_dib: Option<PersistentGdiDib>,
+    }
+
+    unsafe impl Send for WinCapturer {}
+
+    impl WinCapturer {
+        pub fn new(target: &CaptureTarget, out_w: u32, out_h: u32) -> Self {
+            let timer_guard = WinTimerPeriodGuard::new();
+            let dxgi = match target {
+                CaptureTarget::Monitor { id, .. } => unsafe { DxgiDuplicator::new(*id) },
+                CaptureTarget::Window { .. } => None,
+            };
+            let gdi_dib = unsafe { PersistentGdiDib::new(out_w.max(2), out_h.max(2)) };
+            Self {
+                _timer_guard: timer_guard,
+                dxgi,
+                last_dxgi_retry: Instant::now(),
+                gdi_dib,
+            }
+        }
+
+        pub fn capture_target(
+            &mut self,
+            target: &CaptureTarget,
+            out_w: u32,
+            out_h: u32,
+        ) -> Option<RawRgbaFrame> {
+            let w = out_w.max(2);
+            let h = out_h.max(2);
+            unsafe {
+                if self
+                    .gdi_dib
+                    .as_ref()
+                    .is_none_or(|d| d.out_w != w || d.out_h != h)
+                {
+                    self.gdi_dib = PersistentGdiDib::new(w, h);
+                }
+
+                match target {
+                    CaptureTarget::Monitor { id, .. } => {
+                        if self.dxgi.as_ref().is_some_and(|d| d.monitor_id != *id) {
+                            self.dxgi = DxgiDuplicator::new(*id);
+                            self.last_dxgi_retry = Instant::now();
+                        } else if self.dxgi.is_none()
+                            && self.last_dxgi_retry.elapsed() >= Duration::from_secs(2)
+                        {
+                            self.dxgi = DxgiDuplicator::new(*id);
+                            self.last_dxgi_retry = Instant::now();
+                        }
+
+                        if let Some(ref mut dupl) = self.dxgi {
+                            match dupl.capture_scaled(w, h) {
+                                DxgiCaptureResult::Frame(frame) => return Some(frame),
+                                DxgiCaptureResult::TimeoutNoCache => {}
+                                DxgiCaptureResult::AccessLost => {
+                                    self.dxgi = None;
+                                    self.last_dxgi_retry = Instant::now();
+                                }
+                            }
+                        }
+
+                        let hmon = HMONITOR(*id as isize);
+                        let mut info = MONITORINFOEXW::default();
+                        info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
+                        if !GetMonitorInfoW(
+                            hmon,
+                            &mut info as *mut MONITORINFOEXW as *mut MONITORINFO,
+                        )
+                        .as_bool()
+                        {
+                            return None;
+                        }
+                        let r = info.monitorInfo.rcMonitor;
+                        let src_w = r.right - r.left;
+                        let src_h = r.bottom - r.top;
+                        if src_w <= 0 || src_h <= 0 {
+                            return None;
+                        }
+                        let screen_dc = GetDC(HWND::default());
+                        if screen_dc.is_invalid() {
+                            return None;
+                        }
+                        let frame = self.gdi_dib.as_mut().and_then(|dib| {
+                            dib.copy_from_dc(screen_dc, r.left, r.top, src_w, src_h)
+                        });
+                        if let (Some(ref f), Some(ref mut dupl)) = (&frame, &mut self.dxgi) {
+                            dupl.cached_rgba.clear();
+                            dupl.cached_rgba.extend_from_slice(&f.rgba);
+                        }
+                        let _ = ReleaseDC(HWND::default(), screen_dc);
+                        frame
+                    }
+                    CaptureTarget::Window { id, .. } => {
+                        let hwnd = HWND(*id as isize);
+                        let mut rect = RECT::default();
+                        if GetWindowRect(hwnd, &mut rect).is_err() {
+                            return None;
+                        }
+                        let src_w = rect.right - rect.left;
+                        let src_h = rect.bottom - rect.top;
+                        if src_w <= 0 || src_h <= 0 {
+                            return None;
+                        }
+
+                        let win_dc = GetDC(hwnd);
+                        if win_dc.is_invalid() {
+                            return None;
+                        }
+                        let tmp_dc = CreateCompatibleDC(win_dc);
+                        if tmp_dc.is_invalid() {
+                            let _ = ReleaseDC(hwnd, win_dc);
+                            return None;
+                        }
+                        let tmp_bmp = CreateCompatibleBitmap(win_dc, src_w, src_h);
+                        if tmp_bmp.is_invalid() {
+                            let _ = DeleteDC(tmp_dc);
+                            let _ = ReleaseDC(hwnd, win_dc);
+                            return None;
+                        }
+                        let old = SelectObject(tmp_dc, tmp_bmp);
+                        let printed = PrintWindow(hwnd, tmp_dc, PW_RENDERFULLCONTENT).as_bool()
+                            || PrintWindow(hwnd, tmp_dc, 0).as_bool();
+                        let src_dc = if printed { tmp_dc } else { win_dc };
+                        let frame = self
+                            .gdi_dib
+                            .as_mut()
+                            .and_then(|dib| dib.copy_from_dc(src_dc, 0, 0, src_w, src_h));
+                        SelectObject(tmp_dc, old);
+                        let _ = DeleteObject(tmp_bmp);
+                        let _ = DeleteDC(tmp_dc);
+                        let _ = ReleaseDC(hwnd, win_dc);
+                        frame
+                    }
+                }
+            }
+        }
     }
 
     pub fn enumerate_targets() -> Vec<CaptureTarget> {
@@ -805,181 +1430,6 @@ mod windows_impl {
             .file_stem()
             .and_then(|s| s.to_str())
             .map(str::to_string)
-    }
-
-    pub fn capture_target(target: &CaptureTarget, out_w: u32, out_h: u32) -> Option<RawRgbaFrame> {
-        unsafe {
-            match target {
-                CaptureTarget::Monitor { id, .. } => {
-                    let hmon = HMONITOR(*id as isize);
-                    let mut info = MONITORINFOEXW::default();
-                    info.monitorInfo.cbSize = size_of::<MONITORINFOEXW>() as u32;
-                    if !GetMonitorInfoW(hmon, &mut info as *mut MONITORINFOEXW as *mut MONITORINFO)
-                        .as_bool()
-                    {
-                        return None;
-                    }
-                    let r = info.monitorInfo.rcMonitor;
-                    let src_w = r.right - r.left;
-                    let src_h = r.bottom - r.top;
-                    if src_w <= 0 || src_h <= 0 {
-                        return None;
-                    }
-                    let screen_dc = GetDC(HWND::default());
-                    if screen_dc.is_invalid() {
-                        return None;
-                    }
-                    let frame =
-                        copy_scaled_dc(screen_dc, r.left, r.top, src_w, src_h, out_w, out_h);
-                    let _ = ReleaseDC(HWND::default(), screen_dc);
-                    frame
-                }
-                CaptureTarget::Window { id, .. } => {
-                    let hwnd = HWND(*id as isize);
-                    let mut rect = RECT::default();
-                    if GetWindowRect(hwnd, &mut rect).is_err() {
-                        return None;
-                    }
-                    let src_w = rect.right - rect.left;
-                    let src_h = rect.bottom - rect.top;
-                    if src_w <= 0 || src_h <= 0 {
-                        return None;
-                    }
-
-                    let win_dc = GetDC(hwnd);
-                    if win_dc.is_invalid() {
-                        return None;
-                    }
-                    let tmp_dc = CreateCompatibleDC(win_dc);
-                    if tmp_dc.is_invalid() {
-                        let _ = ReleaseDC(hwnd, win_dc);
-                        return None;
-                    }
-                    let tmp_bmp = CreateCompatibleBitmap(win_dc, src_w, src_h);
-                    if tmp_bmp.is_invalid() {
-                        let _ = DeleteDC(tmp_dc);
-                        let _ = ReleaseDC(hwnd, win_dc);
-                        return None;
-                    }
-                    let old = SelectObject(tmp_dc, tmp_bmp);
-                    let printed = PrintWindow(hwnd, tmp_dc, PW_RENDERFULLCONTENT).as_bool()
-                        || PrintWindow(hwnd, tmp_dc, 0).as_bool();
-                    let frame = if printed {
-                        copy_scaled_dc(tmp_dc, 0, 0, src_w, src_h, out_w, out_h)
-                    } else {
-                        copy_scaled_dc(win_dc, 0, 0, src_w, src_h, out_w, out_h)
-                    };
-                    SelectObject(tmp_dc, old);
-                    let _ = DeleteObject(tmp_bmp);
-                    let _ = DeleteDC(tmp_dc);
-                    let _ = ReleaseDC(hwnd, win_dc);
-                    frame
-                }
-            }
-        }
-    }
-
-    unsafe fn copy_scaled_dc(
-        src_dc: HDC,
-        src_x: i32,
-        src_y: i32,
-        src_w: i32,
-        src_h: i32,
-        out_w: u32,
-        out_h: u32,
-    ) -> Option<RawRgbaFrame> {
-        if out_w == 0 || out_h == 0 || out_w > 4096 || out_h > 4096 {
-            return None;
-        }
-
-        let mem_dc = CreateCompatibleDC(src_dc);
-        if mem_dc.is_invalid() {
-            return None;
-        }
-
-        let bmi = BITMAPINFO {
-            bmiHeader: BITMAPINFOHEADER {
-                biSize: size_of::<BITMAPINFOHEADER>() as u32,
-                biWidth: out_w as i32,
-                biHeight: -(out_h as i32), // top-down DIB
-                biPlanes: 1,
-                biBitCount: 32,
-                biCompression: BI_RGB.0,
-                ..Default::default()
-            },
-            ..Default::default()
-        };
-
-        let mut bits_ptr: *mut c_void = std::ptr::null_mut();
-        let Ok(dib) = CreateDIBSection(mem_dc, &bmi, DIB_RGB_COLORS, &mut bits_ptr, None, 0) else {
-            let _ = DeleteDC(mem_dc);
-            return None;
-        };
-        if dib.is_invalid() || bits_ptr.is_null() {
-            if !dib.is_invalid() {
-                let _ = DeleteObject(dib);
-            }
-            let _ = DeleteDC(mem_dc);
-            return None;
-        }
-
-        let old = SelectObject(mem_dc, dib);
-        let _ = SetStretchBltMode(mem_dc, COLORONCOLOR);
-        let ok = if src_w == out_w as i32 && src_h == out_h as i32 {
-            BitBlt(mem_dc, 0, 0, src_w, src_h, src_dc, src_x, src_y, SRCCOPY).is_ok()
-        } else {
-            StretchBlt(
-                mem_dc,
-                0,
-                0,
-                out_w as i32,
-                out_h as i32,
-                src_dc,
-                src_x,
-                src_y,
-                src_w,
-                src_h,
-                SRCCOPY,
-            )
-            .as_bool()
-        };
-
-        let _ = GdiFlush();
-
-        let row_bytes = (out_w as usize) * 4;
-        let src_stride = (row_bytes + 3) & !3;
-        let frame = if ok {
-            let src_slice =
-                std::slice::from_raw_parts(bits_ptr as *const u8, src_stride * (out_h as usize));
-            let mut rgba = vec![0u8; row_bytes * (out_h as usize)];
-            for row in 0..out_h as usize {
-                let src_row = &src_slice[row * src_stride..row * src_stride + row_bytes];
-                let dst_row = &mut rgba[row * row_bytes..(row + 1) * row_bytes];
-                for (dst, bgra) in dst_row
-                    .as_chunks_mut::<4>()
-                    .0
-                    .iter_mut()
-                    .zip(src_row.as_chunks::<4>().0.iter())
-                {
-                    dst[0] = bgra[2];
-                    dst[1] = bgra[1];
-                    dst[2] = bgra[0];
-                    dst[3] = 255;
-                }
-            }
-            Some(RawRgbaFrame {
-                width: out_w,
-                height: out_h,
-                rgba,
-            })
-        } else {
-            None
-        };
-
-        SelectObject(mem_dc, old);
-        let _ = DeleteObject(dib);
-        let _ = DeleteDC(mem_dc);
-        frame
     }
 }
 

@@ -7,11 +7,10 @@ use crate::ui::theme::{
 use crate::ui::{Message, SquadApp};
 use iced::{
     alignment::{Horizontal, Vertical},
-    widget::{
-        button, column, container, horizontal_space, image as iced_image, row, slider, stack, text,
-    },
-    Background, Border, Color, ContentFit, Element, Length, Theme,
+    widget::{button, column, container, horizontal_space, row, slider, stack, text},
+    Background, Border, Color, Element, Length, Theme,
 };
+use std::sync::Arc;
 
 fn live_pill_style(_theme: &Theme) -> container::Style {
     container::Style {
@@ -147,13 +146,11 @@ pub fn view_stream_stage(app: &SquadApp) -> Element<'_, Message> {
                 .on_press(close_msg),
         );
 
-    let video_area: Element<'_, Message> = if let Some(ref handle) = app.active_stream_frame {
-        container(
-            iced_image(handle.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(ContentFit::Contain),
-        )
+    let video_area: Element<'_, Message> = if let Some(ref frame) = app.active_stream_frame {
+        container(crate::ui::video_shader::video_view(
+            Arc::clone(frame),
+            Color::from_rgb(0.05, 0.05, 0.07),
+        ))
         .width(Length::Fill)
         .height(Length::Fill)
         .padding(4)
@@ -217,13 +214,11 @@ pub fn view_stream_fullscreen(app: &SquadApp) -> Element<'_, Message> {
         )
     };
 
-    let video_bg: Element<'_, Message> = if let Some(ref handle) = app.active_stream_frame {
-        container(
-            iced_image(handle.clone())
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .content_fit(ContentFit::Contain),
-        )
+    let video_bg: Element<'_, Message> = if let Some(ref frame) = app.active_stream_frame {
+        container(crate::ui::video_shader::video_view(
+            Arc::clone(frame),
+            Color::BLACK,
+        ))
         .width(Length::Fill)
         .height(Length::Fill)
         .style(|_t: &Theme| container::Style {

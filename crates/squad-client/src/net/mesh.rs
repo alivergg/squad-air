@@ -28,14 +28,14 @@ use squad_proto::{
 };
 use squad_video::{
     detect_hardware_encoder_backend, fragment_frame, is_hevc_hardware_supported, DecoderError,
-    FrameReassembler, H264Decoder, H264Encoder, ScreenCapturer, StreamConfig, VideoCodec,
-    VideoPacketOut,
+    FrameReassembler, H264Decoder, H264Encoder, RawRgbaFrame, ScreenCapturer, StreamConfig,
+    VideoCodec, VideoPacketOut,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Notify};
@@ -98,12 +98,17 @@ pub struct RemoteStreamInfo {
     pub encoder_backend: String,
 }
 
+static NEXT_VIDEO_FRAME_SEQ: AtomicU64 = AtomicU64::new(1);
+const VIDEO_TX_BURST_PACKETS: usize = 16;
+const MAX_UDP_RX_BATCH: usize = 32;
+
 #[derive(Debug, Clone)]
 pub struct DecodedVideoFrame {
     pub streamer_peer_id: PeerId,
     pub width: u32,
     pub height: u32,
-    pub rgba: Vec<u8>,
+    pub rgba: Arc<Vec<u8>>,
+    pub frame_seq: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -276,13 +281,39 @@ struct RemotePeerState {
     replay_voice: squad_proto::ReplayWindow,
     replay_dtx: squad_proto::ReplayWindow,
     replay_stream_audio: squad_proto::ReplayWindow,
+    replay_video: squad_proto::LargeReplayWindow,
 }
+
+type VideoEncodeWake = (Mutex<Option<RawRgbaFrame>>, Condvar);
 
 struct CaptureWorkerHandle {
     stop: Arc<AtomicBool>,
     force_idr: Arc<AtomicBool>,
     preview_active: Arc<AtomicBool>,
     subs_active: Arc<AtomicBool>,
+    encode_wake: Arc<VideoEncodeWake>,
+}
+
+#[derive(Default)]
+struct VideoTxQueue {
+    frags: Vec<VideoPacketOut>,
+    cursor: usize,
+}
+
+impl VideoTxQueue {
+    fn is_empty(&self) -> bool {
+        self.cursor >= self.frags.len()
+    }
+
+    fn clear(&mut self) {
+        self.frags.clear();
+        self.cursor = 0;
+    }
+
+    fn load(&mut self, frags: Vec<VideoPacketOut>) {
+        self.frags = frags;
+        self.cursor = 0;
+    }
 }
 
 enum DecodeJob {
@@ -338,6 +369,8 @@ struct ActiveSession {
     lan_addrs: Vec<std::net::SocketAddrV4>,
     peers: HashMap<PeerId, RemotePeerState>,
     control_seq: u64,
+    video_seq: u64,
+    video_tx_queue: VideoTxQueue,
     transfer: SwarmChatManager,
     local_encoder_backend: String,
     local_stream_config: Option<StreamConfig>,
@@ -493,15 +526,18 @@ pub fn spawn_mesh_worker(
                             }
                             continue;
                         }
-                        match decoder.decode_checked(&annex_b_bytes) {
-                            Ok(Some(raw_rgba)) => {
+                        match decoder.decode_checked_shared(&annex_b_bytes) {
+                            Ok(Some((width, height, rgba))) => {
                                 if decode_gen.load(Ordering::Acquire) == generation {
+                                    let frame_seq =
+                                        NEXT_VIDEO_FRAME_SEQ.fetch_add(1, Ordering::Relaxed);
                                     *slot_decode.lock().unwrap_or_else(|e| e.into_inner()) =
                                         Some(DecodedVideoFrame {
                                             streamer_peer_id,
-                                            width: raw_rgba.width,
-                                            height: raw_rgba.height,
-                                            rgba: raw_rgba.rgba,
+                                            width,
+                                            height,
+                                            rgba,
+                                            frame_seq,
                                         });
                                     video_notify_decode.notify_one();
                                 }
@@ -585,10 +621,15 @@ pub fn spawn_mesh_worker(
         let mut ui_sync_tick = tokio::time::interval(Duration::from_millis(120));
         let mut lan_tick = tokio::time::interval(LAN_BEACON_INTERVAL);
         let mut presence_tick = tokio::time::interval(PRESENCE_PING_INTERVAL);
+        let mut video_pace_tick = tokio::time::interval(Duration::from_millis(2));
+        video_pace_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             let lan_work_active = session.as_ref().is_some_and(|s| s.embedded_rv.is_some())
                 || !discovered_lan.is_empty();
+            let has_paced_video = session
+                .as_ref()
+                .is_some_and(|s| !s.video_tx_queue.is_empty());
 
             tokio::select! {
                 biased;
@@ -932,6 +973,7 @@ pub fn spawn_mesh_worker(
                             if let Some(sess) = session.as_mut() {
                                 stop_capture_worker(&mut capture_worker);
                                 drain_video_out_rx(&mut video_out_rx);
+                                sess.video_tx_queue.clear();
                                 sess.stream_subscribers.clear();
                                 sess.local_preview_enabled = false;
                                 audio_engine.set_share_stream_audio(config.share_audio);
@@ -960,6 +1002,7 @@ pub fn spawn_mesh_worker(
                             drain_video_out_rx(&mut video_out_rx);
                             audio_engine.set_share_stream_audio(false);
                             if let Some(sess) = session.as_mut() {
+                                sess.video_tx_queue.clear();
                                 if sess.local_preview_enabled && sess.watched_peer_id.is_none() {
                                     clear_video_slot(&video_frame_slot);
                                 }
@@ -1486,13 +1529,27 @@ pub fn spawn_mesh_worker(
                     }
                 }
 
-                Ok((len, src_addr)) = socket.recv_from(&mut recv_buf) => {
-                    let datagram = &mut recv_buf[..len];
-                    if let Some(sess) = session.as_mut() {
-                        if src_addr == sess.rendezvous_addr {
-                            sess.last_rv_rx = Instant::now();
+                Ok((first_len, first_src)) = socket.recv_from(&mut recv_buf) => {
+                    let mut cur_len = first_len;
+                    let mut cur_src = first_src;
+                    for batch_idx in 0..MAX_UDP_RX_BATCH {
+                        if batch_idx > 0 {
+                            match socket.try_recv_from(&mut recv_buf) {
+                                Ok((n, addr)) => {
+                                    cur_len = n;
+                                    cur_src = addr;
+                                }
+                                Err(_) => break,
+                            }
                         }
-                    }
+                        let len = cur_len;
+                        let src_addr = cur_src;
+                        let datagram = &mut recv_buf[..len];
+                        if let Some(sess) = session.as_mut() {
+                            if src_addr == sess.rendezvous_addr {
+                                sess.last_rv_rx = Instant::now();
+                            }
+                        }
 
                     if is_spake2_datagram(datagram) {
                         if let Ok(spkt) = Spake2Packet::decode(datagram) {
@@ -1816,58 +1873,23 @@ pub fn spawn_mesh_worker(
                         .await;
                         forward_transfer_events(&mut tr_rx, &evt_tx).await;
                     }
+                    }
                 }
 
-                // Priority 2: video fragments only while subscribers exist.
-                Some(frags) = video_out_rx.recv() => {
+                // Priority 2: paced video fragments while subscribers exist.
+                Some(frags) = video_out_rx.recv(), if !has_paced_video => {
                     let Some(sess) = session.as_mut() else { continue; };
                     if sess.local_peer_id == 0 || sess.stream_subscribers.is_empty() {
+                        sess.video_tx_queue.clear();
                         continue;
                     }
-                    let subs: Vec<PeerId> = sess
-                        .stream_subscribers
-                        .iter()
-                        .copied()
-                        .filter(|&pid| {
-                            sess.peers.get(&pid).is_some_and(|p| {
-                                matches!(p.status, PeerConnStatus::Connected | PeerConnStatus::MeshRelayed)
-                            })
-                        })
-                        .collect();
-                    if subs.is_empty() {
-                        continue;
-                    }
-                    for (idx, frag) in frags.into_iter().enumerate() {
-                        sess.control_seq = sess.control_seq.wrapping_add(1);
-                        let hdr = P2pHeader {
-                            msg_type: P2pMsgType::VideoFrameFrag,
-                            room_prefix: sess.room_prefix,
-                            sender_peer_id: sess.local_peer_id,
-                            seq_num: sess.control_seq,
-                        };
-                        let payload = P2pPayload::VideoFrameFrag {
-                            frame_id: frag.frame_id,
-                            frag_idx: frag.frag_idx,
-                            frag_count: frag.frag_count,
-                            flags: frag.flags,
-                            data: frag.data,
-                        };
-                        if sess.cipher.seal_packet(&hdr, &payload, &mut seal_buf).is_ok() {
-                            for &sub_id in &subs {
-                                send_sealed_to_peer(
-                                    &socket,
-                                    sess,
-                                    sub_id,
-                                    P2pMsgType::VideoFrameFrag,
-                                    &seal_buf,
-                                    &mut relay_buf,
-                                )
-                                .await;
-                            }
-                        }
-                        if idx > 0 && idx % 32 == 0 {
-                            tokio::task::yield_now().await;
-                        }
+                    sess.video_tx_queue.load(frags);
+                    flush_video_tx_burst(&socket, sess, &mut seal_buf, &mut relay_buf).await;
+                }
+
+                _ = video_pace_tick.tick(), if has_paced_video => {
+                    if let Some(sess) = session.as_mut() {
+                        flush_video_tx_burst(&socket, sess, &mut seal_buf, &mut relay_buf).await;
                     }
                 }
 
@@ -2609,6 +2631,7 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                             replay_voice: squad_proto::ReplayWindow::new(),
                             replay_dtx: squad_proto::ReplayWindow::new(),
                             replay_stream_audio: squad_proto::ReplayWindow::new(),
+                            replay_video: squad_proto::LargeReplayWindow::new(),
                         },
                     );
                     io.audio_engine.play_cue(SoundCue::PeerJoin);
@@ -2850,6 +2873,7 @@ async fn handle_p2p_rx(
             peer.replay_voice.reset();
             peer.replay_dtx.reset();
             peer.replay_stream_audio.reset();
+            peer.replay_video.reset();
         }
 
         let replay_ok = match header.msg_type {
@@ -2858,6 +2882,7 @@ async fn handle_p2p_rx(
             P2pMsgType::StreamAudioOpus => {
                 peer.replay_stream_audio.check_and_accept(header.seq_num)
             }
+            P2pMsgType::VideoFrameFrag => peer.replay_video.check_and_accept(header.seq_num),
             _ => peer.replay_control.check_and_accept(header.seq_num),
         };
         if !replay_ok {
@@ -3748,6 +3773,11 @@ fn resolve_host(host_port: &str) -> Result<SocketAddr, String> {
 fn stop_capture_worker(handle: &mut Option<CaptureWorkerHandle>) {
     if let Some(worker) = handle.take() {
         worker.stop.store(true, Ordering::Release);
+        let (lock, cvar) = &*worker.encode_wake;
+        if let Ok(mut guard) = lock.lock() {
+            *guard = None;
+        }
+        cvar.notify_all();
     }
 }
 
@@ -3757,6 +3787,87 @@ fn drain_video_out_rx(rx: &mut mpsc::Receiver<Vec<VideoPacketOut>>) {
 
 fn clear_video_slot(slot: &Mutex<Option<DecodedVideoFrame>>) {
     *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+}
+
+async fn flush_video_tx_burst(
+    socket: &UdpSocket,
+    sess: &mut ActiveSession,
+    seal_buf: &mut Vec<u8>,
+    relay_buf: &mut Vec<u8>,
+) {
+    if sess.local_peer_id == 0
+        || sess.stream_subscribers.is_empty()
+        || sess.video_tx_queue.is_empty()
+    {
+        sess.video_tx_queue.clear();
+        return;
+    }
+
+    let subs: Vec<PeerId> = sess
+        .stream_subscribers
+        .iter()
+        .copied()
+        .filter(|&pid| {
+            sess.peers.get(&pid).is_some_and(|p| {
+                matches!(
+                    p.status,
+                    PeerConnStatus::Connected | PeerConnStatus::MeshRelayed
+                )
+            })
+        })
+        .collect();
+    if subs.is_empty() {
+        sess.video_tx_queue.clear();
+        return;
+    }
+
+    let start = sess.video_tx_queue.cursor;
+    let end = (start + VIDEO_TX_BURST_PACKETS).min(sess.video_tx_queue.frags.len());
+    sess.video_tx_queue.cursor = end;
+
+    for idx in start..end {
+        let frag = std::mem::replace(
+            &mut sess.video_tx_queue.frags[idx],
+            VideoPacketOut {
+                frame_id: 0,
+                frag_idx: 0,
+                frag_count: 0,
+                flags: 0,
+                data: Vec::new(),
+            },
+        );
+        sess.video_seq = sess.video_seq.wrapping_add(1);
+        let hdr = P2pHeader {
+            msg_type: P2pMsgType::VideoFrameFrag,
+            room_prefix: sess.room_prefix,
+            sender_peer_id: sess.local_peer_id,
+            seq_num: sess.video_seq,
+        };
+        let payload = P2pPayload::VideoFrameFrag {
+            frame_id: frag.frame_id,
+            frag_idx: frag.frag_idx,
+            frag_count: frag.frag_count,
+            flags: frag.flags,
+            data: frag.data,
+        };
+        if sess.cipher.seal_packet(&hdr, &payload, seal_buf).is_ok() {
+            for &sub_id in &subs {
+                send_sealed_to_peer(
+                    socket,
+                    sess,
+                    sub_id,
+                    P2pMsgType::VideoFrameFrag,
+                    seal_buf,
+                    relay_buf,
+                )
+                .await;
+            }
+        }
+    }
+
+    if sess.video_tx_queue.is_empty() {
+        sess.video_tx_queue.clear();
+    }
 }
 
 fn reconcile_capture_worker(
@@ -3791,52 +3902,51 @@ fn reconcile_capture_worker(
     let force_idr_flag = Arc::new(AtomicBool::new(true));
     let preview_flag = Arc::new(AtomicBool::new(preview_on));
     let subs_flag = Arc::new(AtomicBool::new(has_subs));
-    let stop_clone = Arc::clone(&stop);
-    let force_clone = Arc::clone(&force_idr_flag);
-    let preview_clone = Arc::clone(&preview_flag);
-    let subs_clone = Arc::clone(&subs_flag);
-    let frame_counter = Arc::clone(&sess.next_video_frame_id);
-    let worker_cfg = cfg.clone();
-    let tx = video_out_tx.clone();
+    let encode_wake: Arc<VideoEncodeWake> = Arc::new((Mutex::new(None), Condvar::new()));
+
+    let stop_cap = Arc::clone(&stop);
+    let preview_cap = Arc::clone(&preview_flag);
+    let subs_cap = Arc::clone(&subs_flag);
+    let wake_cap = Arc::clone(&encode_wake);
+    let cap_cfg = cfg.clone();
     let slot_clone = Arc::clone(video_frame_slot);
     let notify_clone = Arc::clone(video_notify);
     let local_pid = sess.local_peer_id;
 
+    let stop_enc = Arc::clone(&stop);
+    let force_enc = Arc::clone(&force_idr_flag);
+    let subs_enc = Arc::clone(&subs_flag);
+    let wake_enc = Arc::clone(&encode_wake);
+    let frame_counter = Arc::clone(&sess.next_video_frame_id);
+    let enc_cfg = cfg.clone();
+    let tx = video_out_tx.clone();
+
     std::thread::Builder::new()
-        .name("squad-video-capture".into())
+        .name("squad-video-encode".into())
         .spawn(move || {
-            let mut capturer = ScreenCapturer::new(worker_cfg.clone());
             let mut encoder = H264Encoder::new_with_codec(
-                worker_cfg.fps.as_u8(),
-                worker_cfg.bitrate_bps,
-                worker_cfg.codec,
+                enc_cfg.fps.as_u8(),
+                enc_cfg.bitrate_bps,
+                enc_cfg.codec,
             );
-            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(worker_cfg.fps.as_u8()));
-
-            while !stop_clone.load(Ordering::Acquire) {
-                let tick_start = Instant::now();
-                let mut raw = capturer.capture_frame();
-                let has_subscribers = subs_clone.load(Ordering::Acquire);
-
-                if preview_clone.load(Ordering::Acquire) {
-                    let preview_rgba = if has_subscribers {
-                        raw.rgba.clone()
-                    } else {
-                        std::mem::take(&mut raw.rgba)
-                    };
-                    if let Ok(mut guard) = slot_clone.try_lock() {
-                        *guard = Some(DecodedVideoFrame {
-                            streamer_peer_id: local_pid,
-                            width: raw.width,
-                            height: raw.height,
-                            rgba: preview_rgba,
-                        });
-                        notify_clone.notify_one();
+            while !stop_enc.load(Ordering::Acquire) {
+                let raw = {
+                    let (lock, cvar) = &*wake_enc;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    while !stop_enc.load(Ordering::Acquire) && guard.is_none() {
+                        guard = cvar.wait(guard).unwrap_or_else(|e| e.into_inner());
                     }
-                }
+                    if stop_enc.load(Ordering::Acquire) {
+                        break;
+                    }
+                    match guard.take() {
+                        Some(frame) => frame,
+                        None => continue,
+                    }
+                };
 
-                if has_subscribers && tx.capacity() > 0 {
-                    if force_clone.swap(false, Ordering::AcqRel) {
+                if subs_enc.load(Ordering::Acquire) && tx.capacity() > 0 {
+                    if force_enc.swap(false, Ordering::AcqRel) {
                         encoder.force_keyframe();
                     }
                     let encoded = encoder.encode(&raw);
@@ -3844,12 +3954,61 @@ fn reconcile_capture_worker(
                     let frags = fragment_frame(frame_id, encoded.is_keyframe, &encoded.annex_b);
                     let _ = tx.try_send(frags);
                 }
+            }
+        })
+        .ok();
 
-                let elapsed = tick_start.elapsed();
-                if elapsed < frame_interval {
-                    std::thread::sleep(frame_interval - elapsed);
+    std::thread::Builder::new()
+        .name("squad-video-capture".into())
+        .spawn(move || {
+            let mut capturer = ScreenCapturer::new(cap_cfg.clone());
+            let frame_interval = Duration::from_secs_f64(1.0 / f64::from(cap_cfg.fps.as_u8()));
+            let mut next_tick = Instant::now();
+
+            while !stop_cap.load(Ordering::Acquire) {
+                let mut raw = capturer.capture_frame();
+                let has_subscribers = subs_cap.load(Ordering::Acquire);
+
+                if preview_cap.load(Ordering::Acquire) {
+                    let preview_rgba = if has_subscribers {
+                        Arc::new(raw.rgba.clone())
+                    } else {
+                        Arc::new(std::mem::take(&mut raw.rgba))
+                    };
+                    if let Ok(mut guard) = slot_clone.try_lock() {
+                        *guard = Some(DecodedVideoFrame {
+                            streamer_peer_id: local_pid,
+                            width: raw.width,
+                            height: raw.height,
+                            rgba: preview_rgba,
+                            frame_seq: NEXT_VIDEO_FRAME_SEQ.fetch_add(1, Ordering::Relaxed),
+                        });
+                        notify_clone.notify_one();
+                    }
+                }
+
+                if has_subscribers {
+                    let (lock, cvar) = &*wake_cap;
+                    let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+                    *guard = Some(raw);
+                    drop(guard);
+                    cvar.notify_one();
+                }
+
+                next_tick += frame_interval;
+                let now = Instant::now();
+                if next_tick > now {
+                    std::thread::sleep(next_tick - now);
+                } else if now.duration_since(next_tick) > frame_interval * 2 {
+                    next_tick = now;
                 }
             }
+
+            let (lock, cvar) = &*wake_cap;
+            if let Ok(mut guard) = lock.lock() {
+                *guard = None;
+            }
+            cvar.notify_all();
         })
         .ok();
 
@@ -3858,6 +4017,7 @@ fn reconcile_capture_worker(
         force_idr: force_idr_flag,
         preview_active: preview_flag,
         subs_active: subs_flag,
+        encode_wake,
     });
 }
 
@@ -4083,6 +4243,8 @@ async fn init_session(
         lan_addrs,
         peers: HashMap::new(),
         control_seq: 1,
+        video_seq: 1,
+        video_tx_queue: VideoTxQueue::default(),
         transfer,
         local_encoder_backend,
         local_stream_config: None,
@@ -4991,6 +5153,8 @@ mod tests {
                 lan_addrs: Vec::new(),
                 peers: HashMap::new(),
                 control_seq: 1,
+                video_seq: 1,
+                video_tx_queue: VideoTxQueue::default(),
                 transfer: SwarmChatManager::new(),
                 local_encoder_backend: "test".to_string(),
                 local_stream_config: None,
@@ -5048,6 +5212,7 @@ mod tests {
                 replay_voice: squad_proto::ReplayWindow::new(),
                 replay_dtx: squad_proto::ReplayWindow::new(),
                 replay_stream_audio: squad_proto::ReplayWindow::new(),
+                replay_video: squad_proto::LargeReplayWindow::new(),
             }
         };
 

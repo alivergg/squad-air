@@ -3,7 +3,7 @@ pub mod invite;
 pub mod packet;
 pub mod signaling;
 
-pub use crypto::{ReplayWindow, RoomCipher, TAG_LEN};
+pub use crypto::{LargeReplayWindow, ReplayWindow, RoomCipher, TAG_LEN};
 pub use invite::{InviteLink, INVITE_SCHEME};
 pub use packet::{
     encode_peer_relay_datagram_into, encode_relay_datagram_into, is_peer_relay_datagram,

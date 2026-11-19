@@ -32,6 +32,7 @@ pub struct ReassembledFrame {
 struct PendingVideoFrame {
     frag_count: usize,
     is_keyframe: bool,
+    received_data_count: usize,
     data_shards: Vec<Option<Vec<u8>>>,
     parity_shards: Vec<Option<Vec<u8>>>,
     created_at: Instant,
@@ -43,71 +44,77 @@ impl PendingVideoFrame {
         Self {
             frag_count,
             is_keyframe,
+            received_data_count: 0,
             data_shards: vec![None; frag_count],
             parity_shards: vec![None; num_groups],
             created_at: Instant::now(),
         }
     }
 
-    fn try_recover_fec(&mut self) {
-        for (g_idx, parity_opt) in self.parity_shards.iter().enumerate() {
-            let Some(parity) = parity_opt else {
-                continue;
-            };
-            if parity.len() < 2 {
-                continue;
-            }
-            let start = g_idx * VIDEO_FEC_GROUP_SIZE;
-            let end = (start + VIDEO_FEC_GROUP_SIZE).min(self.frag_count);
-            let mut missing_idx = None;
-            let mut missing_count = 0usize;
+    fn try_recover_fec_group(&mut self, g_idx: usize) {
+        let Some(Some(parity)) = self.parity_shards.get(g_idx) else {
+            return;
+        };
+        if parity.len() < 2 {
+            return;
+        }
+        let start = g_idx * VIDEO_FEC_GROUP_SIZE;
+        let end = (start + VIDEO_FEC_GROUP_SIZE).min(self.frag_count);
+        if start >= end {
+            return;
+        }
+        let mut missing_idx = None;
+        let mut missing_count = 0usize;
 
-            for (idx, shard) in self.data_shards.iter().enumerate().take(end).skip(start) {
-                if shard.is_none() {
-                    missing_idx = Some(idx);
-                    missing_count += 1;
-                    if missing_count > 1 {
-                        break;
-                    }
+        for (idx, shard) in self.data_shards.iter().enumerate().take(end).skip(start) {
+            if shard.is_none() {
+                missing_idx = Some(idx);
+                missing_count += 1;
+                if missing_count > 1 {
+                    return;
                 }
             }
+        }
 
-            if missing_count != 1 {
-                continue;
+        if missing_count != 1 {
+            return;
+        }
+        let Some(target_idx) = missing_idx else {
+            return;
+        };
+
+        let parity_len_xor = u16::from_be_bytes([parity[0], parity[1]]);
+        let mut known_len_xor = 0u16;
+        for shard in self.data_shards.iter().take(end).skip(start).flatten() {
+            known_len_xor ^= shard.len() as u16;
+        }
+
+        let recovered_len = (parity_len_xor ^ known_len_xor) as usize;
+        if recovered_len > VIDEO_DATA_SHARD_SIZE {
+            return;
+        }
+
+        let parity_payload = &parity[2..];
+        let mut recovered = vec![0u8; recovered_len];
+        let copy_len = recovered_len.min(parity_payload.len());
+        recovered[..copy_len].copy_from_slice(&parity_payload[..copy_len]);
+
+        for shard in self.data_shards.iter().take(end).skip(start).flatten() {
+            let overlap = recovered_len.min(shard.len());
+            for i in 0..overlap {
+                recovered[i] ^= shard[i];
             }
-            let Some(target_idx) = missing_idx else {
-                continue;
-            };
+        }
 
-            let parity_len_xor = u16::from_be_bytes([parity[0], parity[1]]);
-            let mut known_len_xor = 0u16;
-            for shard in self.data_shards.iter().take(end).skip(start).flatten() {
-                known_len_xor ^= shard.len() as u16;
-            }
-
-            let recovered_len = (parity_len_xor ^ known_len_xor) as usize;
-            if recovered_len > VIDEO_DATA_SHARD_SIZE {
-                continue;
-            }
-
-            let parity_payload = &parity[2..];
-            let mut recovered = vec![0u8; recovered_len];
-            let copy_len = recovered_len.min(parity_payload.len());
-            recovered[..copy_len].copy_from_slice(&parity_payload[..copy_len]);
-
-            for shard in self.data_shards.iter().take(end).skip(start).flatten() {
-                let overlap = recovered_len.min(shard.len());
-                for i in 0..overlap {
-                    recovered[i] ^= shard[i];
-                }
-            }
-
+        if self.data_shards[target_idx].is_none() {
             self.data_shards[target_idx] = Some(recovered);
+            self.received_data_count += 1;
         }
     }
 
+    #[inline]
     fn is_complete(&self) -> bool {
-        self.data_shards.iter().all(Option::is_some)
+        self.received_data_count == self.frag_count
     }
 
     fn assemble(self, frame_id: u32) -> ReassembledFrame {
@@ -147,14 +154,19 @@ pub fn fragment_frame(
     let num_groups = total_data.div_ceil(VIDEO_FEC_GROUP_SIZE);
     let mut packets = Vec::with_capacity(total_data + num_groups);
 
-    for (idx, chunk) in chunks.iter().enumerate() {
-        packets.push(VideoPacketOut {
-            frame_id,
-            frag_idx: idx as u16,
-            frag_count: total_data as u16,
-            flags: key_flag,
-            data: chunk.to_vec(),
-        });
+    for offset in 0..VIDEO_FEC_GROUP_SIZE {
+        for g_idx in 0..num_groups {
+            let idx = g_idx * VIDEO_FEC_GROUP_SIZE + offset;
+            if let Some(chunk) = chunks.get(idx) {
+                packets.push(VideoPacketOut {
+                    frame_id,
+                    frag_idx: idx as u16,
+                    frag_count: total_data as u16,
+                    flags: key_flag,
+                    data: chunk.to_vec(),
+                });
+            }
+        }
     }
 
     for g_idx in 0..num_groups {
@@ -246,17 +258,29 @@ impl FrameReassembler {
             return (None, false);
         }
 
+        if let Some(existing) = self.pending.get(&frame_id) {
+            if existing.frag_count != count || existing.is_keyframe != is_keyframe {
+                return (None, false);
+            }
+        }
+
+        if self.awaiting_idr && !is_keyframe {
+            return (None, true);
+        }
+
         let mut need_pli = false;
         if !self.pending.contains_key(&frame_id) && self.pending.len() >= 8 {
-            if let Some(oldest_fid) = self
+            if let Some(victim_fid) = self
                 .pending
                 .iter()
-                .min_by_key(|(_, st)| st.created_at)
+                .min_by_key(|(_, st)| (st.is_keyframe, st.created_at))
                 .map(|(&fid, _)| fid)
             {
-                self.pending.remove(&oldest_fid);
-                self.awaiting_idr = true;
-                need_pli = true;
+                self.pending.remove(&victim_fid);
+                if !is_keyframe {
+                    self.awaiting_idr = true;
+                    need_pli = true;
+                }
             }
         }
 
@@ -272,15 +296,43 @@ impl FrameReassembler {
         if is_fec {
             if idx < entry.parity_shards.len() && entry.parity_shards[idx].is_none() {
                 entry.parity_shards[idx] = Some(data);
+                entry.try_recover_fec_group(idx);
             }
         } else if idx < entry.data_shards.len() && entry.data_shards[idx].is_none() {
             entry.data_shards[idx] = Some(data);
+            entry.received_data_count += 1;
+            entry.try_recover_fec_group(idx / VIDEO_FEC_GROUP_SIZE);
         }
 
-        entry.try_recover_fec();
+        let now = Instant::now();
 
         if entry.is_complete() {
             let completed = self.pending.remove(&frame_id).unwrap().assemble(frame_id);
+
+            if completed.is_keyframe {
+                let stale_keys: Vec<u32> = self
+                    .pending
+                    .keys()
+                    .copied()
+                    .filter(|&k| is_serial_older(k, frame_id))
+                    .collect();
+                for k in stale_keys {
+                    self.pending.remove(&k);
+                }
+                self.last_completed_frame_id = Some(frame_id);
+                self.awaiting_idr = false;
+                return (Some(completed), false);
+            }
+
+            let older_inflight_idr = self.pending.iter().any(|(&k, st)| {
+                is_serial_older(k, frame_id)
+                    && st.is_keyframe
+                    && now.duration_since(st.created_at) < FRAME_TIMEOUT
+            });
+            if older_inflight_idr {
+                return (None, false);
+            }
+
             let stale_keys: Vec<u32> = self
                 .pending
                 .keys()
@@ -294,22 +346,16 @@ impl FrameReassembler {
             let gap = self
                 .last_completed_frame_id
                 .is_some_and(|prev| frame_id.wrapping_sub(prev) > 1);
-            self.last_completed_frame_id = Some(frame_id);
-
-            if completed.is_keyframe {
-                self.awaiting_idr = false;
-                return (Some(completed), false);
-            }
 
             if self.awaiting_idr || dropped_older || gap {
                 self.awaiting_idr = true;
                 return (None, true);
             }
 
+            self.last_completed_frame_id = Some(frame_id);
             return (Some(completed), false);
         }
 
-        let now = Instant::now();
         let expired: Vec<u32> = self
             .pending
             .iter()
@@ -589,5 +635,134 @@ mod tests {
             gap_pli |= pli;
         }
         assert!(gap_pli);
+    }
+
+    #[test]
+    fn test_p_frame_during_awaiting_idr_does_not_kill_inflight_idr() {
+        let idr_payload: Vec<u8> = (0..12_000).map(|i| ((i * 13) % 251) as u8).collect();
+        let p_payload: Vec<u8> = (0..600).map(|i| (i % 197) as u8).collect();
+        let mut reassembler = FrameReassembler::new();
+
+        let idr_packets = fragment_frame(10, true, &idr_payload);
+        let split = idr_packets.len() / 2;
+
+        for pkt in idr_packets.iter().take(split) {
+            let (out, pli) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data.clone(),
+            );
+            assert!(out.is_none());
+            assert!(!pli);
+        }
+
+        // Complete P-frame #11 arrives before IDR #10 finishes: must NOT evict or poison IDR #10.
+        for pkt in fragment_frame(11, false, &p_payload) {
+            let (out, pli) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data,
+            );
+            assert!(out.is_none());
+            assert!(pli);
+        }
+
+        let mut completed_idr = None;
+        for pkt in idr_packets.into_iter().skip(split) {
+            let (out, pli) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data,
+            );
+            assert!(!pli);
+            if let Some(frame) = out {
+                completed_idr = Some(frame);
+            }
+        }
+        let frame = completed_idr.expect("In-flight IDR #10 must survive early P-frame #11");
+        assert_eq!(frame.frame_id, 10);
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.annex_b_bytes, idr_payload);
+
+        // Also verify periodic GOP IDR #12 in-flight is not killed if P-frame #13 overtakes it.
+        let gop_idr_packets = fragment_frame(12, true, &idr_payload);
+        let gop_split = gop_idr_packets.len() / 2;
+        for pkt in gop_idr_packets.iter().take(gop_split) {
+            let (out, _) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data.clone(),
+            );
+            assert!(out.is_none());
+        }
+        for pkt in fragment_frame(13, false, &p_payload) {
+            let (out, _) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data,
+            );
+            assert!(out.is_none());
+        }
+        let mut completed_gop_idr = None;
+        for pkt in gop_idr_packets.into_iter().skip(gop_split) {
+            let (out, pli) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data,
+            );
+            assert!(!pli);
+            if let Some(f) = out {
+                completed_gop_idr = Some(f);
+            }
+        }
+        let gop_frame = completed_gop_idr.expect("In-flight GOP IDR #12 must complete");
+        assert_eq!(gop_frame.frame_id, 12);
+        assert!(gop_frame.is_keyframe);
+        assert_eq!(gop_frame.annex_b_bytes, idr_payload);
+    }
+
+    #[test]
+    fn test_interleaved_fec_recovers_consecutive_burst_loss() {
+        let payload: Vec<u8> = (0..20_000).map(|i| ((i * 29) % 251) as u8).collect();
+        let packets = fragment_frame(42, true, &payload);
+
+        // Drop 3 consecutive packets in the transmitted stream (indices 3, 4, 5).
+        // Because data shards are interleaved across 4 FEC groups, each dropped packet belongs
+        // to a different FEC group and all 3 are recovered via XOR-FEC without PLI.
+        let mut reassembler = FrameReassembler::new();
+        let mut recovered = None;
+        for (tx_idx, pkt) in packets.into_iter().enumerate() {
+            if (3..6).contains(&tx_idx) {
+                continue;
+            }
+            let (out, need_pli) = reassembler.push_fragment(
+                pkt.frame_id,
+                pkt.frag_idx,
+                pkt.frag_count,
+                pkt.flags,
+                pkt.data,
+            );
+            assert!(!need_pli);
+            if let Some(frame) = out {
+                recovered = Some(frame);
+            }
+        }
+
+        let frame = recovered.expect("Interleaved XOR-FEC must recover 3-packet consecutive burst");
+        assert_eq!(frame.frame_id, 42);
+        assert!(frame.is_keyframe);
+        assert_eq!(frame.annex_b_bytes, payload);
     }
 }

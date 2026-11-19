@@ -3,6 +3,8 @@ use flate2::{read::DeflateDecoder, write::DeflateEncoder, Compression};
 use image::{codecs::jpeg::JpegEncoder, ExtendedColorType, ImageFormat};
 use std::fmt;
 use std::io::{Cursor, Read, Write};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::{self, JoinHandle};
 
 const ANNEX_B_START_CODE: [u8; 4] = [0x00, 0x00, 0x00, 0x01];
 
@@ -19,16 +21,18 @@ const NAL_HEVC_SLICE: u8 = 0x02;
 
 const IDR_MODE_DEFLATE_RGB: u8 = 0x01;
 const IDR_MODE_JPEG_FULL: u8 = 0x02;
+const IDR_MODE_JPEG_STRIPED: u8 = 0x03;
 
 const P_MODE_DEFLATE_TILES: u8 = 0x01;
 const P_MODE_JPEG_TILES: u8 = 0x02;
 
 const P_TILE_SIZE: usize = 64;
-const TILE_SAD_NOISE_FLOOR: u64 = 96;
-const MAX_IDR_PAYLOAD_BYTES: usize = 160 * 1024;
+const TILE_SAD_NOISE_FLOOR: u64 = 64;
+const MAX_IDR_PAYLOAD_BYTES: usize = 140 * 1024;
 const FLAT_IDR_DEFLATE_LIMIT: usize = 48 * 1024;
 const MAX_VIDEO_DIM: u32 = 4096;
 const MAX_VIDEO_PIXELS: usize = 3840 * 2160;
+const STRIPE_LANES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct EncodedVideoFrame {
@@ -128,6 +132,384 @@ pub fn is_hevc_hardware_supported() -> bool {
     }
 }
 
+#[derive(Default)]
+struct StripeWorkerSlot {
+    job_id: u64,
+    done_id: u64,
+    shutdown: bool,
+    is_encode: bool,
+    width: u32,
+    height: u32,
+    quality: u8,
+    rgba: Vec<u8>,
+    rgb_scratch: Vec<u8>,
+    jpeg: Vec<u8>,
+    ok: bool,
+}
+
+struct StripeWorkerShared {
+    state: Mutex<StripeWorkerSlot>,
+    wake_worker: Condvar,
+    wake_caller: Condvar,
+}
+
+struct StripePool {
+    workers: Vec<(Arc<StripeWorkerShared>, Option<JoinHandle<()>>)>,
+    caller_rgb_scratch: Vec<u8>,
+    next_job_id: u64,
+}
+
+impl StripePool {
+    fn new() -> Self {
+        let mut workers = Vec::with_capacity(STRIPE_LANES - 1);
+        for idx in 0..(STRIPE_LANES - 1) {
+            let shared = Arc::new(StripeWorkerShared {
+                state: Mutex::new(StripeWorkerSlot::default()),
+                wake_worker: Condvar::new(),
+                wake_caller: Condvar::new(),
+            });
+            let worker_shared = Arc::clone(&shared);
+            let handle = thread::Builder::new()
+                .name(format!("squad-video-stripe-{idx}"))
+                .spawn(move || loop {
+                    let mut guard = worker_shared
+                        .state
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    while !guard.shutdown && guard.job_id == guard.done_id {
+                        guard = worker_shared
+                            .wake_worker
+                            .wait(guard)
+                            .unwrap_or_else(|e| e.into_inner());
+                    }
+                    if guard.shutdown {
+                        break;
+                    }
+                    let cur_job = guard.job_id;
+                    if guard.is_encode {
+                        let w = guard.width;
+                        let h = guard.height;
+                        let q = guard.quality;
+                        let slot = &mut *guard;
+                        rgba_to_rgb_slice(&slot.rgba, &mut slot.rgb_scratch);
+                        slot.jpeg.clear();
+                        slot.ok = JpegEncoder::new_with_quality(&mut slot.jpeg, q)
+                            .encode(&slot.rgb_scratch, w, h, ExtendedColorType::Rgb8)
+                            .is_ok()
+                            && !slot.jpeg.is_empty();
+                    } else {
+                        let w = guard.width;
+                        let h = guard.height;
+                        let slot = &mut *guard;
+                        slot.ok = decode_jpeg_stripe_into_rgba(&slot.jpeg, w, h, &mut slot.rgba);
+                    }
+                    guard.done_id = cur_job;
+                    drop(guard);
+                    worker_shared.wake_caller.notify_one();
+                })
+                .ok();
+            workers.push((shared, handle));
+        }
+        Self {
+            workers,
+            caller_rgb_scratch: Vec::new(),
+            next_job_id: 0,
+        }
+    }
+
+    fn encode_stripes(
+        &mut self,
+        rgba: &[u8],
+        width: u32,
+        ranges: &[(usize, usize)],
+        quality: u8,
+        out: &mut Vec<u8>,
+    ) -> bool {
+        if ranges.is_empty() {
+            return false;
+        }
+        let w = width as usize;
+        let active_workers = (ranges.len() - 1).min(self.workers.len());
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        let job_id = self.next_job_id;
+
+        for (w_idx, &(y0, y1)) in ranges.iter().skip(1).take(active_workers).enumerate() {
+            let stripe_h = (y1 - y0) as u32;
+            let src = &rgba[(y0 * w * 4)..(y1 * w * 4)];
+            let (ref shared, ref handle) = self.workers[w_idx];
+            if handle.is_some() {
+                let mut slot = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                slot.is_encode = true;
+                slot.width = width;
+                slot.height = stripe_h;
+                slot.quality = quality;
+                slot.rgba.clear();
+                slot.rgba.extend_from_slice(src);
+                slot.job_id = job_id;
+                drop(slot);
+                shared.wake_worker.notify_one();
+            }
+        }
+
+        let (y0_0, y1_0) = ranges[0];
+        let h0 = (y1_0 - y0_0) as u32;
+        let src0 = &rgba[(y0_0 * w * 4)..(y1_0 * w * 4)];
+        rgba_to_rgb_slice(src0, &mut self.caller_rgb_scratch);
+        let mut jpeg0 = Vec::with_capacity((src0.len() / 16).max(1024));
+        let ok0 = JpegEncoder::new_with_quality(&mut jpeg0, quality)
+            .encode(&self.caller_rgb_scratch, width, h0, ExtendedColorType::Rgb8)
+            .is_ok()
+            && !jpeg0.is_empty();
+
+        out.clear();
+        out.push(IDR_MODE_JPEG_STRIPED);
+        out.push(ranges.len() as u8);
+        out.extend_from_slice(&(jpeg0.len() as u32).to_be_bytes());
+        out.extend_from_slice(&jpeg0);
+
+        let mut all_ok = ok0;
+        for (w_idx, &(y0, y1)) in ranges.iter().skip(1).enumerate() {
+            if w_idx < active_workers && self.workers[w_idx].1.is_some() {
+                let shared = &self.workers[w_idx].0;
+                let mut slot = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                while slot.done_id != job_id && !slot.shutdown {
+                    slot = shared
+                        .wake_caller
+                        .wait(slot)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                if slot.ok && !slot.jpeg.is_empty() {
+                    out.extend_from_slice(&(slot.jpeg.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&slot.jpeg);
+                } else {
+                    all_ok = false;
+                }
+            } else {
+                let sh = (y1 - y0) as u32;
+                let src = &rgba[(y0 * w * 4)..(y1 * w * 4)];
+                rgba_to_rgb_slice(src, &mut self.caller_rgb_scratch);
+                let mut jbuf = Vec::new();
+                if JpegEncoder::new_with_quality(&mut jbuf, quality)
+                    .encode(&self.caller_rgb_scratch, width, sh, ExtendedColorType::Rgb8)
+                    .is_ok()
+                    && !jbuf.is_empty()
+                {
+                    out.extend_from_slice(&(jbuf.len() as u32).to_be_bytes());
+                    out.extend_from_slice(&jbuf);
+                } else {
+                    all_ok = false;
+                }
+            }
+        }
+
+        if !all_ok {
+            out.clear();
+        }
+        all_ok
+    }
+
+    fn decode_stripes(
+        &mut self,
+        width: u32,
+        ranges: &[(usize, usize)],
+        jpegs: &[&[u8]],
+        dst_rgba: &mut [u8],
+    ) -> bool {
+        if ranges.is_empty() || ranges.len() != jpegs.len() {
+            return false;
+        }
+        let w = width as usize;
+        let active_workers = (ranges.len() - 1).min(self.workers.len());
+        self.next_job_id = self.next_job_id.wrapping_add(1).max(1);
+        let job_id = self.next_job_id;
+
+        for w_idx in 0..active_workers {
+            let (y0, y1) = ranges[w_idx + 1];
+            let stripe_h = (y1 - y0) as u32;
+            let (ref shared, ref handle) = self.workers[w_idx];
+            if handle.is_some() {
+                let mut slot = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                slot.is_encode = false;
+                slot.width = width;
+                slot.height = stripe_h;
+                slot.jpeg.clear();
+                slot.jpeg.extend_from_slice(jpegs[w_idx + 1]);
+                slot.job_id = job_id;
+                drop(slot);
+                shared.wake_worker.notify_one();
+            }
+        }
+
+        let (y0_0, y1_0) = ranges[0];
+        let h0 = (y1_0 - y0_0) as u32;
+        let mut all_ok = decode_jpeg_stripe_into_rgba_slice(
+            jpegs[0],
+            width,
+            h0,
+            &mut dst_rgba[(y0_0 * w * 4)..(y1_0 * w * 4)],
+        );
+
+        for (w_idx, &(y0, y1)) in ranges.iter().skip(1).enumerate() {
+            let dst_slice = &mut dst_rgba[(y0 * w * 4)..(y1 * w * 4)];
+            if w_idx < active_workers && self.workers[w_idx].1.is_some() {
+                let shared = &self.workers[w_idx].0;
+                let mut slot = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+                while slot.done_id != job_id && !slot.shutdown {
+                    slot = shared
+                        .wake_caller
+                        .wait(slot)
+                        .unwrap_or_else(|e| e.into_inner());
+                }
+                if slot.ok && slot.rgba.len() == dst_slice.len() {
+                    dst_slice.copy_from_slice(&slot.rgba);
+                } else {
+                    all_ok = false;
+                }
+            } else {
+                let sh = (y1 - y0) as u32;
+                if !decode_jpeg_stripe_into_rgba_slice(jpegs[w_idx + 1], width, sh, dst_slice) {
+                    all_ok = false;
+                }
+            }
+        }
+
+        all_ok
+    }
+}
+
+impl Drop for StripePool {
+    fn drop(&mut self) {
+        for (shared, _) in &self.workers {
+            let mut slot = shared.state.lock().unwrap_or_else(|e| e.into_inner());
+            slot.shutdown = true;
+            drop(slot);
+            shared.wake_worker.notify_all();
+        }
+        for (_, handle) in &mut self.workers {
+            if let Some(h) = handle.take() {
+                let _ = h.join();
+            }
+        }
+    }
+}
+
+fn compute_stripe_ranges(height: usize, requested_stripes: usize) -> Vec<(usize, usize)> {
+    let stripes = requested_stripes.clamp(1, 8);
+    if stripes <= 1 || height < stripes * 16 {
+        return vec![(0, height)];
+    }
+    let base = ((height / stripes) & !15).max(16);
+    let mut ranges = Vec::with_capacity(stripes);
+    let mut y = 0usize;
+    for idx in 0..stripes {
+        let next_y = if idx + 1 == stripes {
+            height
+        } else {
+            (y + base).min(height)
+        };
+        if next_y > y {
+            ranges.push((y, next_y));
+        }
+        y = next_y;
+    }
+    ranges
+}
+
+fn rgba_to_rgb_slice(rgba: &[u8], out_rgb: &mut Vec<u8>) {
+    let pixels = rgba.len() / 4;
+    out_rgb.resize(pixels * 3, 0);
+    for (src, dst) in rgba
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .zip(out_rgb.as_chunks_mut::<3>().0.iter_mut())
+    {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+    }
+}
+
+fn decode_jpeg_stripe_into_rgba(
+    jpeg_bytes: &[u8],
+    width: u32,
+    height: u32,
+    out_rgba: &mut Vec<u8>,
+) -> bool {
+    let Some(expected) = (width as usize)
+        .checked_mul(height as usize)
+        .and_then(|px| px.checked_mul(4))
+    else {
+        return false;
+    };
+    out_rgba.resize(expected, 255);
+    decode_jpeg_stripe_into_rgba_slice(jpeg_bytes, width, height, out_rgba)
+}
+
+fn decode_jpeg_stripe_into_rgba_slice(
+    jpeg_bytes: &[u8],
+    width: u32,
+    height: u32,
+    dst_rgba: &mut [u8],
+) -> bool {
+    let Some(img) = decode_jpeg_bounded(jpeg_bytes, MAX_VIDEO_DIM, MAX_VIDEO_DIM) else {
+        return false;
+    };
+    let rgb = if img.width() != width || img.height() != height {
+        img.resize_exact(width, height, image::imageops::FilterType::Triangle)
+            .into_rgb8()
+    } else {
+        img.into_rgb8()
+    };
+    let raw = rgb.as_raw();
+    if raw.len() * 4 != dst_rgba.len() * 3 {
+        return false;
+    }
+    for (src, dst) in raw
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .zip(dst_rgba.as_chunks_mut::<4>().0.iter_mut())
+    {
+        dst[0] = src[0];
+        dst[1] = src[1];
+        dst[2] = src[2];
+        dst[3] = 255;
+    }
+    true
+}
+
+fn is_all_achromatic_rgba(rgba: &[u8]) -> bool {
+    for px in rgba.as_chunks::<4>().0 {
+        if px[0] != px[1] || px[1] != px[2] {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_flat_rgba_strided(rgba: &[u8], w: usize, h: usize) -> bool {
+    if w == 0 || h == 0 {
+        return false;
+    }
+    let mut sampled = 0usize;
+    let mut transitions = 0usize;
+    for y in (0..h).step_by(8) {
+        let row_base = y * w * 4;
+        let mut prev = [rgba[row_base], rgba[row_base + 1], rgba[row_base + 2]];
+        for x in (0..w).step_by(4) {
+            let idx = row_base + x * 4;
+            let cur = [rgba[idx], rgba[idx + 1], rgba[idx + 2]];
+            if x > 0 && cur != prev {
+                transitions += 1;
+            }
+            prev = cur;
+            sampled += 1;
+        }
+    }
+    sampled > 0 && transitions * 10 <= sampled
+}
+
 pub struct H264Encoder {
     fps: u8,
     bitrate_bps: u32,
@@ -136,12 +518,14 @@ pub struct H264Encoder {
     frame_index: u64,
     force_idr: bool,
     last_idr_quality: u8,
+    last_p_quality: u8,
     width: u32,
     height: u32,
     ref_rgba: Vec<u8>,
     scratch_rgb: Vec<u8>,
     scratch_dpcm: Vec<u8>,
     scratch_strip: Vec<u8>,
+    stripe_pool: StripePool,
 }
 
 impl H264Encoder {
@@ -151,20 +535,31 @@ impl H264Encoder {
 
     pub fn new_with_codec(fps: u8, bitrate_bps: u32, codec: VideoCodec) -> Self {
         let clamped_fps = fps.max(1);
+        let clamped_bitrate = bitrate_bps.max(500_000);
+        let init_p_q = match (codec, clamped_bitrate) {
+            (VideoCodec::H265, b) if b >= 12_000_000 => 82,
+            (VideoCodec::H265, b) if b >= 8_000_000 => 76,
+            (VideoCodec::H265, _) => 70,
+            (VideoCodec::H264, b) if b >= 12_000_000 => 78,
+            (VideoCodec::H264, b) if b >= 8_000_000 => 72,
+            (VideoCodec::H264, _) => 66,
+        };
         Self {
             fps: clamped_fps,
-            bitrate_bps: bitrate_bps.max(500_000),
+            bitrate_bps: clamped_bitrate,
             codec,
             gop_len: u64::from(clamped_fps) * 2,
             frame_index: 0,
             force_idr: true,
             last_idr_quality: 68,
+            last_p_quality: init_p_q,
             width: 0,
             height: 0,
             ref_rgba: Vec::new(),
             scratch_rgb: Vec::new(),
             scratch_dpcm: Vec::new(),
             scratch_strip: Vec::new(),
+            stripe_pool: StripePool::new(),
         }
     }
 
@@ -281,7 +676,7 @@ impl H264Encoder {
         }
     }
 
-    fn copy_rgba_to_ref_and_rgb(&mut self, frame: &RawRgbaFrame) -> (bool, bool) {
+    fn update_ref_rgba(&mut self, frame: &RawRgbaFrame) -> (bool, bool) {
         let w = self.width as usize;
         let h = self.height as usize;
         let pixel_count = w * h;
@@ -294,41 +689,44 @@ impl H264Encoder {
             self.ref_rgba[copy_len..].fill(255);
         }
 
-        self.scratch_rgb.resize(pixel_count * 3, 0);
-        let mut all_achromatic = true;
-        let mut transitions = 0usize;
-        let mut prev_pixel = [0u8; 3];
+        let all_achromatic = is_all_achromatic_rgba(&self.ref_rgba);
+        let is_flat = all_achromatic || is_flat_rgba_strided(&self.ref_rgba, w, h);
+        (all_achromatic, is_flat)
+    }
 
-        for (i, (src, dst)) in self
-            .ref_rgba
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .zip(self.scratch_rgb.as_chunks_mut::<3>().0.iter_mut())
-            .enumerate()
-        {
-            dst[0] = src[0];
-            dst[1] = src[1];
-            dst[2] = src[2];
-            if src[0] != src[1] || src[1] != src[2] {
-                all_achromatic = false;
+    fn encode_jpeg_idr_with_quality(&mut self, w: u32, h: u32, quality: u8, out: &mut Vec<u8>) {
+        out.clear();
+        if w >= 256 && h >= 256 {
+            let ranges = compute_stripe_ranges(h as usize, STRIPE_LANES);
+            if ranges.len() >= 2
+                && self
+                    .stripe_pool
+                    .encode_stripes(&self.ref_rgba, w, &ranges, quality, out)
+            {
+                return;
             }
-            if i % w != 0 && *dst != prev_pixel {
-                transitions += 1;
-            }
-            prev_pixel = *dst;
         }
 
-        let is_flat = transitions * 10 <= pixel_count;
-        (all_achromatic, is_flat)
+        rgba_to_rgb_slice(&self.ref_rgba, &mut self.scratch_rgb);
+        let mut jpeg_buf = Vec::new();
+        if JpegEncoder::new_with_quality(&mut jpeg_buf, quality)
+            .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
+            .is_ok()
+            && !jpeg_buf.is_empty()
+        {
+            out.reserve(1 + jpeg_buf.len());
+            out.push(IDR_MODE_JPEG_FULL);
+            out.extend_from_slice(&jpeg_buf);
+        }
     }
 
     fn encode_idr_payload(&mut self, frame: &RawRgbaFrame) -> Vec<u8> {
         let w = self.width;
         let h = self.height;
-        let (all_achromatic, is_flat) = self.copy_rgba_to_ref_and_rgb(frame);
+        let (all_achromatic, is_flat) = self.update_ref_rgba(frame);
 
         if is_flat || all_achromatic {
+            rgba_to_rgb_slice(&self.ref_rgba, &mut self.scratch_rgb);
             dpcm_row_sub_rgb(&self.scratch_rgb, w as usize, &mut self.scratch_dpcm);
             if let Some(compressed) = deflate_fast(&self.scratch_dpcm) {
                 let limit = if all_achromatic {
@@ -345,46 +743,35 @@ impl H264Encoder {
             }
         }
 
-        if self.codec == VideoCodec::H265 {
-            soften_chroma_spikes(&mut self.scratch_rgb, w as usize, h as usize);
-        }
-
         let max_q = self.max_idr_quality();
-        let q1 = self.last_idr_quality.min(max_q);
-        let mut best_jpeg = Vec::new();
-        let enc_ok = JpegEncoder::new_with_quality(&mut best_jpeg, q1)
-            .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
-            .is_ok();
+        let q1 = self.last_idr_quality.clamp(24, max_q);
+        let per_frame = ((u64::from(self.bitrate_bps) / 8) / u64::from(self.fps.max(1))) as usize;
+        let target = (per_frame * 2).clamp(28_000, 96_000);
 
-        if enc_ok && best_jpeg.len() < 110 * 1024 {
-            self.last_idr_quality = (q1 + 4).min(max_q);
-        } else if !enc_ok || best_jpeg.len() >= MAX_IDR_PAYLOAD_BYTES {
-            let q2 = q1.saturating_sub(14).max(30);
-            self.last_idr_quality = q2;
-            best_jpeg.clear();
-            let _ = JpegEncoder::new_with_quality(&mut best_jpeg, q2).encode(
-                &self.scratch_rgb,
-                w,
-                h,
-                ExtendedColorType::Rgb8,
-            );
+        let mut out = Vec::with_capacity(target.min(MAX_IDR_PAYLOAD_BYTES));
+        self.encode_jpeg_idr_with_quality(w, h, q1, &mut out);
 
-            if best_jpeg.is_empty() || best_jpeg.len() >= MAX_IDR_PAYLOAD_BYTES {
+        if out.is_empty() || out.len() >= MAX_IDR_PAYLOAD_BYTES {
+            let q2 = q1.saturating_sub(18).max(22);
+            self.last_idr_quality = q2.max(24);
+            self.encode_jpeg_idr_with_quality(w, h, q2, &mut out);
+
+            if out.is_empty() || out.len() >= MAX_IDR_PAYLOAD_BYTES {
                 let mut fallback = Vec::new();
-                if JpegEncoder::new_with_quality(&mut fallback, 18)
-                    .encode(&self.scratch_rgb, w, h, ExtendedColorType::Rgb8)
-                    .is_ok()
-                    && !fallback.is_empty()
-                {
-                    best_jpeg = fallback;
+                self.encode_jpeg_idr_with_quality(w, h, 14, &mut fallback);
+                if !fallback.is_empty() {
+                    out = fallback;
                     self.last_idr_quality = 24;
                 }
             }
+        } else if out.len() > (target * 12) / 10 {
+            self.last_idr_quality = q1.saturating_sub(5).max(24);
+        } else if out.len() > target {
+            self.last_idr_quality = q1.saturating_sub(2).max(24);
+        } else if out.len() < (target * 75) / 100 {
+            self.last_idr_quality = (q1 + 3).min(max_q);
         }
 
-        let mut out = Vec::with_capacity(1 + best_jpeg.len());
-        out.push(IDR_MODE_JPEG_FULL);
-        out.extend_from_slice(&best_jpeg);
         out
     }
 
@@ -399,7 +786,8 @@ impl H264Encoder {
         let tiles_x = w.div_ceil(P_TILE_SIZE);
         let tiles_y = h.div_ceil(P_TILE_SIZE);
         let total_tiles = tiles_x * tiles_y;
-        let mut changed: Vec<(u64, u16)> = Vec::new();
+        let max_p_tiles = (total_tiles / 4).clamp(16, 128);
+        let mut changed: Vec<u16> = Vec::with_capacity(max_p_tiles + 1);
 
         for ty in 0..tiles_y {
             let y0 = ty * P_TILE_SIZE;
@@ -408,8 +796,9 @@ impl H264Encoder {
                 let x0 = tx * P_TILE_SIZE;
                 let x1 = (x0 + P_TILE_SIZE).min(w);
                 let mut sad = 0u64;
+                let mut tile_dirty = false;
 
-                for y in y0..y1 {
+                'tile_rows: for y in y0..y1 {
                     let row_start = (y * w + x0) * 4;
                     let row_end = (y * w + x1) * 4;
                     let cur = &frame.rgba[row_start..row_end];
@@ -423,11 +812,18 @@ impl H264Encoder {
                         sad += u64::from(c[0].abs_diff(p[0]))
                             + u64::from(c[1].abs_diff(p[1]))
                             + u64::from(c[2].abs_diff(p[2]));
+                        if sad >= TILE_SAD_NOISE_FLOOR {
+                            tile_dirty = true;
+                            break 'tile_rows;
+                        }
                     }
                 }
 
-                if sad >= TILE_SAD_NOISE_FLOOR {
-                    changed.push((sad, (ty * tiles_x + tx) as u16));
+                if tile_dirty {
+                    changed.push((ty * tiles_x + tx) as u16);
+                    if changed.len() > max_p_tiles {
+                        return None;
+                    }
                 }
             }
         }
@@ -436,38 +832,23 @@ impl H264Encoder {
             return Some(vec![0x00, 0x00, P_MODE_JPEG_TILES]);
         }
 
-        if changed.len() * 100 > total_tiles * 80 {
+        let budget = self.p_budget_bytes();
+        let max_pq = self.p_tile_quality();
+        let quality = self.last_p_quality.clamp(36, max_pq);
+        let candidate = self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed, quality);
+
+        if candidate.is_empty() || candidate.len() > budget {
+            self.last_p_quality = quality.saturating_sub(6).max(36);
             return None;
         }
 
-        changed.sort_unstable_by_key(|a| std::cmp::Reverse(a.0));
-
-        let budget = self.p_budget_bytes();
-        let quality = self.p_tile_quality();
-        let mut best_encoded = vec![0x00, 0x00, P_MODE_JPEG_TILES];
-        let mut best_count = 0usize;
-
-        let mut count = changed.len().min((budget / 420).clamp(16, 96));
-        let mut candidate =
-            self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..count], quality);
-        if candidate.len() > budget && count > 1 {
-            count = ((count * budget * 9) / (candidate.len().max(1) * 10)).max(1);
-            candidate =
-                self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..count], quality);
+        if candidate.len() < (budget * 65) / 100 {
+            self.last_p_quality = (quality + 2).min(max_pq);
+        } else if candidate.len() > (budget * 90) / 100 {
+            self.last_p_quality = quality.saturating_sub(2).max(36);
         }
 
-        if candidate.len() <= budget {
-            best_encoded = candidate;
-            best_count = count;
-        } else if !changed.is_empty() {
-            let single = self.serialize_p_tiles(&frame.rgba, w, h, tiles_x, &changed[..1], 55);
-            if !single.is_empty() {
-                best_encoded = single;
-                best_count = 1;
-            }
-        }
-
-        for &(_, tid) in &changed[..best_count] {
+        for &tid in &changed {
             let tx = usize::from(tid) % tiles_x;
             let ty = usize::from(tid) / tiles_x;
             let y0 = ty * P_TILE_SIZE;
@@ -481,7 +862,7 @@ impl H264Encoder {
             }
         }
 
-        Some(best_encoded)
+        Some(candidate)
     }
 
     fn serialize_p_tiles(
@@ -490,14 +871,14 @@ impl H264Encoder {
         w: usize,
         h: usize,
         tiles_x: usize,
-        tiles: &[(u64, u16)],
+        tiles: &[u16],
         jpeg_quality: u8,
     ) -> Vec<u8> {
         let count = tiles.len();
         let strip_h = count * P_TILE_SIZE;
         self.scratch_strip.resize(P_TILE_SIZE * strip_h * 3, 0);
 
-        for (slot, &(_, tid)) in tiles.iter().enumerate() {
+        for (slot, &tid) in tiles.iter().enumerate() {
             let tx = usize::from(tid) % tiles_x;
             let ty = usize::from(tid) / tiles_x;
             let x0 = tx * P_TILE_SIZE;
@@ -554,7 +935,7 @@ impl H264Encoder {
         } else {
             P_MODE_JPEG_TILES
         });
-        for &(_, tid) in tiles {
+        for &tid in tiles {
             out.extend_from_slice(&tid.to_be_bytes());
         }
         out.extend_from_slice(&chosen);
@@ -562,13 +943,16 @@ impl H264Encoder {
     }
 }
 
+pub type SharedRgbaFrame = (u32, u32, Arc<Vec<u8>>);
+
 pub struct H264Decoder {
     width: u32,
     height: u32,
     fps: u8,
     has_idr: bool,
     hevc_decode_supported: bool,
-    frame_rgba: Vec<u8>,
+    frame_rgba: Arc<Vec<u8>>,
+    stripe_pool: StripePool,
 }
 
 impl Default for H264Decoder {
@@ -585,7 +969,8 @@ impl H264Decoder {
             fps: 30,
             has_idr: false,
             hevc_decode_supported: is_hevc_hardware_supported(),
-            frame_rgba: Vec::new(),
+            frame_rgba: Arc::new(Vec::new()),
+            stripe_pool: StripePool::new(),
         }
     }
 
@@ -599,14 +984,14 @@ impl H264Decoder {
 
     pub fn reset(&mut self) {
         self.has_idr = false;
-        self.frame_rgba.clear();
+        Arc::make_mut(&mut self.frame_rgba).clear();
     }
 
     pub fn reset_and_shrink(&mut self) {
         self.has_idr = false;
         self.width = 0;
         self.height = 0;
-        self.frame_rgba = Vec::new();
+        self.frame_rgba = Arc::new(Vec::new());
     }
 
     pub fn decode(&mut self, annex_b: &[u8]) -> Option<RawRgbaFrame> {
@@ -614,6 +999,19 @@ impl H264Decoder {
     }
 
     pub fn decode_checked(&mut self, annex_b: &[u8]) -> Result<Option<RawRgbaFrame>, DecoderError> {
+        self.decode_checked_shared(annex_b).map(|opt| {
+            opt.map(|(width, height, rgba)| RawRgbaFrame {
+                width,
+                height,
+                rgba: (*rgba).clone(),
+            })
+        })
+    }
+
+    pub fn decode_checked_shared(
+        &mut self,
+        annex_b: &[u8],
+    ) -> Result<Option<SharedRgbaFrame>, DecoderError> {
         let nals = split_annex_b_nals(annex_b);
         if nals.is_empty() {
             return Err(DecoderError::CorruptBitstream);
@@ -621,11 +1019,11 @@ impl H264Decoder {
 
         let mut prev_state = (self.width, self.height, self.fps, self.has_idr);
         match self.decode_nals(&nals, &mut prev_state) {
-            Ok(true) => Ok(Some(RawRgbaFrame {
-                width: self.width,
-                height: self.height,
-                rgba: self.frame_rgba.clone(),
-            })),
+            Ok(true) => Ok(Some((
+                self.width,
+                self.height,
+                Arc::clone(&self.frame_rgba),
+            ))),
             Ok(false) => Ok(None),
             Err(err) => {
                 (self.width, self.height, self.fps, self.has_idr) = prev_state;
@@ -694,6 +1092,15 @@ impl H264Decoder {
         Ok(produced)
     }
 
+    fn prepare_idr_rgba_buf(&mut self, expected_rgba: usize) -> &mut Vec<u8> {
+        if Arc::strong_count(&self.frame_rgba) != 1 {
+            self.frame_rgba = Arc::new(vec![255u8; expected_rgba]);
+        }
+        let buf = Arc::get_mut(&mut self.frame_rgba).expect("unique Arc");
+        buf.resize(expected_rgba, 255);
+        buf
+    }
+
     fn decode_idr(&mut self, payload: &[u8]) -> bool {
         if payload.len() < 2 {
             return false;
@@ -720,8 +1127,8 @@ impl H264Decoder {
                 if dpcm.len() < expected_rgb {
                     return false;
                 }
-                self.frame_rgba.resize(expected_rgba, 255);
-                dpcm_row_unsub_rgb_to_rgba(&dpcm[..expected_rgb], w, &mut self.frame_rgba);
+                let dst = self.prepare_idr_rgba_buf(expected_rgba);
+                dpcm_row_unsub_rgb_to_rgba(&dpcm[..expected_rgb], w, dst);
                 true
             }
             IDR_MODE_JPEG_FULL => {
@@ -741,7 +1148,72 @@ impl H264Decoder {
                 if rgba.len() != expected_rgba {
                     return false;
                 }
-                self.frame_rgba = rgba;
+                if let Some(buf) = Arc::get_mut(&mut self.frame_rgba) {
+                    *buf = rgba;
+                } else {
+                    self.frame_rgba = Arc::new(rgba);
+                }
+                true
+            }
+            IDR_MODE_JPEG_STRIPED => {
+                if body.is_empty() {
+                    return false;
+                }
+                let stripe_count = body[0] as usize;
+                if !(2..=8).contains(&stripe_count) || h < stripe_count * 16 {
+                    return false;
+                }
+                let ranges = compute_stripe_ranges(h, stripe_count);
+                if ranges.len() != stripe_count {
+                    return false;
+                }
+                let mut cursor = 1usize;
+                let mut jpegs: Vec<&[u8]> = Vec::with_capacity(stripe_count);
+                for _ in 0..stripe_count {
+                    if cursor + 4 > body.len() {
+                        return false;
+                    }
+                    let slen = u32::from_be_bytes([
+                        body[cursor],
+                        body[cursor + 1],
+                        body[cursor + 2],
+                        body[cursor + 3],
+                    ]) as usize;
+                    cursor += 4;
+                    if slen == 0 || cursor + slen > body.len() {
+                        return false;
+                    }
+                    jpegs.push(&body[cursor..cursor + slen]);
+                    cursor += slen;
+                }
+                if cursor != body.len() {
+                    return false;
+                }
+
+                let width = self.width;
+                let mut decoded_rgba = if Arc::strong_count(&self.frame_rgba) == 1
+                    && self.frame_rgba.len() == expected_rgba
+                {
+                    let mut reused = Vec::new();
+                    std::mem::swap(&mut reused, Arc::get_mut(&mut self.frame_rgba).unwrap());
+                    reused
+                } else {
+                    vec![255u8; expected_rgba]
+                };
+                decoded_rgba.resize(expected_rgba, 255);
+
+                if !self
+                    .stripe_pool
+                    .decode_stripes(width, &ranges, &jpegs, &mut decoded_rgba)
+                {
+                    return false;
+                }
+
+                if let Some(buf) = Arc::get_mut(&mut self.frame_rgba) {
+                    *buf = decoded_rgba;
+                } else {
+                    self.frame_rgba = Arc::new(decoded_rgba);
+                }
                 true
             }
             _ => false,
@@ -825,6 +1297,7 @@ impl H264Decoder {
             _ => return false,
         };
 
+        let dst_rgba = Arc::make_mut(&mut self.frame_rgba);
         for (slot, tid) in tile_ids.into_iter().enumerate() {
             let tx = usize::from(tid) % tiles_x;
             let ty = usize::from(tid) / tiles_x;
@@ -840,64 +1313,15 @@ impl H264Decoder {
                 for dx in 0..(x1 - x0) {
                     let sidx = src_row + dx * 3;
                     let didx = dst_row + dx * 4;
-                    self.frame_rgba[didx] = strip_rgb[sidx];
-                    self.frame_rgba[didx + 1] = strip_rgb[sidx + 1];
-                    self.frame_rgba[didx + 2] = strip_rgb[sidx + 2];
-                    self.frame_rgba[didx + 3] = 255;
+                    dst_rgba[didx] = strip_rgb[sidx];
+                    dst_rgba[didx + 1] = strip_rgb[sidx + 1];
+                    dst_rgba[didx + 2] = strip_rgb[sidx + 2];
+                    dst_rgba[didx + 3] = 255;
                 }
             }
         }
 
         true
-    }
-}
-
-fn soften_chroma_spikes(rgb: &mut [u8], w: usize, h: usize) {
-    if w < 4 || h < 4 {
-        return;
-    }
-    for y in (0..h - 1).step_by(2) {
-        let row0 = y * w * 3;
-        let row1 = (y + 1) * w * 3;
-        for x in (0..w - 1).step_by(2) {
-            let p00 = row0 + x * 3;
-            let p10 = p00 + 3;
-            let p01 = row1 + x * 3;
-            let p11 = p01 + 3;
-            let max_spread = [
-                rgb[p00].abs_diff(rgb[p00 + 1]),
-                rgb[p00 + 1].abs_diff(rgb[p00 + 2]),
-                rgb[p11].abs_diff(rgb[p11 + 1]),
-            ]
-            .into_iter()
-            .max()
-            .unwrap_or(0);
-            if max_spread > 12 {
-                let avg_rg_diff = (i32::from(rgb[p00]) - i32::from(rgb[p00 + 1])
-                    + i32::from(rgb[p10])
-                    - i32::from(rgb[p10 + 1])
-                    + i32::from(rgb[p01])
-                    - i32::from(rgb[p01 + 1])
-                    + i32::from(rgb[p11])
-                    - i32::from(rgb[p11 + 1]))
-                    >> 2;
-                let avg_bg_diff = (i32::from(rgb[p00 + 2]) - i32::from(rgb[p00 + 1])
-                    + i32::from(rgb[p10 + 2])
-                    - i32::from(rgb[p10 + 1])
-                    + i32::from(rgb[p01 + 2])
-                    - i32::from(rgb[p01 + 1])
-                    + i32::from(rgb[p11 + 2])
-                    - i32::from(rgb[p11 + 1]))
-                    >> 2;
-                for idx in [p00, p10, p01, p11] {
-                    let g = i32::from(rgb[idx + 1]);
-                    let r_blend = (i32::from(rgb[idx]) * 3 + (g + avg_rg_diff)) >> 2;
-                    let b_blend = (i32::from(rgb[idx + 2]) * 3 + (g + avg_bg_diff)) >> 2;
-                    rgb[idx] = r_blend.clamp(0, 255) as u8;
-                    rgb[idx + 2] = b_blend.clamp(0, 255) as u8;
-                }
-            }
-        }
     }
 }
 
@@ -1286,5 +1710,129 @@ mod tests {
         let mut bad_p_annex_b = Vec::new();
         write_nal(&mut bad_p_annex_b, NAL_SLICE, &[1, 1, P_MODE_DEFLATE_TILES]);
         assert!(dec.decode(&bad_p_annex_b).is_none());
+    }
+
+    #[test]
+    fn test_dynamic_motion_never_leaves_desynchronized_stale_tiles() {
+        let w = 1920usize;
+        let h = 1080usize;
+        let mut rgba1 = vec![255u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) * 4;
+                rgba1[idx] = ((x * 17 + y * 31) & 0x7F) as u8;
+                rgba1[idx + 1] = ((x * 23 + y * 13) & 0x3F) as u8;
+                rgba1[idx + 2] = 20;
+                rgba1[idx + 3] = 255;
+            }
+        }
+        let f1 = RawRgbaFrame {
+            width: w as u32,
+            height: h as u32,
+            rgba: rgba1.clone(),
+        };
+
+        let mut enc = H264Encoder::new(60, 8_000_000);
+        let mut dec = H264Decoder::new();
+        let e1 = enc.encode(&f1);
+        assert!(e1.is_keyframe);
+        let _ = dec.decode(&e1.annex_b).expect("IDR must decode");
+
+        // Modify ~45% of 64x64 tiles to a bright blue/cyan textured pattern.
+        // Previously this hit the 16..=96 tile cap or collapsed to 1 tile, leaving stale squares.
+        let tiles_x = w.div_ceil(P_TILE_SIZE);
+        let tiles_y = h.div_ceil(P_TILE_SIZE);
+        let mut rgba2 = rgba1;
+        let mut changed_tiles = Vec::new();
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                if (tx + ty * 3) % 2 == 0 && (tx + ty) % 5 != 0 {
+                    changed_tiles.push((tx, ty));
+                    let x0 = tx * P_TILE_SIZE;
+                    let x1 = (x0 + P_TILE_SIZE).min(w);
+                    let y0 = ty * P_TILE_SIZE;
+                    let y1 = (y0 + P_TILE_SIZE).min(h);
+                    for y in y0..y1 {
+                        for x in x0..x1 {
+                            let idx = (y * w + x) * 4;
+                            rgba2[idx] = 10;
+                            rgba2[idx + 1] = 210;
+                            rgba2[idx + 2] = (220 + ((x ^ y) & 31)) as u8;
+                            rgba2[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(changed_tiles.len() > 180);
+
+        let f2 = RawRgbaFrame {
+            width: w as u32,
+            height: h as u32,
+            rgba: rgba2,
+        };
+        let e2 = enc.encode(&f2);
+        assert!(e2.annex_b.len() <= 165 * 1024);
+        let (_, _, d2_rgba) = dec
+            .decode_checked_shared(&e2.annex_b)
+            .expect("dynamic frame must decode cleanly")
+            .expect("dynamic frame must produce output");
+
+        // Verify EVERY changed tile in the decoded output has the new blue/cyan color at its center.
+        for (tx, ty) in changed_tiles {
+            let cx = (tx * P_TILE_SIZE + P_TILE_SIZE / 2).min(w - 1);
+            let cy = (ty * P_TILE_SIZE + P_TILE_SIZE / 2).min(h - 1);
+            let idx = (cy * w + cx) * 4;
+            assert!(
+                d2_rgba[idx + 2] > 160 && d2_rgba[idx] < 80,
+                "Tile ({tx}, {ty}) remained stale: RGB=({}, {}, {})",
+                d2_rgba[idx],
+                d2_rgba[idx + 1],
+                d2_rgba[idx + 2]
+            );
+        }
+    }
+
+    #[test]
+    fn test_striped_idr_1080p_roundtrip_and_corruption_rejection() {
+        let w = 1920usize;
+        let h = 1080usize;
+        let mut rgba = vec![255u8; w * h * 4];
+        for y in 0..h {
+            for x in 0..w {
+                let idx = (y * w + x) * 4;
+                rgba[idx] = ((x * 9 + y * 5) & 0xFF) as u8;
+                rgba[idx + 1] = ((x * 3 + y * 11) & 0xFF) as u8;
+                rgba[idx + 2] = ((x * 15 + y * 7) & 0xFF) as u8;
+                rgba[idx + 3] = 255;
+            }
+        }
+        let frame = RawRgbaFrame {
+            width: w as u32,
+            height: h as u32,
+            rgba,
+        };
+
+        let mut enc = H264Encoder::new(60, 8_000_000);
+        let mut dec = H264Decoder::new();
+        let encoded = enc.encode(&frame);
+        assert!(encoded.is_keyframe);
+        let decoded = dec
+            .decode(&encoded.annex_b)
+            .expect("1080p striped IDR must decode");
+        assert_eq!(decoded.width, 1920);
+        assert_eq!(decoded.height, 1080);
+
+        // Corrupt striped IDR payload (invalid stripe count & truncated stripe length) must be rejected
+        // without corrupting existing decoder dimensions/state.
+        let mut corrupt_annex_b = Vec::new();
+        write_nal(&mut corrupt_annex_b, NAL_SPS, &encode_sps(1920, 1080, 60));
+        write_nal(
+            &mut corrupt_annex_b,
+            NAL_IDR,
+            &[IDR_MODE_JPEG_STRIPED, 4, 0, 0, 1, 0, 0xFF],
+        );
+        assert!(dec.decode(&corrupt_annex_b).is_none());
+        assert_eq!((dec.width, dec.height, dec.has_idr), (1920, 1080, true));
     }
 }
