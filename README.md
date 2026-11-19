@@ -2,7 +2,7 @@
   <img src="assets/icons/icon.png" alt="SquadAir Logo" width="128" height="128" />
 </p>
 
-<h1 align="center">SQUAD-AIR</h1>
+<h1 align="center">SquadAir</h1>
 
 <p align="center">
   <strong>Ultra-lightweight, zero-knowledge P2P voice &amp; 1080p60 screen sharing built in pure Rust — engineered for competitive gamers who count every FPS.</strong>
@@ -20,7 +20,7 @@
 </p>
 
 <p align="center">
-  <a href="#why-squad-air">Why Squad-Air?</a> •
+  <a href="#why-squadair">Why SquadAir?</a> •
   <a href="#benchmarks">Benchmarks</a> •
   <a href="#features">Features</a> •
   <a href="#architecture">Architecture</a> •
@@ -33,7 +33,7 @@
 
 ---
 
-## Why Squad-Air?
+## Why SquadAir?
 
 1. **Zero FPS Loss in Competitive Shooters:**
    No Chromium, no V8, no background web workers. SquadAir compiles to a native Rust binary (`26 MB` on macOS Apple Silicon, `35 MB` standalone on Windows, `12 MB` macOS `.pkg` installer) with a GPU-accelerated `iced` 0.13 UI, a persistent click-through left-center HUD overlay (`overlay_platform.rs`), and working-set trimming when minimized to the system tray (~`3.5–6 MB` RAM during matches on Windows).
@@ -65,7 +65,7 @@
 ```mermaid
 xychart-beta
     title "RAM Footprint During Active Call + 1080p60 Stream (MB - Lower is Better)"
-    x-axis ["Squad-Air (Rust)", "Mumble", "TeamSpeak 6", "Discord Phoenix", "Discord (Electron)"]
+    x-axis ["SquadAir (Rust)", "Mumble", "TeamSpeak 6", "Discord Phoenix", "Discord (Electron)"]
     y-axis "Memory (MB)" 0 --> 800
     bar [48, 65, 190, 290, 680]
 ```
@@ -74,23 +74,23 @@ xychart-beta
 
 ```text
 RAM Usage (Minimized to Tray - In Match):
-  Squad-Air   [█░░░░░░░░░░░░░░░░░░░]  ~3.5 MB (Working-set trimmed on Windows)
+  SquadAir    [█░░░░░░░░░░░░░░░░░░░]  ~3.5 MB (Working-set trimmed on Windows)
 
 RAM Usage (Active Squad Call + 1080p60 Screen Share):
-  Squad-Air   [██░░░░░░░░░░░░░░░░░░]  ~48 MB
+  SquadAir    [██░░░░░░░░░░░░░░░░░░]  ~48 MB
   TeamSpeak 6 [██████░░░░░░░░░░░░░░] ~190 MB
   Discord     [████████████████████] ~680+ MB
 
 CPU Overhead in CS2 (1080p60 Share + Voice):
-  Squad-Air   [█░░░░░░░░░░░░░░░░░░░]  < 1.5% (DXGI / VideoToolbox + 4-Lane Codec + wgpu Shader)
+  SquadAir    [█░░░░░░░░░░░░░░░░░░░]  < 1.5% (DXGI / VideoToolbox + 4-Lane Codec + wgpu Shader)
   Discord     [███████░░░░░░░░░░░░░]  6-12%  (Chromium + WebRTC + Electron UI)
 
 Voice Frame & Transport Latency:
-  Squad-Air   [██░░░░░░░░░░░░░░░░░░]  10 ms Opus Frame + Direct P2P UDP
+  SquadAir    [██░░░░░░░░░░░░░░░░░░]  10 ms Opus Frame + Direct P2P UDP
   Cloud VoIP  [████████░░░░░░░░░░░░]  20-60 ms + Centralized Server Hop
 
 Client Binary / Installer Footprint:
-  Squad-Air   [█░░░░░░░░░░░░░░░░░░░]  12 MB (.pkg) / 26-35 MB (Native Binary)
+  SquadAir    [█░░░░░░░░░░░░░░░░░░░]  12 MB (.pkg) / 26-35 MB (Native Binary)
   Discord     [████████████████████]  ~350+ MB
 ```
 
