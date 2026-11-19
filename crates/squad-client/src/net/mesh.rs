@@ -3763,11 +3763,36 @@ fn update_rtt(rtt_slot: &mut u32, echo_timestamp_us: u64) {
 }
 
 fn resolve_host(host_port: &str) -> Result<SocketAddr, String> {
-    host_port
+    let trimmed = host_port.trim();
+    let target = if trimmed.is_empty() {
+        crate::config::DEFAULT_RENDEZVOUS_SERVER
+    } else {
+        trimmed
+    };
+    let has_port = if target.starts_with('[') {
+        target.contains("]:")
+    } else {
+        target.contains(':')
+    };
+    let resolved_str: std::borrow::Cow<'_, str> = if has_port {
+        std::borrow::Cow::Borrowed(target)
+    } else {
+        std::borrow::Cow::Owned(format!("{target}:3478"))
+    };
+
+    let addrs = resolved_str
         .to_socket_addrs()
-        .map_err(|e| format!("Failed to resolve '{host_port}': {e}"))?
-        .next()
-        .ok_or_else(|| format!("No IP addresses found for '{host_port}'"))
+        .map_err(|e| format!("Failed to resolve '{resolved_str}': {e}"))?;
+    let mut first_v6 = None;
+    for addr in addrs {
+        if addr.is_ipv4() {
+            return Ok(addr);
+        }
+        if first_v6.is_none() {
+            first_v6 = Some(addr);
+        }
+    }
+    first_v6.ok_or_else(|| format!("No IP addresses found for '{resolved_str}'"))
 }
 
 fn stop_capture_worker(handle: &mut Option<CaptureWorkerHandle>) {
@@ -6318,5 +6343,19 @@ mod tests {
         aud_b.shutdown();
         aud_c.shutdown();
         aud_d.shutdown();
+    }
+
+    #[test]
+    fn test_resolve_host_default_port_and_explicit_port() {
+        let bare_ip = resolve_host("127.0.0.1").expect("bare IP resolves");
+        assert_eq!(bare_ip, "127.0.0.1:3478".parse().unwrap());
+
+        let explicit = resolve_host("127.0.0.1:4567").expect("explicit port resolves");
+        assert_eq!(explicit, "127.0.0.1:4567".parse().unwrap());
+
+        let empty = resolve_host("   ");
+        if let Ok(addr) = empty {
+            assert_eq!(addr.port(), 3478);
+        }
     }
 }

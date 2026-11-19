@@ -1,0 +1,41 @@
+name: Deploy Rendezvous Server
+
+on:
+  push:
+    branches:
+      - dev
+    paths:
+      - 'crates/squad-rendezvous/**'
+      - 'crates/squad-proto/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/deploy-rendezvous.yml'
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install musl tools & Rust target
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build static squad-rendezvous
+        run: cargo build --release --target x86_64-unknown-linux-musl --bin squad-rendezvous
+
+      - name: Deploy binary to VPS
+        env:
+          SSH_KEY: ${{ secrets.VPS_SSH_KEY }}
+          VPS_HOST: ${{ secrets.VPS_HOST }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "$VPS_HOST" >> ~/.ssh/known_hosts
+
+          scp target/x86_64-unknown-linux-musl/release/squad-rendezvous deploy@$VPS_HOST:/opt/squad-air/squad-rendezvous.new
+          ssh deploy@$VPS_HOST "chmod 755 /opt/squad-air/squad-rendezvous.new && mv /opt/squad-air/squad-rendezvous.new /opt/squad-air/squad-rendezvous && sudo systemctl restart squad-rendezvous"

@@ -1,3 +1,7 @@
+use crate::config::{
+    matching_rendezvous_preset, CUSTOM_RENDEZVOUS_OPTION, DEFAULT_RENDEZVOUS_SERVER,
+    RENDEZVOUS_SERVER_PRESETS,
+};
 use crate::hotkeys::{is_macos_accessibility_trusted, is_macos_input_monitoring_trusted};
 use crate::ui::{
     components::{avatar_circle, mic_sensitivity_meter},
@@ -41,6 +45,49 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
         false,
     );
 
+    let mut server_options: Vec<String> = RENDEZVOUS_SERVER_PRESETS
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    server_options.push(CUSTOM_RENDEZVOUS_OPTION.to_string());
+    let selected_server = if app.rendezvous_custom_mode {
+        Some(CUSTOM_RENDEZVOUS_OPTION.to_string())
+    } else {
+        Some(
+            matching_rendezvous_preset(&app.config.rendezvous_server)
+                .unwrap_or(DEFAULT_RENDEZVOUS_SERVER)
+                .to_string(),
+        )
+    };
+
+    let mut voice_server_col = column![
+        text("Voice Server").size(12).color(M3_ON_SURFACE_VARIANT),
+        pick_list(
+            server_options,
+            selected_server,
+            Message::RendezvousPresetSelected
+        )
+        .width(Length::Fill)
+        .padding(10)
+        .style(m3_pick_list_style)
+        .menu_style(m3_menu_style),
+    ]
+    .width(Length::FillPortion(1))
+    .spacing(6);
+
+    if app.rendezvous_custom_mode {
+        voice_server_col = voice_server_col.push(
+            text_input(
+                "Custom server (host or host:port)",
+                &app.config.custom_rendezvous_server,
+            )
+            .on_input(Message::RendezvousServerChanged)
+            .padding(10)
+            .size(14)
+            .style(m3_text_input_style),
+        );
+    }
+
     let profile_section = container(
         column![
             text("Profile").size(16),
@@ -81,16 +128,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
                 ]
                 .width(Length::FillPortion(1))
                 .spacing(6),
-                column![
-                    text("Voice Server").size(12).color(M3_ON_SURFACE_VARIANT),
-                    text_input("host:port", &app.config.rendezvous_server)
-                        .on_input(Message::RendezvousServerChanged)
-                        .padding(10)
-                        .size(14)
-                        .style(m3_text_input_style),
-                ]
-                .width(Length::FillPortion(1))
-                .spacing(6),
+                voice_server_col,
             ]
             .spacing(16),
         ]

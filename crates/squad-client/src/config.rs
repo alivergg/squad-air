@@ -9,6 +9,18 @@ use std::io::Write;
 use std::path::PathBuf;
 use uuid::Uuid;
 
+pub const DEFAULT_RENDEZVOUS_SERVER: &str = "rv.squadair.app";
+pub const RENDEZVOUS_SERVER_PRESETS: &[&str] = &[DEFAULT_RENDEZVOUS_SERVER];
+pub const CUSTOM_RENDEZVOUS_OPTION: &str = "Custom";
+
+pub fn matching_rendezvous_preset(raw: &str) -> Option<&'static str> {
+    let trimmed = raw.trim();
+    let host_only = trimmed.strip_suffix(":3478").unwrap_or(trimmed);
+    RENDEZVOUS_SERVER_PRESETS.iter().copied().find(|&preset| {
+        preset.eq_ignore_ascii_case(trimmed) || preset.eq_ignore_ascii_case(host_only)
+    })
+}
+
 const ADJECTIVES: &[&str] = &[
     "Swift", "Silent", "Frost", "Shadow", "Cobalt", "Apex", "Nova", "Iron", "Rapid", "Solar",
 ];
@@ -28,6 +40,8 @@ pub struct AppConfig {
     pub nickname: String,
     pub client_uuid: ClientUuid,
     pub rendezvous_server: String,
+    #[serde(default)]
+    pub custom_rendezvous_server: String,
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub aec_enabled: bool,
@@ -74,7 +88,8 @@ impl Default for AppConfig {
         Self {
             nickname: generate_default_nickname(),
             client_uuid: *Uuid::new_v4().as_bytes(),
-            rendezvous_server: "127.0.0.1:3478".to_string(),
+            rendezvous_server: DEFAULT_RENDEZVOUS_SERVER.to_string(),
+            custom_rendezvous_server: String::new(),
             input_device: None,
             output_device: None,
             aec_enabled: false,
@@ -120,10 +135,29 @@ impl AppConfig {
         if path.exists() {
             if let Ok(contents) = fs::read_to_string(&path) {
                 if let Ok(mut cfg) = toml::from_str::<Self>(&contents) {
+                    let mut needs_save = false;
                     if decode_identity_secret(&cfg.identity_secret_b58).is_none() {
                         cfg.identity_secret_b58 = generate_identity_secret_b58();
-                        let _ = cfg.save();
+                        needs_save = true;
                     } else if !contents.contains("identity_secret_b58") {
+                        needs_save = true;
+                    }
+
+                    let trimmed_srv = cfg.rendezvous_server.trim().to_string();
+                    if trimmed_srv.is_empty()
+                        || (trimmed_srv == "127.0.0.1:3478"
+                            && !contents.contains("custom_rendezvous_server"))
+                    {
+                        cfg.rendezvous_server = DEFAULT_RENDEZVOUS_SERVER.to_string();
+                        needs_save = true;
+                    } else if matching_rendezvous_preset(&trimmed_srv).is_none()
+                        && cfg.custom_rendezvous_server.is_empty()
+                    {
+                        cfg.custom_rendezvous_server = trimmed_srv;
+                        needs_save = true;
+                    }
+
+                    if needs_save {
                         let _ = cfg.save();
                     }
                     return cfg;
@@ -320,6 +354,13 @@ mod tests {
     #[test]
     fn app_config_overlay_defaults_and_serde_roundtrip() {
         let mut cfg = AppConfig::default();
+        assert_eq!(cfg.rendezvous_server, DEFAULT_RENDEZVOUS_SERVER);
+        assert_eq!(cfg.custom_rendezvous_server, "");
+        assert_eq!(
+            matching_rendezvous_preset("rv.squadair.app:3478"),
+            Some(DEFAULT_RENDEZVOUS_SERVER)
+        );
+        assert_eq!(matching_rendezvous_preset("custom.example.com:3478"), None);
         assert!((cfg.cue_volume - 1.0).abs() < 1e-4);
         assert!(cfg.overlay_enabled);
         assert!(!cfg.overlay_speaking_only);

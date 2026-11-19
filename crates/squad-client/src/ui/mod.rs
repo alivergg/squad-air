@@ -12,7 +12,9 @@ pub mod stream_view;
 pub mod theme;
 pub mod video_shader;
 
-use crate::config::AppConfig;
+use crate::config::{
+    matching_rendezvous_preset, AppConfig, CUSTOM_RENDEZVOUS_OPTION, DEFAULT_RENDEZVOUS_SERVER,
+};
 use crate::crypto_identity::{
     format_friend_code, load_friends, parse_friend_code, save_friends, FriendContact,
 };
@@ -123,6 +125,7 @@ pub enum Message {
     TestCueSound,
     VadThresholdChanged(f32),
     NicknameChanged(String),
+    RendezvousPresetSelected(String),
     RendezvousServerChanged(String),
     StartRecordingHotkey(HotkeySlot),
     CancelRecordingHotkey,
@@ -405,6 +408,7 @@ pub struct SquadApp {
     pub short_code_joining: bool,
     pub active_short_code: Option<(u32, std::time::Instant)>,
     pub short_code_copied_flash: bool,
+    pub rendezvous_custom_mode: bool,
     ui_sync: Arc<UiSyncState>,
 }
 
@@ -486,6 +490,9 @@ impl SquadApp {
 
         let (main_window_id, open_main_task) = iced::window::open(main_window_settings());
 
+        let rendezvous_custom_mode =
+            matching_rendezvous_preset(&config_mut.rendezvous_server).is_none();
+
         let app = Self {
             config: config_mut,
             screen: Screen::Lobby,
@@ -563,6 +570,7 @@ impl SquadApp {
             short_code_joining: false,
             active_short_code: None,
             short_code_copied_flash: false,
+            rendezvous_custom_mode,
             ui_sync,
         };
         app.sync_presence_to_mesh();
@@ -1246,8 +1254,32 @@ impl SquadApp {
                 self.config.nickname = nick;
                 Task::none()
             }
+            Message::RendezvousPresetSelected(choice) => {
+                if choice == CUSTOM_RENDEZVOUS_OPTION {
+                    self.rendezvous_custom_mode = true;
+                    let custom_trimmed = self.config.custom_rendezvous_server.trim();
+                    if !custom_trimmed.is_empty() {
+                        self.config.rendezvous_server = custom_trimmed.to_string();
+                        let _ = self.config.save();
+                        self.sync_presence_to_mesh();
+                    }
+                } else {
+                    self.rendezvous_custom_mode = false;
+                    self.config.rendezvous_server = choice;
+                    let _ = self.config.save();
+                    self.sync_presence_to_mesh();
+                }
+                Task::none()
+            }
             Message::RendezvousServerChanged(srv) => {
-                self.config.rendezvous_server = srv;
+                self.rendezvous_custom_mode = true;
+                self.config.custom_rendezvous_server = srv.clone();
+                let trimmed = srv.trim();
+                self.config.rendezvous_server = if trimmed.is_empty() {
+                    DEFAULT_RENDEZVOUS_SERVER.to_string()
+                } else {
+                    trimmed.to_string()
+                };
                 Task::none()
             }
             Message::StartRecordingHotkey(slot) => {
