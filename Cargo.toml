@@ -44,6 +44,8 @@ tray-icon = "0.19"
 arboard = "3.4"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 rfd = "0.15"
+x25519-dalek = { version = "2.0", features = ["static_secrets", "getrandom"] }
+spake2 = "0.4"
 
 [profile.release]
 opt-level = 3

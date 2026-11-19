@@ -1,4 +1,8 @@
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
+pub use crate::signaling::{
+    FriendPresenceInfo, PeerRecord, SignalingErrorCode, SignalingPacket,
+    MAX_FRIENDS_STATUS_PER_PACKET, MAX_FRIEND_INVITE_CIPHERTEXT, MAX_QUERY_FRIENDS_PER_PACKET,
+    MAX_SPAKE2_MSG_LEN, SHORT_CODE_MAX,
+};
 use thiserror::Error;
 
 pub const MAGIC: [u8; 2] = [0x53, 0x51]; // "SQ"
@@ -26,6 +30,9 @@ pub const OPCODE_LAN_ANNOUNCE: u8 = 0x06;
 pub const OPCODE_LAN_GOODBYE: u8 = 0x07;
 pub const OPCODE_PEER_RELAY: u8 = 0x08;
 pub const MAX_LAN_ROOM_NAME_LEN: usize = 48;
+pub const OPCODE_SPAKE2_HOST_REPLY: u8 = 0x60;
+pub const OPCODE_SPAKE2_JOINER_RETRY: u8 = 0x61;
+pub const MAX_SPAKE2_ENCRYPTED_INVITE: usize = 128;
 
 pub type RoomId = [u8; 16];
 pub type ClientUuid = [u8; 16];
@@ -49,132 +56,69 @@ pub enum ProtoError {
     InvalidInvite(String),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(u8)]
-pub enum SignalingErrorCode {
-    RoomFull = 1,
-    RateLimited = 2,
-    InvalidPacket = 3,
-}
-
-impl SignalingErrorCode {
-    pub fn from_u8(val: u8) -> Result<Self, ProtoError> {
-        match val {
-            1 => Ok(Self::RoomFull),
-            2 => Ok(Self::RateLimited),
-            3 => Ok(Self::InvalidPacket),
-            other => Err(ProtoError::UnknownOpcode(other)),
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PeerRecord {
-    pub peer_id: PeerId,
-    pub client_uuid: ClientUuid,
-    pub public_addr: SocketAddr,
-    pub lan_addrs: Vec<SocketAddrV4>,
-    pub nickname: String,
+pub enum Spake2Packet {
+    /// `0x60` Host -> Joiner (unencrypted P2P SPAKE2 reply carrying AEAD-sealed invite)
+    HostReply {
+        code: u32,
+        spake2_msg_b: Vec<u8>,
+        nonce: [u8; 12],
+        encrypted_invite: Vec<u8>,
+    },
+    /// `0x61` Joiner -> Host (retry packet during hole punching)
+    JoinerRetry { code: u32, spake2_msg_a: Vec<u8> },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum SignalingPacket {
-    /// `0x01` Client -> Rendezvous
-    C2sRegister {
-        room_id: RoomId,
-        client_uuid: ClientUuid,
-        nickname: String,
-        lan_addrs: Vec<SocketAddrV4>,
-    },
-    /// `0x02` Rendezvous -> Client
-    S2cRoomState {
-        assigned_peer_id: PeerId,
-        peers: Vec<PeerRecord>,
-    },
-    /// `0x03` Client -> Rendezvous
-    C2sLeave {
-        room_id: RoomId,
-        client_uuid: ClientUuid,
-    },
-    /// `0x04` Rendezvous -> Client
-    S2cError { code: SignalingErrorCode },
+#[inline]
+pub fn is_spake2_datagram(datagram: &[u8]) -> bool {
+    datagram.len() >= 4
+        && datagram[0..2] == MAGIC
+        && datagram[2] == PROTO_VERSION
+        && matches!(
+            datagram[3],
+            OPCODE_SPAKE2_HOST_REPLY | OPCODE_SPAKE2_JOINER_RETRY
+        )
 }
 
-impl SignalingPacket {
+impl Spake2Packet {
     pub fn encode(&self) -> Result<Vec<u8>, ProtoError> {
-        let mut buf = Vec::with_capacity(256);
+        let mut buf = Vec::with_capacity(128);
         buf.extend_from_slice(&MAGIC);
         buf.push(PROTO_VERSION);
 
         match self {
-            SignalingPacket::C2sRegister {
-                room_id,
-                client_uuid,
-                nickname,
-                lan_addrs,
+            Spake2Packet::HostReply {
+                code,
+                spake2_msg_b,
+                nonce,
+                encrypted_invite,
             } => {
-                buf.push(0x01);
-                buf.extend_from_slice(room_id);
-                buf.extend_from_slice(client_uuid);
-
-                let nick_bytes = truncate_utf8(nickname, MAX_NICKNAME_LEN);
-                buf.push(nick_bytes.len() as u8);
-                buf.extend_from_slice(nick_bytes);
-
-                let count = lan_addrs.len().min(MAX_LAN_ADDRS);
-                buf.push(count as u8);
-                for addr in lan_addrs.iter().take(count) {
-                    buf.extend_from_slice(&addr.ip().octets());
-                    buf.extend_from_slice(&addr.port().to_be_bytes());
+                if *code > SHORT_CODE_MAX
+                    || spake2_msg_b.is_empty()
+                    || spake2_msg_b.len() > MAX_SPAKE2_MSG_LEN
+                    || encrypted_invite.len() > MAX_SPAKE2_ENCRYPTED_INVITE
+                {
+                    return Err(ProtoError::InvalidHeader);
                 }
+                buf.push(OPCODE_SPAKE2_HOST_REPLY);
+                buf.extend_from_slice(&code.to_be_bytes());
+                buf.push(spake2_msg_b.len() as u8);
+                buf.extend_from_slice(spake2_msg_b);
+                buf.extend_from_slice(nonce);
+                buf.extend_from_slice(&(encrypted_invite.len() as u16).to_be_bytes());
+                buf.extend_from_slice(encrypted_invite);
             }
-            SignalingPacket::S2cRoomState {
-                assigned_peer_id,
-                peers,
-            } => {
-                buf.push(0x02);
-                buf.extend_from_slice(&assigned_peer_id.to_be_bytes());
-                let peer_count = peers.len().min(MAX_ROOM_PEERS);
-                buf.push(peer_count as u8);
-
-                for peer in peers.iter().take(peer_count) {
-                    buf.extend_from_slice(&peer.peer_id.to_be_bytes());
-                    buf.extend_from_slice(&peer.client_uuid);
-                    match peer.public_addr.ip() {
-                        IpAddr::V4(ip4) => {
-                            buf.push(4);
-                            buf.extend_from_slice(&ip4.octets());
-                        }
-                        IpAddr::V6(ip6) => {
-                            buf.push(6);
-                            buf.extend_from_slice(&ip6.octets());
-                        }
-                    }
-                    buf.extend_from_slice(&peer.public_addr.port().to_be_bytes());
-
-                    let lan_count = peer.lan_addrs.len().min(MAX_LAN_ADDRS);
-                    buf.push(lan_count as u8);
-                    for lan in peer.lan_addrs.iter().take(lan_count) {
-                        buf.extend_from_slice(&lan.ip().octets());
-                        buf.extend_from_slice(&lan.port().to_be_bytes());
-                    }
-
-                    let nick_bytes = truncate_utf8(&peer.nickname, MAX_NICKNAME_LEN);
-                    buf.push(nick_bytes.len() as u8);
-                    buf.extend_from_slice(nick_bytes);
+            Spake2Packet::JoinerRetry { code, spake2_msg_a } => {
+                if *code > SHORT_CODE_MAX
+                    || spake2_msg_a.is_empty()
+                    || spake2_msg_a.len() > MAX_SPAKE2_MSG_LEN
+                {
+                    return Err(ProtoError::InvalidHeader);
                 }
-            }
-            SignalingPacket::C2sLeave {
-                room_id,
-                client_uuid,
-            } => {
-                buf.push(0x03);
-                buf.extend_from_slice(room_id);
-                buf.extend_from_slice(client_uuid);
-            }
-            SignalingPacket::S2cError { code } => {
-                buf.push(0x04);
-                buf.push(*code as u8);
+                buf.push(OPCODE_SPAKE2_JOINER_RETRY);
+                buf.extend_from_slice(&code.to_be_bytes());
+                buf.push(spake2_msg_a.len() as u8);
+                buf.extend_from_slice(spake2_msg_a);
             }
         }
 
@@ -202,161 +146,55 @@ impl SignalingPacket {
         let mut cursor = 4usize;
 
         match opcode {
-            0x01 => {
-                need_bytes(data, cursor, 33)?;
-                let mut room_id = [0u8; 16];
-                room_id.copy_from_slice(&data[cursor..cursor + 16]);
-                cursor += 16;
-
-                let mut client_uuid = [0u8; 16];
-                client_uuid.copy_from_slice(&data[cursor..cursor + 16]);
-                cursor += 16;
-
-                let nick_len = data[cursor] as usize;
-                cursor += 1;
-                if nick_len > MAX_NICKNAME_LEN {
+            OPCODE_SPAKE2_HOST_REPLY => {
+                need_bytes(data, cursor, 5)?;
+                let code = u32::from_be_bytes([
+                    data[cursor],
+                    data[cursor + 1],
+                    data[cursor + 2],
+                    data[cursor + 3],
+                ]);
+                let msg_len = data[cursor + 4] as usize;
+                cursor += 5;
+                if code > SHORT_CODE_MAX || msg_len == 0 || msg_len > MAX_SPAKE2_MSG_LEN {
                     return Err(ProtoError::InvalidHeader);
                 }
-                need_bytes(data, cursor, nick_len + 1)?;
-                let nickname_raw = std::str::from_utf8(&data[cursor..cursor + nick_len])
-                    .map_err(|_| ProtoError::InvalidUtf8)?;
-                let nickname = sanitize_display_str(nickname_raw, MAX_NICKNAME_LEN);
-                cursor += nick_len;
-
-                let lan_count = data[cursor] as usize;
-                cursor += 1;
-                if lan_count > MAX_LAN_ADDRS {
+                need_bytes(data, cursor, msg_len + 14)?;
+                let spake2_msg_b = data[cursor..cursor + msg_len].to_vec();
+                cursor += msg_len;
+                let mut nonce = [0u8; 12];
+                nonce.copy_from_slice(&data[cursor..cursor + 12]);
+                let enc_len = u16::from_be_bytes([data[cursor + 12], data[cursor + 13]]) as usize;
+                cursor += 14;
+                if enc_len > MAX_SPAKE2_ENCRYPTED_INVITE {
+                    return Err(ProtoError::PacketTooLarge(enc_len));
+                }
+                need_bytes(data, cursor, enc_len)?;
+                Ok(Spake2Packet::HostReply {
+                    code,
+                    spake2_msg_b,
+                    nonce,
+                    encrypted_invite: data[cursor..cursor + enc_len].to_vec(),
+                })
+            }
+            OPCODE_SPAKE2_JOINER_RETRY => {
+                need_bytes(data, cursor, 5)?;
+                let code = u32::from_be_bytes([
+                    data[cursor],
+                    data[cursor + 1],
+                    data[cursor + 2],
+                    data[cursor + 3],
+                ]);
+                let msg_len = data[cursor + 4] as usize;
+                cursor += 5;
+                if code > SHORT_CODE_MAX || msg_len == 0 || msg_len > MAX_SPAKE2_MSG_LEN {
                     return Err(ProtoError::InvalidHeader);
                 }
-                need_bytes(data, cursor, lan_count * 6)?;
-                let mut lan_addrs = Vec::with_capacity(lan_count);
-                for _ in 0..lan_count {
-                    let ip = Ipv4Addr::new(
-                        data[cursor],
-                        data[cursor + 1],
-                        data[cursor + 2],
-                        data[cursor + 3],
-                    );
-                    let port = u16::from_be_bytes([data[cursor + 4], data[cursor + 5]]);
-                    lan_addrs.push(SocketAddrV4::new(ip, port));
-                    cursor += 6;
-                }
-
-                Ok(SignalingPacket::C2sRegister {
-                    room_id,
-                    client_uuid,
-                    nickname,
-                    lan_addrs,
+                need_bytes(data, cursor, msg_len)?;
+                Ok(Spake2Packet::JoinerRetry {
+                    code,
+                    spake2_msg_a: data[cursor..cursor + msg_len].to_vec(),
                 })
-            }
-            0x02 => {
-                need_bytes(data, cursor, 3)?;
-                let assigned_peer_id = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-                let peer_count = data[cursor + 2] as usize;
-                cursor += 3;
-
-                if peer_count > MAX_ROOM_PEERS {
-                    return Err(ProtoError::InvalidHeader);
-                }
-
-                let mut peers = Vec::with_capacity(peer_count);
-                for _ in 0..peer_count {
-                    need_bytes(data, cursor, 19)?;
-                    let peer_id = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-                    cursor += 2;
-
-                    let mut client_uuid = [0u8; 16];
-                    client_uuid.copy_from_slice(&data[cursor..cursor + 16]);
-                    cursor += 16;
-
-                    let family = data[cursor];
-                    cursor += 1;
-
-                    let ip = match family {
-                        4 => {
-                            need_bytes(data, cursor, 4)?;
-                            let ip4 = Ipv4Addr::new(
-                                data[cursor],
-                                data[cursor + 1],
-                                data[cursor + 2],
-                                data[cursor + 3],
-                            );
-                            cursor += 4;
-                            IpAddr::V4(ip4)
-                        }
-                        6 => {
-                            need_bytes(data, cursor, 16)?;
-                            let mut octets = [0u8; 16];
-                            octets.copy_from_slice(&data[cursor..cursor + 16]);
-                            cursor += 16;
-                            IpAddr::V6(Ipv6Addr::from(octets))
-                        }
-                        _ => return Err(ProtoError::InvalidHeader),
-                    };
-
-                    need_bytes(data, cursor, 3)?;
-                    let port = u16::from_be_bytes([data[cursor], data[cursor + 1]]);
-                    let public_addr = SocketAddr::new(ip, port);
-                    let lan_count = data[cursor + 2] as usize;
-                    cursor += 3;
-
-                    if lan_count > MAX_LAN_ADDRS {
-                        return Err(ProtoError::InvalidHeader);
-                    }
-                    need_bytes(data, cursor, lan_count * 6 + 1)?;
-                    let mut lan_addrs = Vec::with_capacity(lan_count);
-                    for _ in 0..lan_count {
-                        let lip = Ipv4Addr::new(
-                            data[cursor],
-                            data[cursor + 1],
-                            data[cursor + 2],
-                            data[cursor + 3],
-                        );
-                        let lport = u16::from_be_bytes([data[cursor + 4], data[cursor + 5]]);
-                        lan_addrs.push(SocketAddrV4::new(lip, lport));
-                        cursor += 6;
-                    }
-
-                    let nick_len = data[cursor] as usize;
-                    cursor += 1;
-                    if nick_len > MAX_NICKNAME_LEN {
-                        return Err(ProtoError::InvalidHeader);
-                    }
-                    need_bytes(data, cursor, nick_len)?;
-                    let nickname_raw = std::str::from_utf8(&data[cursor..cursor + nick_len])
-                        .map_err(|_| ProtoError::InvalidUtf8)?;
-                    let nickname = sanitize_display_str(nickname_raw, MAX_NICKNAME_LEN);
-                    cursor += nick_len;
-
-                    peers.push(PeerRecord {
-                        peer_id,
-                        client_uuid,
-                        public_addr,
-                        lan_addrs,
-                        nickname,
-                    });
-                }
-
-                Ok(SignalingPacket::S2cRoomState {
-                    assigned_peer_id,
-                    peers,
-                })
-            }
-            0x03 => {
-                need_bytes(data, cursor, 32)?;
-                let mut room_id = [0u8; 16];
-                room_id.copy_from_slice(&data[cursor..cursor + 16]);
-                let mut client_uuid = [0u8; 16];
-                client_uuid.copy_from_slice(&data[cursor + 16..cursor + 32]);
-                Ok(SignalingPacket::C2sLeave {
-                    room_id,
-                    client_uuid,
-                })
-            }
-            0x04 => {
-                need_bytes(data, cursor, 1)?;
-                let code = SignalingErrorCode::from_u8(data[cursor])?;
-                Ok(SignalingPacket::S2cError { code })
             }
             other => Err(ProtoError::UnknownOpcode(other)),
         }
@@ -1371,7 +1209,7 @@ impl P2pPayload {
 }
 
 #[inline]
-fn need_bytes(buf: &[u8], offset: usize, count: usize) -> Result<(), ProtoError> {
+pub(crate) fn need_bytes(buf: &[u8], offset: usize, count: usize) -> Result<(), ProtoError> {
     let end = offset.checked_add(count).ok_or(ProtoError::InvalidHeader)?;
     if buf.len() < end {
         Err(ProtoError::PacketTooShort {
@@ -1418,7 +1256,7 @@ pub fn sanitize_display_str(raw: &str, max_bytes: usize) -> String {
     trimmed[..end].to_string()
 }
 
-fn truncate_utf8(s: &str, max_bytes: usize) -> &[u8] {
+pub(crate) fn truncate_utf8(s: &str, max_bytes: usize) -> &[u8] {
     if s.len() <= max_bytes {
         return s.as_bytes();
     }
@@ -1432,6 +1270,7 @@ fn truncate_utf8(s: &str, max_bytes: usize) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
 
     #[test]
     fn test_signaling_packets_roundtrip() {
@@ -1905,5 +1744,35 @@ mod tests {
         let dbg = format!("{announce:?}");
         assert!(dbg.contains("[REDACTED]"));
         assert!(!dbg.contains("171"));
+    }
+
+    #[test]
+    fn test_spake2_p2p_packets_roundtrip() {
+        let reply = Spake2Packet::HostReply {
+            code: 482_910,
+            spake2_msg_b: vec![0x22; 33],
+            nonce: [0x11; 12],
+            encrypted_invite: vec![0x33; 64],
+        };
+        let encoded = reply.encode().unwrap();
+        assert!(is_spake2_datagram(&encoded));
+        assert!(!is_relay_datagram(&encoded));
+        assert!(!is_peer_relay_datagram(&encoded));
+        assert_eq!(Spake2Packet::decode(&encoded).unwrap(), reply);
+
+        let retry = Spake2Packet::JoinerRetry {
+            code: 482_910,
+            spake2_msg_a: vec![0x44; 33],
+        };
+        let retry_bytes = retry.encode().unwrap();
+        assert!(is_spake2_datagram(&retry_bytes));
+        assert_eq!(Spake2Packet::decode(&retry_bytes).unwrap(), retry);
+
+        assert!(Spake2Packet::JoinerRetry {
+            code: 1_000_000,
+            spake2_msg_a: vec![0x44; 33],
+        }
+        .encode()
+        .is_err());
     }
 }
