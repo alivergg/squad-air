@@ -391,6 +391,10 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
         .padding([9, 14])
         .style(pill_danger_button)
         .on_press(Message::StopScreenShare)
+    } else if app.has_relayed_peer() {
+        button(text("Disabled on Relay — Voice & Chat only").size(11))
+            .padding([9, 14])
+            .style(pill_tonal_button)
     } else {
         button(text("Share Screen").size(12))
             .padding([9, 14])

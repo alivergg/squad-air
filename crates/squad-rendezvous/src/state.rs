@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 
 const MAX_PACKETS_PER_SEC_PER_IP: f64 = 30.0;
 const BUCKET_BURST: f64 = 45.0;
-const RELAY_PACKETS_PER_SEC_PER_IP: f64 = 2500.0;
-const RELAY_BUCKET_BURST: f64 = 500.0;
+const RELAY_PACKETS_PER_SEC_PER_PEER: f64 = 150.0;
+const RELAY_BUCKET_BURST: f64 = 150.0;
 const STALE_BUCKET_TTL: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_ROOMS: usize = 4096;
 const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
@@ -102,17 +102,17 @@ struct TokenBucket {
     last_refill: Instant,
 }
 
-fn consume_token(
-    buckets: &DashMap<IpAddr, TokenBucket>,
-    ip: IpAddr,
+fn consume_token<K: Eq + std::hash::Hash>(
+    buckets: &DashMap<K, TokenBucket>,
+    key: K,
     now: Instant,
     rate_per_sec: f64,
     burst: f64,
 ) -> bool {
-    if !buckets.contains_key(&ip) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
+    if !buckets.contains_key(&key) && buckets.len() >= MAX_RATE_LIMIT_BUCKETS {
         return false;
     }
-    let mut entry = buckets.entry(ip).or_insert(TokenBucket {
+    let mut entry = buckets.entry(key).or_insert(TokenBucket {
         tokens: burst,
         last_refill: now,
     });
@@ -136,7 +136,7 @@ pub struct RendezvousState {
     short_codes: DashMap<u32, ShortCodeEntry>,
     short_code_failures: DashMap<IpAddr, ShortCodeRateState>,
     rate_limits: DashMap<IpAddr, TokenBucket>,
-    relay_rate_limits: DashMap<IpAddr, TokenBucket>,
+    relay_rate_limits: DashMap<SocketAddr, TokenBucket>,
 }
 
 impl Default for RendezvousState {
@@ -167,12 +167,12 @@ impl RendezvousState {
         )
     }
 
-    pub fn check_relay_rate_limit(&self, ip: IpAddr, now: Instant) -> bool {
+    pub fn check_relay_rate_limit(&self, addr: SocketAddr, now: Instant) -> bool {
         consume_token(
             &self.relay_rate_limits,
-            ip,
+            addr,
             now,
-            RELAY_PACKETS_PER_SEC_PER_IP,
+            RELAY_PACKETS_PER_SEC_PER_PEER,
             RELAY_BUCKET_BURST,
         )
     }
@@ -202,7 +202,7 @@ impl RendezvousState {
             (sender.peer_id, target.public_addr)
         };
 
-        if !self.check_relay_rate_limit(src_addr.ip(), now) {
+        if !self.check_relay_rate_limit(src_addr, now) {
             return None;
         }
 
@@ -775,7 +775,7 @@ mod tests {
             None
         );
         // Unauthenticated drops must not populate relay_rate_limits.
-        assert!(!state.relay_rate_limits.contains_key(&outsider.ip()));
+        assert!(!state.relay_rate_limits.contains_key(&outsider));
     }
 
     #[test]
@@ -865,12 +865,12 @@ mod tests {
             );
         }
 
-        // Wait 1s for full burst refill and verify burst ceiling (500 packets) at a single instant.
+        // Wait 1s for full burst refill and verify burst ceiling (150 packets) at a single instant.
         let t_burst = t0 + Duration::from_secs(3);
         register_peer(&state, addr_a, room_id, [1u8; 16], "Alice", t_burst);
         register_peer(&state, addr_b, room_id, [2u8; 16], "Bob", t_burst);
 
-        for i in 0..500 {
+        for i in 0..150 {
             assert_eq!(
                 state.authorize_relay_forward(addr_a, room_id, peer_b_id, t_burst, ttl),
                 Some((peer_a_id, addr_b)),
@@ -883,9 +883,9 @@ mod tests {
             "packet exceeding burst ceiling must be dropped"
         );
 
-        // 20ms at 2500 pkt/s refills exactly 50 tokens.
-        let t_refill = t_burst + Duration::from_millis(20);
-        for i in 0..50 {
+        // 100ms at 150 pkt/s refills exactly 15 tokens.
+        let t_refill = t_burst + Duration::from_millis(100);
+        for i in 0..15 {
             assert_eq!(
                 state.authorize_relay_forward(addr_a, room_id, peer_b_id, t_refill, ttl),
                 Some((peer_a_id, addr_b)),
@@ -898,9 +898,9 @@ mod tests {
         );
 
         // Stale relay rate-limit buckets older than 60s are evicted.
-        assert!(state.relay_rate_limits.contains_key(&addr_a.ip()));
+        assert!(state.relay_rate_limits.contains_key(&addr_a));
         let _ = state.evict_expired(t_refill + Duration::from_secs(61), ttl);
-        assert!(!state.relay_rate_limits.contains_key(&addr_a.ip()));
+        assert!(!state.relay_rate_limits.contains_key(&addr_a));
     }
 
     #[test]

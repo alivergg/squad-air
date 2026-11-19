@@ -15,6 +15,7 @@ use tokio::sync::watch;
 use tracing::{debug, info, warn};
 
 pub const DEFAULT_PEER_TTL: Duration = Duration::from_secs(6);
+pub const MAX_SERVER_RELAY_DATAGRAM_BYTES: usize = 320;
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -106,7 +107,7 @@ pub async fn handle_datagram_with_config(
 
     // Handle zero-amplification relay datagrams before signaling rate-limiting/decoding.
     if is_relay_datagram(datagram) {
-        if !config.enable_relay {
+        if !config.enable_relay || datagram.len() > MAX_SERVER_RELAY_DATAGRAM_BYTES {
             return;
         }
         let Ok((room_id, target_peer_id, inner)) = parse_relay_header(datagram) else {
@@ -557,6 +558,16 @@ mod tests {
             ),
             (4u64, P2pPayload::StreamSubscribe { subscribe: true }),
             (5u64, P2pPayload::StreamPli),
+            (
+                6u64,
+                P2pPayload::ChatText {
+                    sender_uuid: [1u8; 16],
+                    sender_nickname: "Alice".into(),
+                    msg_id: 2,
+                    timestamp_ms: 101,
+                    text: "x".repeat(MAX_SERVER_RELAY_DATAGRAM_BYTES),
+                },
+            ),
         ] {
             cipher
                 .seal_packet(

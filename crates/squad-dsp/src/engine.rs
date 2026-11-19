@@ -1358,7 +1358,7 @@ fn run_audio_worker(
                 .mic_level_db_bits
                 .store((-60.0f32).to_bits(), Ordering::Relaxed);
             atomics.local_speaking.store(false, Ordering::Relaxed);
-            if mixer.has_peers() && last_dtx_keepalive.elapsed() >= Duration::from_millis(500) {
+            if mixer.has_peers() && last_dtx_keepalive.elapsed() >= Duration::from_millis(1500) {
                 let current_dtx_seq = dtx_seq_num;
                 dtx_seq_num = dtx_seq_num.wrapping_add(1);
                 let _ = outbound_tx.try_send(OutboundAudioFrame::DtxKeepalive {
@@ -1440,7 +1440,7 @@ fn run_audio_worker(
                         Err(e) => warn!("Opus encode error: {e}"),
                     }
                 } else if mixer.has_peers()
-                    && last_dtx_keepalive.elapsed() >= Duration::from_millis(500)
+                    && last_dtx_keepalive.elapsed() >= Duration::from_millis(1500)
                 {
                     let current_dtx_seq = dtx_seq_num;
                     dtx_seq_num = dtx_seq_num.wrapping_add(1);

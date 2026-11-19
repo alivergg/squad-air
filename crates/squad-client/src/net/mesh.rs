@@ -900,7 +900,11 @@ pub fn spawn_mesh_worker(
                         }
                         MeshCommand::SendInlineImage { filename, bytes } => {
                             if let Some(sess) = session.as_mut() {
-                                if sess.local_peer_id != 0 {
+                                let has_relayed = sess
+                                    .peers
+                                    .values()
+                                    .any(|p| p.status == PeerConnStatus::Relayed);
+                                if sess.local_peer_id != 0 && !has_relayed {
                                     let peers = connected_peer_list(sess);
                                     let mut ctx = TransferCtx {
                                         local_peer_id: sess.local_peer_id,
@@ -922,7 +926,11 @@ pub fn spawn_mesh_worker(
                         }
                         MeshCommand::OfferFile { path } => {
                             if let Some(sess) = session.as_mut() {
-                                if sess.local_peer_id != 0 {
+                                let has_relayed = sess
+                                    .peers
+                                    .values()
+                                    .any(|p| p.status == PeerConnStatus::Relayed);
+                                if sess.local_peer_id != 0 && !has_relayed {
                                     let peers = connected_peer_list(sess);
                                     let mut ctx = TransferCtx {
                                         local_peer_id: sess.local_peer_id,
@@ -2854,7 +2862,8 @@ async fn handle_p2p_rx(
     }
 
     if matches!(relay_source, Some(RelaySource::Server))
-        && !header.msg_type.is_server_relay_allowed()
+        && (!header.msg_type.is_server_relay_allowed()
+            || matches!(header.msg_type, P2pMsgType::StreamAnnounce))
     {
         return;
     }

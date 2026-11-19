@@ -748,13 +748,17 @@ impl P2pMsgType {
     }
 
     /// Returns `true` if this message type is permitted over the central server UDP relay
-    /// (voice, chat, file/avatar transfer, and lightweight signaling/keepalives).
-    /// Heavy screen-share video/stream media is restricted to Direct P2P or Peer-Mesh Relay.
+    /// (voice, chat, lightweight avatar announce, and signaling/keepalives).
+    /// Heavy screen-share video/stream media and file transfers are restricted to Direct P2P or Peer-Mesh Relay.
     #[inline]
     pub const fn is_server_relay_allowed(self) -> bool {
         !matches!(
             self,
-            Self::StreamSubscribe
+            Self::BlobOffer
+                | Self::BlobChunkReq
+                | Self::BlobChunkData
+                | Self::BlobHave
+                | Self::StreamSubscribe
                 | Self::StreamPli
                 | Self::VideoFrameFrag
                 | Self::StreamDecoderError
@@ -1905,6 +1909,10 @@ mod tests {
         assert!(!P2pMsgType::StreamSubscribe.is_server_relay_allowed());
         assert!(!P2pMsgType::StreamPli.is_server_relay_allowed());
         assert!(!P2pMsgType::StreamDecoderError.is_server_relay_allowed());
+        assert!(!P2pMsgType::BlobOffer.is_server_relay_allowed());
+        assert!(!P2pMsgType::BlobChunkReq.is_server_relay_allowed());
+        assert!(!P2pMsgType::BlobChunkData.is_server_relay_allowed());
+        assert!(!P2pMsgType::BlobHave.is_server_relay_allowed());
     }
 
     #[test]

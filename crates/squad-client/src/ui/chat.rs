@@ -59,11 +59,19 @@ pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
     .height(Length::Fill)
     .anchor_bottom();
 
-    let composer = row![
+    let file_btn = if app.has_relayed_peer() {
+        button(text("Disabled on Relay — Voice & Chat only").size(11))
+            .padding([10, 12])
+            .style(pill_tonal_button)
+    } else {
         button(text("+ File").size(12))
             .padding([10, 12])
             .style(pill_tonal_button)
-            .on_press(Message::PickFileToSend),
+            .on_press(Message::PickFileToSend)
+    };
+
+    let composer = row![
+        file_btn,
         text_input("Write a message...", &app.chat_input)
             .on_input(Message::ChatInputChanged)
             .on_submit(Message::SendChatText)

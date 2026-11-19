@@ -413,6 +413,12 @@ pub struct SquadApp {
 }
 
 impl SquadApp {
+    pub(crate) fn has_relayed_peer(&self) -> bool {
+        self.peers
+            .iter()
+            .any(|p| p.status == crate::net::PeerConnStatus::Relayed)
+    }
+
     pub fn new() -> (Self, Task<Message>) {
         let config = AppConfig::load_or_create();
         let friends = load_friends();
@@ -1400,16 +1406,26 @@ impl SquadApp {
                 }
                 Task::none()
             }
-            Message::PickFileToSend => Task::perform(
-                async {
-                    rfd::AsyncFileDialog::new()
-                        .pick_file()
-                        .await
-                        .map(|handle| handle.path().to_path_buf())
-                },
-                Message::FilePicked,
-            ),
+            Message::PickFileToSend => {
+                if self.has_relayed_peer() {
+                    self.status_banner = Some("Disabled on Relay — Voice & Chat only".to_string());
+                    return Task::none();
+                }
+                Task::perform(
+                    async {
+                        rfd::AsyncFileDialog::new()
+                            .pick_file()
+                            .await
+                            .map(|handle| handle.path().to_path_buf())
+                    },
+                    Message::FilePicked,
+                )
+            }
             Message::FilePicked(Some(path)) => {
+                if self.has_relayed_peer() {
+                    self.status_banner = Some("Disabled on Relay — Voice & Chat only".to_string());
+                    return Task::none();
+                }
                 let _ = self.mesh_tx.try_send(MeshCommand::OfferFile { path });
                 Task::none()
             }
@@ -1436,14 +1452,24 @@ impl SquadApp {
                 match payload {
                     ClipboardPayload::InlineImage { filename, bytes } => {
                         if self.screen == Screen::Room {
-                            let _ = self
-                                .mesh_tx
-                                .try_send(MeshCommand::SendInlineImage { filename, bytes });
+                            if self.has_relayed_peer() {
+                                self.status_banner =
+                                    Some("Disabled on Relay — Voice & Chat only".to_string());
+                            } else {
+                                let _ = self
+                                    .mesh_tx
+                                    .try_send(MeshCommand::SendInlineImage { filename, bytes });
+                            }
                         }
                     }
                     ClipboardPayload::TempFile(path) => {
                         if self.screen == Screen::Room {
-                            let _ = self.mesh_tx.try_send(MeshCommand::OfferFile { path });
+                            if self.has_relayed_peer() {
+                                self.status_banner =
+                                    Some("Disabled on Relay — Voice & Chat only".to_string());
+                            } else {
+                                let _ = self.mesh_tx.try_send(MeshCommand::OfferFile { path });
+                            }
                         }
                     }
                     ClipboardPayload::InviteUri(uri) => {
@@ -1587,6 +1613,10 @@ impl SquadApp {
                 Task::none()
             }
             Message::OpenShareModal => {
+                if self.has_relayed_peer() {
+                    self.status_banner = Some("Disabled on Relay — Voice & Chat only".to_string());
+                    return Task::none();
+                }
                 request_screen_capture_permission();
                 self.capture_targets = enumerate_capture_targets();
                 self.select_first_target_for_tab();
@@ -1634,6 +1664,11 @@ impl SquadApp {
                 Task::none()
             }
             Message::StartScreenShare => {
+                if self.has_relayed_peer() {
+                    self.share_modal_open = false;
+                    self.status_banner = Some("Disabled on Relay — Voice & Chat only".to_string());
+                    return Task::none();
+                }
                 if let Some(target) = self
                     .capture_targets
                     .get(self.selected_capture_target_idx)
