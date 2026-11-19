@@ -150,6 +150,50 @@ pub async fn handle_datagram_with_config(
             room_id,
             client_uuid,
         } => state.handle_leave(src_addr, room_id, client_uuid),
+        SignalingPacket::C2sPresencePing {
+            pub_key,
+            nickname,
+            in_room,
+        } => {
+            state.handle_presence_ping(src_addr, pub_key, nickname, in_room, now);
+            Vec::new()
+        }
+        SignalingPacket::C2sQueryFriends { friend_pub_keys } => {
+            state.handle_query_friends(src_addr, friend_pub_keys, now)
+        }
+        SignalingPacket::C2sRelayFriendInvite {
+            sender_pub_key,
+            target_pub_key,
+            ephemeral_pub_key,
+            nonce,
+            ciphertext,
+        } => state.handle_relay_friend_invite(
+            src_addr,
+            sender_pub_key,
+            target_pub_key,
+            ephemeral_pub_key,
+            nonce,
+            ciphertext,
+            now,
+        ),
+        SignalingPacket::C2sRegisterShortCode {
+            room_id,
+            host_pub_key,
+            code,
+        } => state.handle_register_short_code(src_addr, room_id, host_pub_key, code, now),
+        SignalingPacket::C2sResolveShortCode {
+            code,
+            joiner_pub_key,
+            joiner_lan_addrs,
+            spake2_msg_a,
+        } => state.handle_resolve_short_code(
+            src_addr,
+            code,
+            joiner_pub_key,
+            joiner_lan_addrs,
+            spake2_msg_a,
+            now,
+        ),
         _ => Vec::new(),
     };
 
@@ -536,6 +580,149 @@ mod tests {
                 .is_err(),
             "server relay must block screen-share video/stream traffic"
         );
+
+        let _ = shutdown_tx.send(true);
+        let _ = srv_task.await;
+    }
+
+    #[tokio::test]
+    async fn test_udp_presence_invite_relay_and_short_code_flow() {
+        let server_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server_addr = server_sock.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+
+        let srv_task = tokio::spawn(run_server(server_sock, shutdown_rx));
+
+        let host_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let friend_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let joiner_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        let host_pk = [0x11; 32];
+        let friend_pk = [0x22; 32];
+        let joiner_pk = [0x33; 32];
+        let room_id = [0xEF; 16];
+
+        // Host & Friend publish presence
+        for (sock, pk, nick) in [
+            (&host_sock, host_pk, "Host"),
+            (&friend_sock, friend_pk, "Friend"),
+        ] {
+            let ping = SignalingPacket::C2sPresencePing {
+                pub_key: pk,
+                nickname: nick.into(),
+                in_room: false,
+            };
+            sock.send_to(&ping.encode().unwrap(), server_addr)
+                .await
+                .unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+
+        // Host queries Friend and relays an encrypted invite
+        let query = SignalingPacket::C2sQueryFriends {
+            friend_pub_keys: vec![friend_pk],
+        };
+        host_sock
+            .send_to(&query.encode().unwrap(), server_addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 1200];
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        match SignalingPacket::decode(&buf[..len]).unwrap() {
+            SignalingPacket::S2cFriendsStatus { online_friends } => {
+                assert_eq!(online_friends.len(), 1);
+                assert_eq!(online_friends[0].nickname, "Friend");
+            }
+            other => panic!("expected S2cFriendsStatus, got {other:?}"),
+        }
+
+        let relay_inv = SignalingPacket::C2sRelayFriendInvite {
+            sender_pub_key: host_pk,
+            target_pub_key: friend_pk,
+            ephemeral_pub_key: [0xE1; 32],
+            nonce: [0x12; 12],
+            ciphertext: vec![0xAA; 64],
+        };
+        host_sock
+            .send_to(&relay_inv.encode().unwrap(), server_addr)
+            .await
+            .unwrap();
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), friend_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            SignalingPacket::decode(&buf[..len]).unwrap(),
+            SignalingPacket::S2cIncomingFriendInvite { sender_pub_key, .. } if sender_pub_key == host_pk
+        ));
+
+        // Host enters room & registers short code 482910; Joiner resolves it
+        let _ = register_client(&host_sock, server_addr, room_id, [1; 16], "Host").await;
+        host_sock
+            .send_to(
+                &SignalingPacket::C2sRegisterShortCode {
+                    room_id,
+                    host_pub_key: host_pk,
+                    code: 482_910,
+                }
+                .encode()
+                .unwrap(),
+                server_addr,
+            )
+            .await
+            .unwrap();
+        let (len, _) =
+            tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            SignalingPacket::decode(&buf[..len]).unwrap(),
+            SignalingPacket::S2cShortCodeRegistered {
+                code: 482_910,
+                expires_in_secs: 600
+            }
+        );
+
+        joiner_sock
+            .send_to(
+                &SignalingPacket::C2sResolveShortCode {
+                    code: 482_910,
+                    joiner_pub_key: joiner_pk,
+                    joiner_lan_addrs: Vec::new(),
+                    spake2_msg_a: vec![0x55; 33],
+                }
+                .encode()
+                .unwrap(),
+                server_addr,
+            )
+            .await
+            .unwrap();
+
+        let (len_h, _) =
+            tokio::time::timeout(Duration::from_secs(1), host_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            SignalingPacket::decode(&buf[..len_h]).unwrap(),
+            SignalingPacket::S2cShortCodeChallenge { code: 482_910, .. }
+        ));
+
+        let (len_j, _) =
+            tokio::time::timeout(Duration::from_secs(1), joiner_sock.recv_from(&mut buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert!(matches!(
+            SignalingPacket::decode(&buf[..len_j]).unwrap(),
+            SignalingPacket::S2cShortCodeJoinerInfo { code: 482_910, .. }
+        ));
 
         let _ = shutdown_tx.send(true);
         let _ = srv_task.await;

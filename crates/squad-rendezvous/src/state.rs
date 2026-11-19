@@ -1,6 +1,8 @@
 use dashmap::DashMap;
 use squad_proto::{
-    ClientUuid, PeerId, PeerRecord, RoomId, SignalingErrorCode, SignalingPacket, MAX_ROOM_PEERS,
+    ClientUuid, FriendPresenceInfo, PeerId, PeerRecord, RoomId, SignalingErrorCode,
+    SignalingPacket, MAX_FRIENDS_STATUS_PER_PACKET, MAX_FRIEND_INVITE_CIPHERTEXT, MAX_ROOM_PEERS,
+    MAX_SPAKE2_MSG_LEN, SHORT_CODE_MAX,
 };
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr, SocketAddrV4};
@@ -13,6 +15,37 @@ const RELAY_BUCKET_BURST: f64 = 500.0;
 const STALE_BUCKET_TTL: Duration = Duration::from_secs(60);
 const MAX_ACTIVE_ROOMS: usize = 4096;
 const MAX_RATE_LIMIT_BUCKETS: usize = 65_536;
+pub const PRESENCE_TTL: Duration = Duration::from_secs(15);
+const MAX_PRESENCE_ENTRIES: usize = 65_536;
+pub const SHORT_CODE_TTL_SECS: u16 = 600;
+pub const SHORT_CODE_TTL: Duration = Duration::from_secs(600);
+const MAX_SHORT_CODES: usize = 4096;
+const SHORT_CODE_FAIL_WINDOW: Duration = Duration::from_secs(60);
+const SHORT_CODE_MAX_FAILS: usize = 5;
+const SHORT_CODE_BLOCK_DURATION: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone)]
+pub struct PresenceRecord {
+    pub addr: SocketAddr,
+    pub nickname: String,
+    pub in_room: bool,
+    pub last_seen: Instant,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShortCodeEntry {
+    pub room_id: RoomId,
+    pub host_pub_key: [u8; 32],
+    pub host_addr: SocketAddr,
+    pub host_lan_addrs: Vec<SocketAddrV4>,
+    pub created_at: Instant,
+}
+
+#[derive(Debug, Default)]
+struct ShortCodeRateState {
+    failures: Vec<Instant>,
+    blocked_until: Option<Instant>,
+}
 
 #[derive(Debug, Clone)]
 pub struct PeerEntry {
@@ -99,6 +132,9 @@ fn consume_token(
 
 pub struct RendezvousState {
     rooms: DashMap<RoomId, RoomState>,
+    presence: DashMap<[u8; 32], PresenceRecord>,
+    short_codes: DashMap<u32, ShortCodeEntry>,
+    short_code_failures: DashMap<IpAddr, ShortCodeRateState>,
     rate_limits: DashMap<IpAddr, TokenBucket>,
     relay_rate_limits: DashMap<IpAddr, TokenBucket>,
 }
@@ -113,6 +149,9 @@ impl RendezvousState {
     pub fn new() -> Self {
         Self {
             rooms: DashMap::new(),
+            presence: DashMap::new(),
+            short_codes: DashMap::new(),
+            short_code_failures: DashMap::new(),
             rate_limits: DashMap::new(),
             relay_rate_limits: DashMap::new(),
         }
@@ -301,7 +340,304 @@ impl RendezvousState {
         if should_remove_room {
             self.rooms.remove(&room_id);
         }
+        self.short_codes
+            .retain(|_, sc| sc.room_id != room_id || (!should_remove_room && sc.host_addr != src_addr));
         notifications
+    }
+
+    pub fn handle_presence_ping(
+        &self,
+        src_addr: SocketAddr,
+        pub_key: [u8; 32],
+        nickname: String,
+        in_room: bool,
+        now: Instant,
+    ) {
+        if !self.presence.contains_key(&pub_key) && self.presence.len() >= MAX_PRESENCE_ENTRIES {
+            return;
+        }
+        if let Some(existing) = self.presence.get(&pub_key) {
+            if existing.addr != src_addr
+                && existing.addr.ip() != src_addr.ip()
+                && now.saturating_duration_since(existing.last_seen) <= Duration::from_secs(2)
+            {
+                return;
+            }
+        }
+        self.presence.insert(
+            pub_key,
+            PresenceRecord {
+                addr: src_addr,
+                nickname,
+                in_room,
+                last_seen: now,
+            },
+        );
+    }
+
+    pub fn handle_query_friends(
+        &self,
+        src_addr: SocketAddr,
+        friend_pub_keys: Vec<[u8; 32]>,
+        now: Instant,
+    ) -> Vec<(SocketAddr, SignalingPacket)> {
+        let mut online = Vec::new();
+        for key in friend_pub_keys {
+            if let Some(rec) = self.presence.get(&key) {
+                if now.saturating_duration_since(rec.last_seen) <= PRESENCE_TTL {
+                    online.push(FriendPresenceInfo {
+                        pub_key: key,
+                        nickname: rec.nickname.clone(),
+                        in_room: rec.in_room,
+                    });
+                }
+            }
+        }
+        if online.is_empty() {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cFriendsStatus {
+                    online_friends: Vec::new(),
+                },
+            )];
+        }
+        online
+            .chunks(MAX_FRIENDS_STATUS_PER_PACKET)
+            .map(|chunk| {
+                (
+                    src_addr,
+                    SignalingPacket::S2cFriendsStatus {
+                        online_friends: chunk.to_vec(),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn handle_relay_friend_invite(
+        &self,
+        src_addr: SocketAddr,
+        sender_pub_key: [u8; 32],
+        target_pub_key: [u8; 32],
+        ephemeral_pub_key: [u8; 32],
+        nonce: [u8; 12],
+        ciphertext: Vec<u8>,
+        now: Instant,
+    ) -> Vec<(SocketAddr, SignalingPacket)> {
+        if ciphertext.is_empty() || ciphertext.len() > MAX_FRIEND_INVITE_CIPHERTEXT {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::InvalidPacket,
+                },
+            )];
+        }
+        let target_addr = self.presence.get(&target_pub_key).and_then(|rec| {
+            if now.saturating_duration_since(rec.last_seen) <= PRESENCE_TTL {
+                Some(rec.addr)
+            } else {
+                None
+            }
+        });
+        let Some(dst_addr) = target_addr else {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::FriendOffline,
+                },
+            )];
+        };
+        vec![(
+            dst_addr,
+            SignalingPacket::S2cIncomingFriendInvite {
+                sender_pub_key,
+                ephemeral_pub_key,
+                nonce,
+                ciphertext,
+            },
+        )]
+    }
+
+    pub fn handle_register_short_code(
+        &self,
+        src_addr: SocketAddr,
+        room_id: RoomId,
+        host_pub_key: [u8; 32],
+        code: u32,
+        now: Instant,
+    ) -> Vec<(SocketAddr, SignalingPacket)> {
+        if code > SHORT_CODE_MAX {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::InvalidShortCode,
+                },
+            )];
+        }
+
+        let host_lan_addrs = {
+            let Some(room) = self.rooms.get(&room_id) else {
+                return vec![(
+                    src_addr,
+                    SignalingPacket::S2cError {
+                        code: SignalingErrorCode::InvalidPacket,
+                    },
+                )];
+            };
+            let Some(peer) = room.peers.values().find(|p| p.public_addr == src_addr) else {
+                return vec![(
+                    src_addr,
+                    SignalingPacket::S2cError {
+                        code: SignalingErrorCode::InvalidPacket,
+                    },
+                )];
+            };
+            peer.lan_addrs.clone()
+        };
+
+        self.short_codes.retain(|_, sc| sc.room_id != room_id);
+
+        if let Some(existing) = self.short_codes.get(&code) {
+            if now.saturating_duration_since(existing.created_at) <= SHORT_CODE_TTL
+                && self.rooms.contains_key(&existing.room_id)
+            {
+                return vec![(
+                    src_addr,
+                    SignalingPacket::S2cError {
+                        code: SignalingErrorCode::InvalidShortCode,
+                    },
+                )];
+            }
+        }
+
+        if !self.short_codes.contains_key(&code) && self.short_codes.len() >= MAX_SHORT_CODES {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::RoomFull,
+                },
+            )];
+        }
+
+        self.short_codes.insert(
+            code,
+            ShortCodeEntry {
+                room_id,
+                host_pub_key,
+                host_addr: src_addr,
+                host_lan_addrs,
+                created_at: now,
+            },
+        );
+
+        vec![(
+            src_addr,
+            SignalingPacket::S2cShortCodeRegistered {
+                code,
+                expires_in_secs: SHORT_CODE_TTL_SECS,
+            },
+        )]
+    }
+
+    pub fn handle_resolve_short_code(
+        &self,
+        src_addr: SocketAddr,
+        code: u32,
+        joiner_pub_key: [u8; 32],
+        joiner_lan_addrs: Vec<SocketAddrV4>,
+        spake2_msg_a: Vec<u8>,
+        now: Instant,
+    ) -> Vec<(SocketAddr, SignalingPacket)> {
+        let src_ip = src_addr.ip();
+        if let Some(state) = self.short_code_failures.get(&src_ip) {
+            if state.blocked_until.is_some_and(|until| now < until) {
+                return vec![(
+                    src_addr,
+                    SignalingPacket::S2cError {
+                        code: SignalingErrorCode::RateLimited,
+                    },
+                )];
+            }
+        }
+
+        if code > SHORT_CODE_MAX
+            || spake2_msg_a.is_empty()
+            || spake2_msg_a.len() > MAX_SPAKE2_MSG_LEN
+        {
+            return self.record_short_code_failure(src_addr, now);
+        }
+
+        let entry = self.short_codes.get(&code).map(|e| e.value().clone());
+        if let Some(sc) = entry {
+            let not_expired = now.saturating_duration_since(sc.created_at) <= SHORT_CODE_TTL;
+            let host_live = self
+                .rooms
+                .get(&sc.room_id)
+                .is_some_and(|r| r.peers.values().any(|p| p.public_addr == sc.host_addr));
+            if not_expired && host_live {
+                return vec![
+                    (
+                        sc.host_addr,
+                        SignalingPacket::S2cShortCodeChallenge {
+                            code,
+                            joiner_pub_key,
+                            joiner_public_addr: src_addr,
+                            joiner_lan_addrs,
+                            spake2_msg_a,
+                        },
+                    ),
+                    (
+                        src_addr,
+                        SignalingPacket::S2cShortCodeJoinerInfo {
+                            code,
+                            host_pub_key: sc.host_pub_key,
+                            host_public_addr: sc.host_addr,
+                            host_lan_addrs: sc.host_lan_addrs,
+                        },
+                    ),
+                ];
+            }
+            self.short_codes.remove(&code);
+        }
+
+        self.record_short_code_failure(src_addr, now)
+    }
+
+    fn record_short_code_failure(
+        &self,
+        src_addr: SocketAddr,
+        now: Instant,
+    ) -> Vec<(SocketAddr, SignalingPacket)> {
+        let ip = src_addr.ip();
+        if !self.short_code_failures.contains_key(&ip)
+            && self.short_code_failures.len() >= MAX_RATE_LIMIT_BUCKETS
+        {
+            return vec![(
+                src_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::RateLimited,
+                },
+            )];
+        }
+        let mut entry = self.short_code_failures.entry(ip).or_default();
+        if entry.blocked_until.is_some_and(|until| now >= until) {
+            entry.blocked_until = None;
+            entry.failures.clear();
+        }
+        entry
+            .failures
+            .retain(|&t| now.saturating_duration_since(t) <= SHORT_CODE_FAIL_WINDOW);
+        entry.failures.push(now);
+
+        let err_code = if entry.failures.len() >= SHORT_CODE_MAX_FAILS {
+            entry.blocked_until = Some(now + SHORT_CODE_BLOCK_DURATION);
+            SignalingErrorCode::RateLimited
+        } else {
+            SignalingErrorCode::InvalidShortCode
+        };
+
+        vec![(src_addr, SignalingPacket::S2cError { code: err_code })]
     }
 
     /// Evicts expired peers (`now - last_seen > ttl`) and returns broadcast updates for affected rooms.
@@ -327,7 +663,23 @@ impl RendezvousState {
             self.rooms.remove(&room_id);
         }
 
-        // Prune stale IP rate-limit buckets older than 60s
+        // Prune stale IP rate-limit buckets, presence records, short codes, and brute-force state
+        self.presence
+            .retain(|_, p| now.saturating_duration_since(p.last_seen) <= PRESENCE_TTL);
+        self.short_codes.retain(|_, sc| {
+            now.saturating_duration_since(sc.created_at) <= SHORT_CODE_TTL
+                && self
+                    .rooms
+                    .get(&sc.room_id)
+                    .is_some_and(|r| r.peers.values().any(|p| p.public_addr == sc.host_addr))
+        });
+        self.short_code_failures.retain(|_, st| {
+            st.blocked_until.is_some_and(|u| now < u)
+                || st
+                    .failures
+                    .iter()
+                    .any(|&t| now.saturating_duration_since(t) <= SHORT_CODE_FAIL_WINDOW)
+        });
         self.rate_limits
             .retain(|_, b| now.saturating_duration_since(b.last_refill) <= STALE_BUCKET_TTL);
         self.relay_rate_limits
@@ -636,5 +988,176 @@ mod tests {
         let room = state.rooms.get(&room_id).unwrap();
         assert!(!room.peers.contains_key(&uuid_a));
         assert!(room.peers.contains_key(&uuid_a_new));
+    }
+
+    #[test]
+    fn test_presence_ttl_query_privacy_and_invite_relay() {
+        let state = RendezvousState::new();
+        let t0 = Instant::now();
+        let addr_a: SocketAddr = "203.0.113.10:5001".parse().unwrap();
+        let addr_b: SocketAddr = "203.0.113.11:5002".parse().unwrap();
+        let key_a = [0xA1; 32];
+        let key_b = [0xB2; 32];
+        let key_c = [0xC3; 32];
+
+        state.handle_presence_ping(addr_a, key_a, "Alice".into(), false, t0);
+        state.handle_presence_ping(addr_b, key_b, "Bob".into(), true, t0);
+
+        let res = state.handle_query_friends(addr_a, vec![key_b, key_c], t0 + Duration::from_secs(5));
+        assert_eq!(res.len(), 1);
+        match &res[0].1 {
+            SignalingPacket::S2cFriendsStatus { online_friends } => {
+                assert_eq!(online_friends.len(), 1);
+                assert_eq!(online_friends[0].pub_key, key_b);
+                assert_eq!(online_friends[0].nickname, "Bob");
+                assert!(online_friends[0].in_room);
+            }
+            other => panic!("expected S2cFriendsStatus, got {other:?}"),
+        }
+
+        let relay = state.handle_relay_friend_invite(
+            addr_a,
+            key_a,
+            key_b,
+            [0xE1; 32],
+            [0x12; 12],
+            vec![0x77; 48],
+            t0 + Duration::from_secs(6),
+        );
+        assert_eq!(relay.len(), 1);
+        assert_eq!(relay[0].0, addr_b);
+        assert!(matches!(
+            relay[0].1,
+            SignalingPacket::S2cIncomingFriendInvite { sender_pub_key, .. } if sender_pub_key == key_a
+        ));
+
+        // After 16s (> 15s TTL), Bob expires and invite returns FriendOffline without leaking IP.
+        let t_late = t0 + Duration::from_secs(16);
+        let offline_relay = state.handle_relay_friend_invite(
+            addr_a,
+            key_a,
+            key_b,
+            [0xE2; 32],
+            [0x13; 12],
+            vec![0x77; 48],
+            t_late,
+        );
+        assert_eq!(
+            offline_relay,
+            vec![(
+                addr_a,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::FriendOffline
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn test_short_code_registration_resolution_eviction_and_rate_limit() {
+        let state = RendezvousState::new();
+        let t0 = Instant::now();
+        let peer_ttl = Duration::from_secs(6);
+        let room_id = [0x88; 16];
+        let host_addr: SocketAddr = "203.0.113.10:5001".parse().unwrap();
+        let joiner_addr: SocketAddr = "203.0.113.20:5002".parse().unwrap();
+        let attacker_addr: SocketAddr = "198.51.100.99:5003".parse().unwrap();
+        let host_pk = [0x11; 32];
+        let joiner_pk = [0x22; 32];
+
+        register_peer(&state, host_addr, room_id, [1u8; 16], "Host", t0);
+
+        let reg = state.handle_register_short_code(host_addr, room_id, host_pk, 482_910, t0);
+        assert_eq!(
+            reg,
+            vec![(
+                host_addr,
+                SignalingPacket::S2cShortCodeRegistered {
+                    code: 482_910,
+                    expires_in_secs: 600
+                }
+            )]
+        );
+
+        let res = state.handle_resolve_short_code(
+            joiner_addr,
+            482_910,
+            joiner_pk,
+            vec!["192.168.1.50:5002".parse().unwrap()],
+            vec![0xAA; 33],
+            t0 + Duration::from_secs(1),
+        );
+        assert_eq!(res.len(), 2);
+        assert_eq!(res[0].0, host_addr);
+        assert!(matches!(
+            res[0].1,
+            SignalingPacket::S2cShortCodeChallenge { code: 482_910, .. }
+        ));
+        assert_eq!(res[1].0, joiner_addr);
+        assert!(matches!(
+            res[1].1,
+            SignalingPacket::S2cShortCodeJoinerInfo { code: 482_910, .. }
+        ));
+
+        // 4 failed attempts return InvalidShortCode; 5th failed attempt triggers 60s RateLimited lock.
+        for attempt in 1..=4u32 {
+            let err = state.handle_resolve_short_code(
+                attacker_addr,
+                100_000 + attempt,
+                joiner_pk,
+                Vec::new(),
+                vec![0xBB; 33],
+                t0 + Duration::from_secs(1),
+            );
+            assert_eq!(
+                err,
+                vec![(
+                    attacker_addr,
+                    SignalingPacket::S2cError {
+                        code: SignalingErrorCode::InvalidShortCode
+                    }
+                )]
+            );
+        }
+        let fifth = state.handle_resolve_short_code(
+            attacker_addr,
+            999_999,
+            joiner_pk,
+            Vec::new(),
+            vec![0xBB; 33],
+            t0 + Duration::from_secs(2),
+        );
+        assert_eq!(
+            fifth,
+            vec![(
+                attacker_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::RateLimited
+                }
+            )]
+        );
+
+        // Even guessing the VALID code while blocked must stay RateLimited for 60s.
+        let blocked_valid = state.handle_resolve_short_code(
+            attacker_addr,
+            482_910,
+            joiner_pk,
+            Vec::new(),
+            vec![0xBB; 33],
+            t0 + Duration::from_secs(30),
+        );
+        assert_eq!(
+            blocked_valid,
+            vec![(
+                attacker_addr,
+                SignalingPacket::S2cError {
+                    code: SignalingErrorCode::RateLimited
+                }
+            )]
+        );
+
+        // Evicting expired host automatically removes its room short code.
+        let _ = state.evict_expired(t0 + Duration::from_secs(10), peer_ttl);
+        assert!(!state.short_codes.contains_key(&482_910));
     }
 }
