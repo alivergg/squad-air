@@ -1,0 +1,26 @@
+{
+  "name": "SquadAir",
+  "short_name": "SquadAir",
+  "description": "Ultra-light P2P voice chat and 1080p60 screen sharing built in pure Rust with end-to-end ChaCha20-Poly1305 encryption.",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#181818",
+  "theme_color": "#181818",
+  "icons": [
+    {
+      "src": "/assets/img/favicon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml"
+    },
+    {
+      "src": "/assets/img/icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png"
+    },
+    {
+      "src": "/assets/img/icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png"
+    }
+  ]
+}

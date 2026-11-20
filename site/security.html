@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Security &amp; Cryptography Specification — SquadAir</title>
+  <meta name="description" content="Technical specification of SquadAir cryptography (ChaCha20-Poly1305, X25519, SPAKE2, BLAKE3), replay windows, Tier 3 anti-amplification relay protection, and vulnerability disclosure.">
+  <meta name="theme-color" content="#181818">
+  <link rel="canonical" href="https://squadair.app/security.html">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <script defer src="assets/js/app.js"></script>
+</head>
+<body>
+  <a href="#main-content" class="skip-link visually-hidden">Skip to main content</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a href="/" class="site-logo">
+        <img src="assets/img/logo.svg" width="28" height="28" alt="" aria-hidden="true">
+        <span>SquadAir</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <button
+          class="menu-button button-sm"
+          type="button"
+          popovertarget="site-menu"
+          popovertargetaction="toggle"
+          aria-controls="site-menu"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16"/>
+          </svg>
+          <span>Menu</span>
+        </button>
+
+        <ul id="site-menu" class="site-menu" popover="auto">
+          <li><a href="/" class="body-5">Overview</a></li>
+          <li><a href="security.html" class="body-5" aria-current="page">Security</a></li>
+          <li><a href="privacy.html" class="body-5">Privacy</a></li>
+          <li><a href="terms.html" class="body-5">Terms</a></li>
+        </ul>
+      </nav>
+
+      <div class="header-actions">
+        <a href="https://github.com/alivergg/squad-air" class="nav-github-link body-5" rel="noopener">alivergg/squad-air</a>
+        <a href="https://github.com/alivergg/squad-air/releases/latest" class="btn btn--primary button-sm">Download</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container doc-shell">
+    <div class="doc-grid">
+      <aside class="doc-toc" aria-label="Table of contents">
+        <span class="title-4">On this page</span>
+        <ul>
+          <li><a href="#primitives">Cryptographic primitives</a></li>
+          <li><a href="#replay">Replay &amp; integrity</a></li>
+          <li><a href="#relay-hardening">Tier 3 relay protection</a></li>
+          <li><a href="#updater">Release verification</a></li>
+          <li><a href="#disclosure">Vulnerability disclosure</a></li>
+        </ul>
+      </aside>
+
+      <article class="doc-article">
+        <header class="doc-header">
+          <div class="section-kicker caption-1">
+            <span class="status-led" aria-hidden="true"></span>
+            <span>RFC 9116 &amp; squad-proto security design</span>
+          </div>
+          <h1 id="main-content" class="heading-2" tabindex="-1">Security &amp; Cryptography Specification</h1>
+          <p class="body-3 text-secondary">
+            SquadAir enforces end-to-end encryption over untrusted UDP networks and hardens its stateless rendezvous coordinator against amplification and brute-force attacks.
+          </p>
+        </header>
+
+        <section id="primitives" class="doc-section">
+          <h2 class="heading-4">1. Cryptographic Primitives</h2>
+          <div class="doc-table-wrap">
+            <table class="doc-table">
+              <thead>
+                <tr>
+                  <th scope="col" class="body-5">Subsystem</th>
+                  <th scope="col" class="body-5">Primitive &amp; Construction</th>
+                  <th scope="col" class="body-5">Scope</th>
+                </tr>
+              </thead>
+              <tbody class="body-6">
+                <tr>
+                  <td><strong>Media &amp; Chat AEAD</strong></td>
+                  <td class="mono-num">ChaCha20-Poly1305</td>
+                  <td>Every voice frame, 1080p60 video fragment, chat message, inline image, and file chunk. Key derived from 256-bit room secret via <span class="mono-num">BLAKE3</span> KDF with volatile stack zeroization.</td>
+                </tr>
+                <tr>
+                  <td><strong>Packet Nonce &amp; AAD</strong></td>
+                  <td class="mono-num">[peer_id:2B][type:1B][seq:8B][0x00]</td>
+                  <td>Deterministic 96-bit nonce bound to the 18-byte cleartext <span class="mono-num">P2pHeader</span> as Additional Authenticated Data (AAD) with 16-byte Poly1305 tag.</td>
+                </tr>
+                <tr>
+                  <td><strong>Friend Invites (<span class="mono-num">sqf_</span>)</strong></td>
+                  <td class="mono-num">X25519 (Dual DH) + BLAKE3 + ChaCha20-Poly1305</td>
+                  <td>Combines ephemeral-static and static-static <span class="mono-num">X25519</span> shared secrets, rejecting weak all-zero outputs and binding sender, recipient, and ephemeral keys in 96-byte AAD.</td>
+                </tr>
+                <tr>
+                  <td><strong>6-Digit Codes &amp; LAN Locks</strong></td>
+                  <td class="mono-num">SPAKE2 (Ed25519Group)</td>
+                  <td>Password-Authenticated Key Exchange seals <span class="mono-num">(room_id, secret)</span> so neither an eavesdropper nor the coordinator can recover room keys.</td>
+                </tr>
+                <tr>
+                  <td><strong>Integrity &amp; Identity</strong></td>
+                  <td class="mono-num">BLAKE3</td>
+                  <td>Derives AEAD subkeys, verifies <span class="mono-num">1024 B</span> swarm file chunks against root hashes, and generates deterministic <span class="mono-num">5x5</span> visual identicons.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="replay" class="doc-section">
+          <h2 class="heading-4">2. Replay Defense &amp; Wire Framing</h2>
+          <p class="body-6">
+            All P2P datagrams fit inside a <span class="mono-num">1200-byte</span> UDP MTU (<span class="mono-num">MAX_UDP_PAYLOAD = 1200</span>) to avoid IP fragmentation. Incoming packets must pass AEAD tag verification before body decoding and are tracked per sender via sliding sequence bitmasks:
+          </p>
+          <ul class="body-6">
+            <li><strong><span class="mono-num">ReplayWindow</span> (128 packets):</strong> Protects audio, chat, control, and file transfer streams against duplicate or replayed datagrams.</li>
+            <li><strong><span class="mono-num">LargeReplayWindow</span> (2048 packets):</strong> Accommodates high-throughput 60 FPS video fragment bursts and interleaved <span class="mono-num">XOR-FEC</span> recovery while rejecting stale replays.</li>
+          </ul>
+        </section>
+
+        <section id="relay-hardening" class="doc-section">
+          <h2 class="heading-4">3. Tier 3 Server Relay Anti-Amplification Hardening</h2>
+          <p class="body-6">
+            When <span class="mono-num">squad-rendezvous</span> runs with opt-in <span class="mono-num">--enable-relay</span> for strict CGNAT voice fallback, multiple layers prevent UDP amplification, bandwidth exhaustion, and spoofed reflection:
+          </p>
+          <ul class="body-6">
+            <li><strong>Disabled by Default:</strong> Without <span class="mono-num">--enable-relay</span>, all relay datagrams are dropped silently at the socket boundary.</li>
+            <li><strong>Strict Payload Cap (<span class="mono-num">320 B</span>):</strong> Any relay datagram larger than <span class="mono-num">MAX_SERVER_RELAY_DATAGRAM_BYTES (320 bytes)</span> is dropped before inspection.</li>
+            <li><strong>Video &amp; Bulk Transfer Blocklist:</strong> <span class="mono-num">is_server_relay_allowed()</span> blocks all screen-share opcodes (<span class="mono-num">VideoFrameFrag</span>, <span class="mono-num">StreamAudioOpus</span>, <span class="mono-num">StreamSubscribe</span>, <span class="mono-num">StreamPli</span>) and file-swarm opcodes at the header layer.</li>
+            <li><strong>Exact Socket &amp; Room Membership Validation:</strong> Both source <span class="mono-num">IP:port</span> and target <span class="mono-num">peer_id</span> must belong to the same active <span class="mono-num">room_id</span> within the <span class="mono-num">6-second</span> heartbeat TTL, and self-relay is rejected.</li>
+            <li><strong>Zero Reflection on Drop:</strong> Spoofed or unauthenticated relay probes produce zero outbound error packets and never allocate rate-limit state.</li>
+            <li><strong>Token Bucket &amp; Brute-Force Limits:</strong> Authenticated relay senders are capped at <span class="mono-num">150 packets/sec</span>, signaling is capped at <span class="mono-num">30 packets/sec</span> per IP (burst 45), and 5 failed 6-digit code attempts within 60 seconds block that IP for 60 seconds.</li>
+          </ul>
+        </section>
+
+        <section id="updater" class="doc-section">
+          <h2 class="heading-4">4. Release Integrity &amp; Hardened Deployment</h2>
+          <p class="body-6">
+            Every release published on <a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a> ships with <span class="mono-num">SHA256SUMS.txt</span>. The built-in client updater verifies downloaded release bytes in pure Rust over TLS using SHA-256 before launching platform installers. Self-hosted coordinator deployments support a hardened Docker configuration with <span class="mono-num">read_only: true</span> and <span class="mono-num">cap_drop: ["ALL"]</span>.
+          </p>
+        </section>
+
+        <section id="disclosure" class="doc-section">
+          <h2 class="heading-4">5. Coordinated Vulnerability Disclosure</h2>
+          <div class="doc-callout">
+            <p class="body-5">Report security issues directly to <a href="mailto:security@squadair.app">security@squadair.app</a></p>
+            <p class="body-6">
+              Please include reproduction steps, affected crate or release tag, and impact summary instead of opening a public GitHub issue for unpatched vulnerabilities. Machine-readable policy metadata is hosted at <a href="/.well-known/security.txt">/.well-known/security.txt</a> per RFC 9116.
+            </p>
+          </div>
+        </section>
+      </article>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div style="display: grid; gap: var(--space-100); align-content: start;">
+          <a href="/" class="site-logo">
+            <img src="assets/img/logo.svg" width="24" height="24" alt="" aria-hidden="true">
+            <span>SquadAir</span>
+          </a>
+          <p class="body-6 text-secondary" style="max-inline-size: 36ch;">
+            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the MIT License.
+          </p>
+        </div>
+
+        <div>
+          <h2 class="title-4">Product</h2>
+          <ul class="footer-list body-6">
+            <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download</a></li>
+            <li><a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a></li>
+            <li><a href="https://github.com/alivergg/squad-air">Source Code</a></li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 class="title-4">Documentation</h2>
+          <ul class="footer-list body-6">
+            <li><a href="security.html" aria-current="page">Security Specification</a></li>
+            <li><a href="privacy.html">Privacy Policy</a></li>
+            <li><a href="terms.html">Terms of Use</a></li>
+            <li><a href="/.well-known/security.txt">security.txt</a></li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 class="title-4">Contact</h2>
+          <ul class="footer-list body-6">
+            <li><a href="mailto:support@squadair.app">support@squadair.app</a></li>
+            <li><a href="mailto:security@squadair.app">security@squadair.app</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom caption-2">
+        <span>SquadAir Contributors · MIT License</span>
+        <span>Zero cookies · Zero analytics · Zero accounts</span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

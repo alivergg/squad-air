@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Terms of Use &amp; Open Source License — SquadAir</title>
+  <meta name="description" content="Terms of use for the free SquadAir open-source software (MIT License) and acceptable use policy for the public rv.squadair.app signaling coordinator.">
+  <meta name="theme-color" content="#181818">
+  <link rel="canonical" href="https://squadair.app/terms.html">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <script defer src="assets/js/app.js"></script>
+</head>
+<body>
+  <a href="#main-content" class="skip-link visually-hidden">Skip to main content</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a href="/" class="site-logo">
+        <img src="assets/img/logo.svg" width="28" height="28" alt="" aria-hidden="true">
+        <span>SquadAir</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <button
+          class="menu-button button-sm"
+          type="button"
+          popovertarget="site-menu"
+          popovertargetaction="toggle"
+          aria-controls="site-menu"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16"/>
+          </svg>
+          <span>Menu</span>
+        </button>
+
+        <ul id="site-menu" class="site-menu" popover="auto">
+          <li><a href="/" class="body-5">Overview</a></li>
+          <li><a href="security.html" class="body-5">Security</a></li>
+          <li><a href="privacy.html" class="body-5">Privacy</a></li>
+          <li><a href="terms.html" class="body-5" aria-current="page">Terms</a></li>
+        </ul>
+      </nav>
+
+      <div class="header-actions">
+        <a href="https://github.com/alivergg/squad-air" class="nav-github-link body-5" rel="noopener">alivergg/squad-air</a>
+        <a href="https://github.com/alivergg/squad-air/releases/latest" class="btn btn--primary button-sm">Download</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container doc-shell">
+    <div class="doc-grid">
+      <aside class="doc-toc" aria-label="Table of contents">
+        <span class="title-4">On this page</span>
+        <ul>
+          <li><a href="#license">MIT Open Source License</a></li>
+          <li><a href="#coordinator">Public coordinator usage</a></li>
+          <li><a href="#acceptable-use">Acceptable use &amp; limits</a></li>
+          <li><a href="#disclaimer">Disclaimer of warranty</a></li>
+          <li><a href="#contact">Contact</a></li>
+        </ul>
+      </aside>
+
+      <article class="doc-article">
+        <header class="doc-header">
+          <div class="section-kicker caption-1">
+            <span class="status-led status-led--cobalt" aria-hidden="true"></span>
+            <span>Last updated November 20, 2026</span>
+          </div>
+          <h1 id="main-content" class="heading-2" tabindex="-1">Terms of Use &amp; Open Source License</h1>
+          <p class="body-3 text-secondary">
+            SquadAir is free, open-source software distributed under the MIT License alongside an optional public UDP signaling coordinator at <span class="mono-num">rv.squadair.app:3478</span>.
+          </p>
+        </header>
+
+        <section id="license" class="doc-section">
+          <h2 class="heading-4">1. Open Source Software License (MIT)</h2>
+          <p class="body-6">
+            The SquadAir client, audio engine, video pipeline, wire protocol, and rendezvous server source code are copyright (c) 2026 SquadAir Contributors and licensed under the <a href="https://github.com/alivergg/squad-air/blob/main/LICENSE" rel="noopener">MIT License</a>.
+          </p>
+          <p class="body-6">
+            You are free to use, inspect, compile, modify, distribute, and self-host the software at zero cost subject to preserving the copyright and permission notice in the <span class="mono-num">LICENSE</span> file.
+          </p>
+        </section>
+
+        <section id="coordinator" class="doc-section">
+          <h2 class="heading-4">2. Voluntary Use of the Public Coordinator (<span class="mono-num">rv.squadair.app</span>)</h2>
+          <p class="body-6">
+            The public coordinator at <span class="mono-num">rv.squadair.app:3478</span> is provided free of charge as a best-effort community signaling endpoint for UDP hole punching, <span class="mono-num">X25519</span> friend presence pings, <span class="mono-num">SPAKE2</span> short-code handshakes, and low-bandwidth voice/chat CGNAT relay fallback.
+          </p>
+          <p class="body-6">
+            You are never required to use <span class="mono-num">rv.squadair.app</span>. You may switch to your own <span class="mono-num">squad-rendezvous</span> instance under Settings at any time or operate purely over local area networks using LAN Mode.
+          </p>
+        </section>
+
+        <section id="acceptable-use" class="doc-section">
+          <h2 class="heading-4">3. Fair &amp; Acceptable Use of Public Infrastructure</h2>
+          <p class="body-6">
+            When connecting to <span class="mono-num">rv.squadair.app</span>, you agree not to abuse shared UDP resources or target other users. Strictly prohibited activities include:
+          </p>
+          <ul class="body-6">
+            <li>Sending spoofed source IP packets, volumetric UDP floods, or denial-of-service traffic toward the coordinator or peer endpoints.</li>
+            <li>Automated enumeration or brute-force guessing of 6-digit <span class="mono-num">SPAKE2</span> voice codes.</li>
+            <li>Attempting to bypass Tier 3 relay packet size (<span class="mono-num">320 bytes</span>) or bandwidth caps to tunnel video streams or bulk files through the public relay.</li>
+            <li>Using SquadAir infrastructure for unlawful harassment, unauthorized network scanning, or distribution of malware.</li>
+          </ul>
+          <p class="body-6">
+            To preserve stability for active squads, <span class="mono-num">squad-rendezvous</span> automatically enforces per-IP signaling token buckets (<span class="mono-num">30 packets/sec</span>), short-code lockout windows (<span class="mono-num">5 failed attempts</span> triggers a <span class="mono-num">60-second</span> block), and per-peer relay limits (<span class="mono-num">150 packets/sec</span>).
+          </p>
+        </section>
+
+        <section id="disclaimer" class="doc-section">
+          <h2 class="heading-4">4. Disclaimer of Warranty &amp; Limitation of Liability</h2>
+          <div class="doc-callout">
+            <p class="body-6">
+              THE SOFTWARE AND THE PUBLIC COORDINATOR ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS, CONTRIBUTORS, OR OPERATORS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+            </p>
+          </div>
+          <p class="body-6">
+            Because SquadAir operates without central user accounts or recovery keys, you are solely responsible for safeguarding your local <span class="mono-num">config.toml</span> identity key and <span class="mono-num">friends.json</span> contacts.
+          </p>
+        </section>
+
+        <section id="contact" class="doc-section">
+          <h2 class="heading-4">5. Contact</h2>
+          <p class="body-6">
+            Questions regarding licensing or coordinator abuse reports may be sent to <a href="mailto:support@squadair.app">support@squadair.app</a> or <a href="mailto:security@squadair.app">security@squadair.app</a>.
+          </p>
+        </section>
+      </article>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div style="display: grid; gap: var(--space-100); align-content: start;">
+          <a href="/" class="site-logo">
+            <img src="assets/img/logo.svg" width="24" height="24" alt="" aria-hidden="true">
+            <span>SquadAir</span>
+          </a>
+          <p class="body-6 text-secondary" style="max-inline-size: 36ch;">
+            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the MIT License.
+          </p>
+        </div>
+
+        <div>
+          <h2 class="title-4">Product</h2>
+          <ul class="footer-list body-6">
+            <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download</a></li>
+            <li><a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a></li>
+            <li><a href="https://github.com/alivergg/squad-air">Source Code</a></li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 class="title-4">Documentation</h2>
+          <ul class="footer-list body-6">
+            <li><a href="security.html">Security Specification</a></li>
+            <li><a href="privacy.html">Privacy Policy</a></li>
+            <li><a href="terms.html" aria-current="page">Terms of Use</a></li>
+            <li><a href="/.well-known/security.txt">security.txt</a></li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 class="title-4">Contact</h2>
+          <ul class="footer-list body-6">
+            <li><a href="mailto:support@squadair.app">support@squadair.app</a></li>
+            <li><a href="mailto:security@squadair.app">security@squadair.app</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom caption-2">
+        <span>SquadAir Contributors · MIT License</span>
+        <span>Zero cookies · Zero analytics · Zero accounts</span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>

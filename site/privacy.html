@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Privacy Policy &amp; Zero-Knowledge Disclosure — SquadAir</title>
+  <meta name="description" content="SquadAir privacy policy detailing local-only client files, ephemeral coordinator RAM state, zero cookies, zero analytics, and zero conversation logs.">
+  <meta name="theme-color" content="#181818">
+  <link rel="canonical" href="https://squadair.app/privacy.html">
+  <link rel="manifest" href="/site.webmanifest">
+  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="assets/css/main.css">
+  <script defer src="assets/js/app.js"></script>
+</head>
+<body>
+  <a href="#main-content" class="skip-link visually-hidden">Skip to main content</a>
+
+  <header class="site-header">
+    <div class="header-inner">
+      <a href="/" class="site-logo">
+        <img src="assets/img/logo.svg" width="28" height="28" alt="" aria-hidden="true">
+        <span>SquadAir</span>
+      </a>
+
+      <nav class="site-nav" aria-label="Primary">
+        <button
+          class="menu-button button-sm"
+          type="button"
+          popovertarget="site-menu"
+          popovertargetaction="toggle"
+          aria-controls="site-menu"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true">
+            <path d="M4 7h16M4 12h16M4 17h16"/>
+          </svg>
+          <span>Menu</span>
+        </button>
+
+        <ul id="site-menu" class="site-menu" popover="auto">
+          <li><a href="/" class="body-5">Overview</a></li>
+          <li><a href="security.html" class="body-5">Security</a></li>
+          <li><a href="privacy.html" class="body-5" aria-current="page">Privacy</a></li>
+          <li><a href="terms.html" class="body-5">Terms</a></li>
+        </ul>
+      </nav>
+
+      <div class="header-actions">
+        <a href="https://github.com/alivergg/squad-air" class="nav-github-link body-5" rel="noopener">alivergg/squad-air</a>
+        <a href="https://github.com/alivergg/squad-air/releases/latest" class="btn btn--primary button-sm">Download</a>
+      </div>
+    </div>
+  </header>
+
+  <main class="container doc-shell">
+    <div class="doc-grid">
+      <aside class="doc-toc" aria-label="Table of contents">
+        <span class="title-4">On this page</span>
+        <ul>
+          <li><a href="#guarantees">Zero-collection guarantees</a></li>
+          <li><a href="#local-storage">Local files on your device</a></li>
+          <li><a href="#coordinator-ram">Ephemeral coordinator RAM</a></li>
+          <li><a href="#website-updater">Website &amp; auto-updater</a></li>
+          <li><a href="#contact">Privacy contact</a></li>
+        </ul>
+      </aside>
+
+      <article class="doc-article">
+        <header class="doc-header">
+          <div class="section-kicker caption-1">
+            <span class="status-led" aria-hidden="true"></span>
+            <span>Last updated November 20, 2026</span>
+          </div>
+          <h1 id="main-content" class="heading-2" tabindex="-1">Privacy Policy &amp; Zero-Knowledge Disclosure</h1>
+          <p class="body-3 text-secondary">
+            SquadAir (<span class="mono-num">squadair</span>) is designed so there are no user accounts, no cloud databases, and no unencrypted media servers to subpoena, leak, or monetize.
+          </p>
+        </header>
+
+        <section id="guarantees" class="doc-section">
+          <h2 class="heading-4">1. Zero Cookies, Zero Analytics, Zero Conversation Logs</h2>
+          <div class="doc-callout">
+            <p class="body-5">SquadAir operates on three verifiable defaults:</p>
+            <ul class="body-6">
+              <li><strong>Zero Cookies:</strong> <span class="mono-num">squadair.app</span> sets zero HTTP cookies, zero <span class="mono-num">localStorage</span> tracking identifiers, and zero third-party scripts.</li>
+              <li><strong>Zero Analytics &amp; Telemetry:</strong> Neither the desktop client nor this website ships crash telemetry, usage analytics, advertising SDKs, or device fingerprinting.</li>
+              <li><strong>Zero Conversation Logs:</strong> Voice audio, screen streams, chat text, screenshots, and files are encrypted client-side with <span class="mono-num">ChaCha20-Poly1305</span> and never decrypted or stored by any SquadAir server.</li>
+            </ul>
+          </div>
+        </section>
+
+        <section id="local-storage" class="doc-section">
+          <h2 class="heading-4">2. Data Stored Strictly on Your Local Device</h2>
+          <p class="body-6">
+            SquadAir stores preferences, contacts, and recent room state solely inside your operating system's standard user application data directory. Configuration files are created atomically with restrictive user-only permissions (<span class="mono-num">0600</span> on Unix).
+          </p>
+
+          <div class="doc-table-wrap">
+            <table class="doc-table">
+              <thead>
+                <tr>
+                  <th scope="col" class="body-5">Artifact</th>
+                  <th scope="col" class="body-5">Contents</th>
+                  <th scope="col" class="body-5">Retention</th>
+                </tr>
+              </thead>
+              <tbody class="body-6">
+                <tr>
+                  <td class="mono-num">config.toml</td>
+                  <td>Nickname, local <span class="mono-num">client_uuid</span>, Base58 <span class="mono-num">X25519</span> identity secret, audio/overlay settings, saved room URIs.</td>
+                  <td>Local only until deleted by user</td>
+                </tr>
+                <tr>
+                  <td class="mono-num">friends.json</td>
+                  <td>Up to 256 trusted friend <span class="mono-num">X25519</span> public keys, nicknames, and local timestamps.</td>
+                  <td>Local only until removed by user</td>
+                </tr>
+                <tr>
+                  <td>Room chat history</td>
+                  <td>Up to 30 recent messages per joined room for local display and peer history sync.</td>
+                  <td>Capped at 30 messages per room</td>
+                </tr>
+                <tr>
+                  <td>Inline &amp; avatar cache</td>
+                  <td>Inline clipboard screenshots (<span class="mono-num">&lt;= 200 KB</span>) and P2P custom avatars (<span class="mono-num">128x128</span> JPEG, <span class="mono-num">&lt;= 64 KB</span>).</td>
+                  <td>Avatars auto-pruned after 30 days</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section id="coordinator-ram" class="doc-section">
+          <h2 class="heading-4">3. Ephemeral RAM Data on the Signaling Coordinator</h2>
+          <p class="body-6">
+            To connect peers behind home routers and NATs, the public coordinator <span class="mono-num">rv.squadair.app:3478</span> (or your own self-hosted <span class="mono-num">squad-rendezvous</span> binary) holds strictly ephemeral signaling coordinates in volatile RAM with zero disk persistence and zero database backing:
+          </p>
+          <ul class="body-6">
+            <li><strong>Friend Presence Ping (<span class="mono-num">15 s</span> TTL):</strong> Stores your public socket <span class="mono-num">IP:port</span>, <span class="mono-num">X25519</span> public key, display nickname, and boolean <span class="mono-num">in_room</span> state so saved friends can see when you are online. Evicted automatically if heartbeats stop for 15 seconds.</li>
+            <li><strong>Active Room Registration (<span class="mono-num">6 s</span> TTL):</strong> Holds an opaque 16-byte <span class="mono-num">room_id</span>, session <span class="mono-num">client_uuid</span>, socket <span class="mono-num">IP:port</span>, and local LAN hints to facilitate UDP hole punching. Automatically reaped after 6 seconds of inactivity.</li>
+            <li><strong>6-Digit Voice Codes (<span class="mono-num">600 s</span> TTL):</strong> Maps an ephemeral 6-digit code to the room host's socket address and <span class="mono-num">SPAKE2</span> challenge routing. Room decryption secrets never leave client memory.</li>
+            <li><strong>Rate-Limiting Buckets (<span class="mono-num">60 s</span> TTL):</strong> Temporary per-IP token buckets and failed short-code counters in memory to mitigate UDP flooding and brute-force guessing.</li>
+          </ul>
+          <p class="body-6">
+            When two peers cannot punch directly or bridge via a teammate (Tier 1 or Tier 2) and fall back to the optional Tier 3 server relay, the coordinator forwards only encrypted voice and text datagrams (<span class="mono-num">&lt;= 320 bytes</span>) without possessing the room key needed to decrypt them.
+          </p>
+        </section>
+
+        <section id="website-updater" class="doc-section">
+          <h2 class="heading-4">4. Website Hosting &amp; Desktop Auto-Updater</h2>
+          <p class="body-6">
+            This documentation site is served as static files over Cloudflare Pages with zero cookies and zero analytics scripts. Standard edge infrastructure providers process transient HTTP connection metadata (such as IP address and TLS handshake) solely to route HTTPS responses and defend against network abuse.
+          </p>
+          <p class="body-6">
+            When you check for updates inside the SquadAir client, the updater connects directly to GitHub Releases (<span class="mono-num">https://github.com/alivergg/squad-air/releases/latest</span>) to compare release tags and verify installer checksums against <span class="mono-num">SHA256SUMS.txt</span>.
+          </p>
+        </section>
+
+        <section id="contact" class="doc-section">
+          <h2 class="heading-4">5. Contact</h2>
+          <p class="body-6">
+            For privacy questions or questions about self-hosting <span class="mono-num">squad-rendezvous</span>, contact <a href="mailto:support@squadair.app">support@squadair.app</a> or review the open-source code at <a href="https://github.com/alivergg/squad-air">github.com/alivergg/squad-air</a>.
+          </p>
+        </section>
+      </article>
+    </div>
+  </main>
+
+  <footer class="site-footer">
+    <div class="container">
+      <div class="footer-grid">
+        <div style="display: grid; gap: var(--space-100); align-content: start;">
+          <a href="/" class="site-logo">
+            <img src="assets/img/logo.svg" width="24" height="24" alt="" aria-hidden="true">
+            <span>SquadAir</span>
+          </a>
+          <p class="body-6 text-secondary" style="max-inline-size: 36ch;">
+            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the MIT License.
+          </p>
+        </div>
+
+        <div>
+          <h2 class="title-4">Product</h2>
+          <ul class="footer-list body-6">
+            <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download</a></li>
+            <li><a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a></li>
+            <li><a href="https://github.com/alivergg/squad-air">Source Code</a></li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 class="title-4">Documentation</h2>
+          <ul class="footer-list body-6">
+            <li><a href="security.html">Security Specification</a></li>
+            <li><a href="privacy.html" aria-current="page">Privacy Policy</a></li>
+            <li><a href="terms.html">Terms of Use</a></li>
+            <li><a href="/.well-known/security.txt">security.txt</a></li>
+          </ul>
+        </div>
+
+        <div>
+          <h2 class="title-4">Contact</h2>
+          <ul class="footer-list body-6">
+            <li><a href="mailto:support@squadair.app">support@squadair.app</a></li>
+            <li><a href="mailto:security@squadair.app">security@squadair.app</a></li>
+          </ul>
+        </div>
+      </div>
+
+      <div class="footer-bottom caption-2">
+        <span>SquadAir Contributors · MIT License</span>
+        <span>Zero cookies · Zero analytics · Zero accounts</span>
+      </div>
+    </div>
+  </footer>
+</body>
+</html>
