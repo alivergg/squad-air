@@ -32,11 +32,13 @@ use crate::ui::avatar::{
 };
 use crate::ui::share_modal::ShareSourceTab;
 use crate::ui::shortcut_normalizer::{matches_layout_agnostic_key, shortcut_normalizer};
+#[cfg_attr(feature = "ms_store", allow(unused_imports))]
 use crate::ui::theme::{
     material_dark_theme, pill_danger_button, pill_primary_button, pill_success_button,
     pill_tonal_button, root_container_style, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_OUTLINE,
     M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SURFACE_CONTAINER, M3_SURFACE_HIGH,
 };
+#[cfg_attr(feature = "ms_store", allow(unused_imports))]
 use iced::{
     advanced::subscription::{from_recipe, EventStream, Hasher, Recipe},
     alignment::Vertical,
@@ -196,12 +198,19 @@ pub enum Message {
     OverlayWindowOpened(iced::window::Id),
     OverlayConfigured,
     WindowCloseRequested(iced::window::Id),
+    #[cfg(not(feature = "ms_store"))]
     CheckForUpdatesManual,
+    #[cfg(not(feature = "ms_store"))]
     UpdateCheckCompleted(Result<Option<crate::updater::ReleaseInfo>, String>),
+    #[cfg(not(feature = "ms_store"))]
     OpenUpdateModal,
+    #[cfg(not(feature = "ms_store"))]
     DismissUpdateModal,
+    #[cfg(not(feature = "ms_store"))]
     SkipUpdateVersion,
+    #[cfg(not(feature = "ms_store"))]
     StartOneClickUpdate,
+    #[cfg(not(feature = "ms_store"))]
     UpdateInstallFinished(Result<String, String>),
     CopyMyFriendId,
     OpenAddFriendModal,
@@ -391,10 +400,15 @@ pub struct SquadApp {
     pub lan_join_password_error: Option<String>,
     pub lan_join_in_progress: bool,
     pub active_lan_locked: bool,
+    #[cfg(not(feature = "ms_store"))]
     pub available_update: Option<crate::updater::ReleaseInfo>,
+    #[cfg(not(feature = "ms_store"))]
     pub update_modal_open: bool,
+    #[cfg(not(feature = "ms_store"))]
     pub update_in_progress: bool,
+    #[cfg(not(feature = "ms_store"))]
     pub update_status_text: Option<String>,
+    #[cfg(not(feature = "ms_store"))]
     update_manual_check: bool,
     pub friends: Vec<FriendContact>,
     pub friend_presences: HashMap<[u8; 32], FriendPresenceUi>,
@@ -567,10 +581,15 @@ impl SquadApp {
             lan_join_password_error: None,
             lan_join_in_progress: false,
             active_lan_locked: false,
+            #[cfg(not(feature = "ms_store"))]
             available_update: None,
+            #[cfg(not(feature = "ms_store"))]
             update_modal_open: false,
+            #[cfg(not(feature = "ms_store"))]
             update_in_progress: false,
+            #[cfg(not(feature = "ms_store"))]
             update_status_text: None,
+            #[cfg(not(feature = "ms_store"))]
             update_manual_check: false,
             friends,
             friend_presences: HashMap::new(),
@@ -591,20 +610,24 @@ impl SquadApp {
         };
         app.sync_presence_to_mesh();
 
-        let update_task = Task::perform(
-            async {
-                tokio::task::spawn_blocking(crate::updater::check_latest_release)
-                    .await
-                    .map_err(|e| format!("Update check failed: {e}"))
-                    .and_then(|res| res)
-            },
-            Message::UpdateCheckCompleted,
-        );
+        #[cfg(not(feature = "ms_store"))]
+        let startup_task = {
+            let update_task = Task::perform(
+                async {
+                    tokio::task::spawn_blocking(crate::updater::check_latest_release)
+                        .await
+                        .map_err(|e| format!("Update check failed: {e}"))
+                        .and_then(|res| res)
+                },
+                Message::UpdateCheckCompleted,
+            );
+            Task::batch([open_main_task.map(Message::WindowOpened), update_task])
+        };
 
-        (
-            app,
-            Task::batch([open_main_task.map(Message::WindowOpened), update_task]),
-        )
+        #[cfg(feature = "ms_store")]
+        let startup_task = open_main_task.map(Message::WindowOpened);
+
+        (app, startup_task)
     }
 
     pub fn title(&self, window_id: iced::window::Id) -> String {
@@ -1599,6 +1622,7 @@ impl SquadApp {
                 self.add_friend_modal_open = false;
                 self.invite_friends_modal_open = false;
                 self.clear_lan_password_modal(true);
+                #[cfg(not(feature = "ms_store"))]
                 if !self.update_in_progress {
                     self.update_modal_open = false;
                 }
@@ -1971,6 +1995,7 @@ impl SquadApp {
                     .try_send(MeshCommand::SetLocalAvatar { avatar: None });
                 Task::none()
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::CheckForUpdatesManual => {
                 self.update_manual_check = true;
                 self.update_status_text = Some("Checking GitHub Releases...".to_string());
@@ -1984,6 +2009,7 @@ impl SquadApp {
                     Message::UpdateCheckCompleted,
                 )
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::UpdateCheckCompleted(result) => {
                 let is_manual = self.update_manual_check;
                 self.update_manual_check = false;
@@ -2002,7 +2028,7 @@ impl SquadApp {
                         if is_manual {
                             self.update_status_text = Some(format!(
                                 "You are up to date (v{}).",
-                                crate::updater::current_app_version()
+                                crate::current_app_version()
                             ));
                         }
                     }
@@ -2014,6 +2040,7 @@ impl SquadApp {
                 }
                 Task::none()
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::OpenUpdateModal => {
                 if self.available_update.is_some() {
                     self.update_modal_open = true;
@@ -2023,12 +2050,14 @@ impl SquadApp {
                 }
                 Task::none()
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::DismissUpdateModal => {
                 if !self.update_in_progress {
                     self.update_modal_open = false;
                 }
                 Task::none()
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::SkipUpdateVersion => {
                 if !self.update_in_progress {
                     if let Some(ref info) = self.available_update {
@@ -2039,6 +2068,7 @@ impl SquadApp {
                 }
                 Task::none()
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::StartOneClickUpdate => {
                 if !self.update_in_progress {
                     if let Some(info) = self.available_update.clone() {
@@ -2060,6 +2090,7 @@ impl SquadApp {
                 }
                 Task::none()
             }
+            #[cfg(not(feature = "ms_store"))]
             Message::UpdateInstallFinished(result) => {
                 self.update_in_progress = false;
                 match result {
@@ -2363,21 +2394,22 @@ impl SquadApp {
             stack![base, incoming_call::view_invite_friends_modal(self)].into()
         } else if self.share_modal_open {
             stack![base, share_modal::view_share_modal(self)].into()
-        } else if self.update_modal_open {
-            if let Some(ref info) = self.available_update {
-                stack![
-                    base,
-                    view_update_modal(
-                        info,
-                        self.update_in_progress,
-                        self.update_status_text.as_deref()
-                    )
-                ]
-                .into()
-            } else {
-                base.into()
-            }
         } else {
+            #[cfg(not(feature = "ms_store"))]
+            if self.update_modal_open {
+                if let Some(ref info) = self.available_update {
+                    let modal: Element<'_, Message> = stack![
+                        base,
+                        view_update_modal(
+                            info,
+                            self.update_in_progress,
+                            self.update_status_text.as_deref()
+                        )
+                    ]
+                    .into();
+                    return shortcut_normalizer(modal);
+                }
+            }
             base.into()
         };
 
@@ -2689,12 +2721,13 @@ fn view_image_lightbox<'a>(
         .into()
 }
 
+#[cfg(not(feature = "ms_store"))]
 fn view_update_modal<'a>(
     info: &'a crate::updater::ReleaseInfo,
     in_progress: bool,
     status_text: Option<&'a str>,
 ) -> Element<'a, Message> {
-    let current = crate::updater::current_app_version();
+    let current = crate::current_app_version();
     let header = column![
         text(format!("Update Available: SquadAir {}", info.tag_name))
             .size(19)

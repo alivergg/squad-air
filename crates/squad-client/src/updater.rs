@@ -22,10 +22,6 @@ pub struct ReleaseInfo {
     pub notes: String,
 }
 
-pub fn current_app_version() -> &'static str {
-    option_env!("SQUADAIR_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
-}
-
 pub fn parse_version_tag(raw: &str) -> Option<(u32, u32, u32)> {
     let clean = raw.trim().trim_start_matches(['v', 'V']);
     if clean.is_empty() {
@@ -601,7 +597,7 @@ pub fn check_latest_release() -> Result<Option<ReleaseInfo>, String> {
         return Ok(None);
     };
 
-    if is_newer_version(current_app_version(), &info.tag_name) {
+    if is_newer_version(crate::current_app_version(), &info.tag_name) {
         Ok(Some(info))
     } else {
         Ok(None)

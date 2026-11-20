@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+ms_store = []
+
 [[bin]]
 name = "squad-client"
 path = "src/main.rs"

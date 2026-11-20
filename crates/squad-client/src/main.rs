@@ -6,9 +6,14 @@ mod hotkeys;
 mod net;
 mod tray;
 mod ui;
+#[cfg(not(feature = "ms_store"))]
 mod updater;
 
 use ui::SquadApp;
+
+pub fn current_app_version() -> &'static str {
+    option_env!("SQUADAIR_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+}
 
 #[cfg(target_os = "macos")]
 const INFO_PLIST_STR: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
