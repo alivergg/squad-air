@@ -699,6 +699,7 @@ pub enum P2pMsgType {
     LanHostMigrate = 0x14,
     LanHostClaim = 0x15,
     MeshReachability = 0x16,
+    IdentityAnnounce = 0x17,
     AudioOpus = 0x20,
     AudioDtxKeepalive = 0x21,
     ChatText = 0x30,
@@ -727,6 +728,7 @@ impl P2pMsgType {
             0x14 => Ok(Self::LanHostMigrate),
             0x15 => Ok(Self::LanHostClaim),
             0x16 => Ok(Self::MeshReachability),
+            0x17 => Ok(Self::IdentityAnnounce),
             0x20 => Ok(Self::AudioOpus),
             0x21 => Ok(Self::AudioDtxKeepalive),
             0x30 => Ok(Self::ChatText),
@@ -842,6 +844,9 @@ pub enum P2pPayload {
     MeshReachability {
         direct_peers: Vec<PeerId>,
     },
+    IdentityAnnounce {
+        pub_key: [u8; 32],
+    },
     AudioOpus {
         opus_data: Vec<u8>,
     },
@@ -929,6 +934,7 @@ impl P2pPayload {
             P2pPayload::LanHostMigrate { .. } => P2pMsgType::LanHostMigrate,
             P2pPayload::LanHostClaim { .. } => P2pMsgType::LanHostClaim,
             P2pPayload::MeshReachability { .. } => P2pMsgType::MeshReachability,
+            P2pPayload::IdentityAnnounce { .. } => P2pMsgType::IdentityAnnounce,
             P2pPayload::AudioOpus { .. } => P2pMsgType::AudioOpus,
             P2pPayload::AudioDtxKeepalive => P2pMsgType::AudioDtxKeepalive,
             P2pPayload::ChatText { .. } => P2pMsgType::ChatText,
@@ -985,6 +991,9 @@ impl P2pPayload {
                 for pid in direct_peers.iter().take(count) {
                     out.extend_from_slice(&pid.to_be_bytes());
                 }
+            }
+            P2pPayload::IdentityAnnounce { pub_key } => {
+                out.extend_from_slice(pub_key);
             }
             P2pPayload::AudioOpus { opus_data } => {
                 if opus_data.len() > 1024 {
@@ -1207,6 +1216,12 @@ impl P2pPayload {
                     direct_peers.push(u16::from_be_bytes([body[off], body[off + 1]]));
                 }
                 Ok(P2pPayload::MeshReachability { direct_peers })
+            }
+            P2pMsgType::IdentityAnnounce => {
+                need_bytes(body, 0, 32)?;
+                let mut pub_key = [0u8; 32];
+                pub_key.copy_from_slice(&body[0..32]);
+                Ok(P2pPayload::IdentityAnnounce { pub_key })
             }
             P2pMsgType::AudioOpus => {
                 need_bytes(body, 0, 2)?;
@@ -1904,6 +1919,17 @@ mod tests {
         assert!(P2pMsgType::AudioOpus.is_server_relay_allowed());
         assert!(P2pMsgType::ChatText.is_server_relay_allowed());
         assert!(P2pMsgType::MeshReachability.is_server_relay_allowed());
+        assert!(P2pMsgType::IdentityAnnounce.is_server_relay_allowed());
+
+        let id_payload = P2pPayload::IdentityAnnounce {
+            pub_key: [0x5A; 32],
+        };
+        let mut id_wire = Vec::new();
+        id_payload.encode_body(&mut id_wire).unwrap();
+        assert_eq!(
+            P2pPayload::decode_body(P2pMsgType::IdentityAnnounce, &id_wire).unwrap(),
+            id_payload
+        );
         assert!(!P2pMsgType::VideoFrameFrag.is_server_relay_allowed());
         assert!(!P2pMsgType::StreamAudioOpus.is_server_relay_allowed());
         assert!(!P2pMsgType::StreamSubscribe.is_server_relay_allowed());

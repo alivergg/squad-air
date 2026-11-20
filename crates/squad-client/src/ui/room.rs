@@ -73,7 +73,10 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     let online_friends_count = app
         .friends
         .iter()
-        .filter(|f| app.friend_presences.contains_key(&f.pub_key))
+        .filter(|f| {
+            app.friend_presences.contains_key(&f.pub_key)
+                && !app.is_friend_in_current_room(&f.pub_key)
+        })
         .count();
     let invite_btn_label = if online_friends_count > 0 {
         format!("Invite ({online_friends_count})")

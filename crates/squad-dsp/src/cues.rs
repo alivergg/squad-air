@@ -204,12 +204,62 @@ impl SoundCueBank {
     }
 
     fn normalize_cue_samples(mut samples: Vec<f32>) -> Vec<f32> {
+        if samples.is_empty() {
+            return samples;
+        }
+
+        // Gentle 1st-order 85 Hz high-pass filter removes DC offset and sub-bass boom
+        // that otherwise saturate small speakers and the soft limiter.
+        let rc = 1.0 / (2.0 * std::f32::consts::PI * 85.0);
+        let dt = 1.0 / (SAMPLE_RATE as f32);
+        let alpha = rc / (rc + dt);
+        let mut prev_x = samples[0];
+        let mut prev_y = 0.0f32;
+        for s in &mut samples {
+            let x = if s.is_finite() { *s } else { 0.0 };
+            let y = alpha * (prev_y + x - prev_x);
+            prev_x = x;
+            prev_y = y;
+            *s = y;
+        }
+
         let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
-        if peak > 0.01 && peak < 0.45 {
-            let gain = 0.60 / peak;
-            for s in &mut samples {
-                *s = (*s * gain).clamp(-1.0, 1.0);
+        if peak <= 1e-4 {
+            return samples;
+        }
+
+        // Match perceptual loudness across all cues via active RMS (ignoring trailing silence)
+        // while keeping the peak strictly under the soft limiter threshold even at 200% cue gain.
+        let activity_gate = peak * 0.05;
+        let (sum_sq, active_count) = samples.iter().fold((0.0f64, 0usize), |(acc, cnt), &s| {
+            if s.abs() > activity_gate {
+                (acc + (s as f64) * (s as f64), cnt + 1)
+            } else {
+                (acc, cnt)
             }
+        });
+        let active_rms = if active_count > 0 {
+            ((sum_sq / active_count as f64).sqrt() as f32).max(1e-4)
+        } else {
+            peak * 0.5
+        };
+
+        const TARGET_ACTIVE_RMS: f32 = 0.085;
+        const MAX_CUE_PEAK: f32 = 0.36;
+        let gain = (TARGET_ACTIVE_RMS / active_rms).min(MAX_CUE_PEAK / peak);
+
+        let fade_len = ((SAMPLE_RATE as usize) * 5 / 1000).min(samples.len() / 2);
+        let len = samples.len();
+        for (idx, s) in samples.iter_mut().enumerate() {
+            let mut env = 1.0f32;
+            if idx < fade_len {
+                env = env.min(idx as f32 / fade_len as f32);
+            }
+            let rem = len.saturating_sub(1 + idx);
+            if rem < fade_len {
+                env = env.min(rem as f32 / fade_len as f32);
+            }
+            *s = (*s * gain * env).clamp(-MAX_CUE_PEAK, MAX_CUE_PEAK);
         }
         samples
     }
@@ -395,6 +445,13 @@ mod tests {
                 .get(cue)
                 .unwrap_or_else(|| panic!("missing cue {:?}", cue));
             assert!(!samples.is_empty(), "empty cue {:?}", cue);
+            let peak = samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()));
+            assert!(
+                peak <= 0.365,
+                "cue {:?} peak {} exceeds anti-clipping ceiling",
+                cue,
+                peak
+            );
         }
     }
 

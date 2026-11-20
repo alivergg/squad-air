@@ -419,6 +419,14 @@ impl SquadApp {
             .any(|p| p.status == crate::net::PeerConnStatus::Relayed)
     }
 
+    pub(crate) fn is_friend_in_current_room(&self, pub_key: &[u8; 32]) -> bool {
+        self.screen == Screen::Room
+            && self
+                .peers
+                .iter()
+                .any(|p| p.pub_key.as_ref() == Some(pub_key))
+    }
+
     pub fn new() -> (Self, Task<Message>) {
         let config = AppConfig::load_or_create();
         let friends = load_friends();
@@ -971,11 +979,16 @@ impl SquadApp {
                                 .collect();
                         }
                         MeshEvent::IncomingFriendCall(call) => {
-                            self.incoming_call = Some(call);
-                            if self.is_in_tray {
-                                pending_tasks.extend(self.restore_from_tray());
-                            } else if let Some(id) = self.main_window_id {
-                                pending_tasks.push(iced::window::gain_focus(id));
+                            let already_in_same_room = self.screen == Screen::Room
+                                && InviteLink::parse(&self.active_invite_uri)
+                                    .is_ok_and(|inv| inv.room_id == call.invite.room_id);
+                            if !already_in_same_room {
+                                self.incoming_call = Some(call);
+                                if self.is_in_tray {
+                                    pending_tasks.extend(self.restore_from_tray());
+                                } else if let Some(id) = self.main_window_id {
+                                    pending_tasks.push(iced::window::gain_focus(id));
+                                }
                             }
                         }
                         MeshEvent::ShortCodeGenerated {
@@ -2167,6 +2180,9 @@ impl SquadApp {
                 Task::none()
             }
             Message::InviteFriendToParty(pub_key) => {
+                if self.is_friend_in_current_room(&pub_key) {
+                    return Task::none();
+                }
                 let _ = self.mesh_tx.try_send(MeshCommand::CallOrInviteFriend {
                     target_pub_key: pub_key,
                 });

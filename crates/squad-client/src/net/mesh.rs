@@ -115,6 +115,7 @@ pub struct DecodedVideoFrame {
 pub struct PeerUiSnapshot {
     pub peer_id: PeerId,
     pub client_uuid: ClientUuid,
+    pub pub_key: Option<[u8; 32]>,
     pub nickname: String,
     pub status: PeerConnStatus,
     pub route: PeerRouteKind,
@@ -266,6 +267,7 @@ pub enum MeshEvent {
 
 struct RemotePeerState {
     record: PeerRecord,
+    pub_key: Option<[u8; 32]>,
     status: PeerConnStatus,
     active_addr: Option<SocketAddr>,
     mesh_relay_peer: Option<PeerId>,
@@ -364,6 +366,7 @@ struct ActiveSession {
     cipher: RoomCipher,
     room_prefix: [u8; 4],
     local_uuid: ClientUuid,
+    local_pub_key: [u8; 32],
     nickname: String,
     local_peer_id: PeerId,
     lan_addrs: Vec<std::net::SocketAddrV4>,
@@ -1237,6 +1240,7 @@ pub fn spawn_mesh_worker(
                             }
                             if let Some(sess) = session.as_mut() {
                                 sess.nickname = nickname;
+                                sess.local_pub_key = presence.my_pub_key;
                             }
                             send_presence_ping_and_query(&socket, &presence, session.is_some())
                                 .await;
@@ -1250,8 +1254,23 @@ pub fn spawn_mesh_worker(
                                     .await;
                                 continue;
                             };
+                            if target_pub_key == presence.my_pub_key {
+                                continue;
+                            }
                             let (invite, is_party_invite, relay_rv_addr) =
                                 if let Some(sess) = session.as_ref() {
+                                    if sess
+                                        .peers
+                                        .values()
+                                        .any(|p| p.pub_key == Some(target_pub_key))
+                                    {
+                                        evt_tx
+                                            .send(MeshEvent::Error(
+                                                "This friend is already in the room".to_string(),
+                                            ))
+                                            .await;
+                                        continue;
+                                    }
                                     if sess.embedded_rv.is_some() {
                                         evt_tx
                                             .send(MeshEvent::Error(
@@ -2399,6 +2418,9 @@ pub fn spawn_mesh_worker(
                         if sess.cipher.seal_packet(&hdr, &payload, &mut seal_buf).is_ok() {
                             send_sealed_to_peer(&socket, sess, pid, P2pMsgType::Ping, &seal_buf, &mut relay_buf).await;
                         }
+                        if sess.peers.get(&pid).is_some_and(|p| p.pub_key.is_none()) {
+                            send_identity_announce_to_peer(&socket, sess, pid, &mut seal_buf, &mut relay_buf).await;
+                        }
                     }
 
                     broadcast_mesh_reachability_if_needed(&socket, sess, &mut seal_buf, &mut relay_buf, true).await;
@@ -2428,6 +2450,7 @@ pub fn spawn_mesh_worker(
                             snapshots.push(PeerUiSnapshot {
                                 peer_id,
                                 client_uuid: p.record.client_uuid,
+                                pub_key: p.pub_key,
                                 nickname: p.record.nickname.clone(),
                                 status: p.status,
                                 route: classify_peer_route(p.status, p.active_addr),
@@ -2624,6 +2647,7 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                         rec.peer_id,
                         RemotePeerState {
                             record: rec,
+                            pub_key: None,
                             status: PeerConnStatus::Punching,
                             active_addr: None,
                             mesh_relay_peer: None,
@@ -2996,6 +3020,14 @@ async fn handle_p2p_rx(
                 )
                 .await;
             }
+            send_identity_announce_to_peer(
+                socket,
+                sess,
+                header.sender_peer_id,
+                io.seal_buf,
+                io.relay_buf,
+            )
+            .await;
         }
     }
 
@@ -3139,6 +3171,13 @@ async fn handle_p2p_rx(
                     io.evt_tx,
                 )
                 .await;
+            }
+        }
+        P2pPayload::IdentityAnnounce { pub_key } => {
+            if pub_key != [0u8; 32] {
+                if let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) {
+                    peer.pub_key = Some(pub_key);
+                }
             }
         }
         P2pPayload::AudioOpus { opus_data } => {
@@ -3649,6 +3688,39 @@ fn peer_endpoint(sess: &ActiveSession, peer_id: PeerId) -> Option<PeerEndpoint> 
             peer_id,
         }),
         PeerConnStatus::Punching | PeerConnStatus::NatFailed => None,
+    }
+}
+
+async fn send_identity_announce_to_peer(
+    socket: &UdpSocket,
+    sess: &mut ActiveSession,
+    peer_id: PeerId,
+    seal_buf: &mut Vec<u8>,
+    relay_buf: &mut Vec<u8>,
+) {
+    if sess.local_peer_id == 0 || sess.local_pub_key == [0u8; 32] {
+        return;
+    }
+    sess.control_seq = sess.control_seq.wrapping_add(1);
+    let hdr = P2pHeader {
+        msg_type: P2pMsgType::IdentityAnnounce,
+        room_prefix: sess.room_prefix,
+        sender_peer_id: sess.local_peer_id,
+        seq_num: sess.control_seq,
+    };
+    let body = P2pPayload::IdentityAnnounce {
+        pub_key: sess.local_pub_key,
+    };
+    if sess.cipher.seal_packet(&hdr, &body, seal_buf).is_ok() {
+        send_sealed_to_peer(
+            socket,
+            sess,
+            peer_id,
+            P2pMsgType::IdentityAnnounce,
+            seal_buf,
+            relay_buf,
+        )
+        .await;
     }
 }
 
@@ -4241,6 +4313,7 @@ async fn init_session(
     invite: InviteLink,
     nickname: String,
     client_uuid: ClientUuid,
+    local_pub_key: [u8; 32],
     bound_port: u16,
     pending_local_avatar: Option<([u8; 32], Vec<u8>)>,
     local_encoder_backend: String,
@@ -4272,6 +4345,7 @@ async fn init_session(
         cipher,
         room_prefix,
         local_uuid: client_uuid,
+        local_pub_key,
         nickname,
         local_peer_id: 0,
         lan_addrs,
@@ -4546,6 +4620,7 @@ async fn activate_joined_session(
         invite,
         nickname,
         client_uuid,
+        ctx.presence.my_pub_key,
         ctx.bound_port,
         ctx.pending_local_avatar.clone(),
         ctx.local_encoder_backend.to_string(),
@@ -4723,6 +4798,12 @@ async fn handle_global_signaling_packet(
             };
             match open_friend_invite(sk, sender_pub_key, ephemeral_pub_key, nonce, ciphertext) {
                 Ok(dec) => {
+                    if session
+                        .as_ref()
+                        .is_some_and(|s| s.invite.room_id == dec.invite.room_id)
+                    {
+                        return true;
+                    }
                     let is_known_friend = presence.friend_pub_keys.contains(sender_pub_key);
                     audio_engine.play_cue(SoundCue::IncomingCall);
                     evt_tx
@@ -5182,6 +5263,7 @@ mod tests {
                 cipher,
                 room_prefix: invite.room_prefix(),
                 local_uuid: [uuid_b; 16],
+                local_pub_key: [0u8; 32],
                 nickname: nick.to_string(),
                 local_peer_id: local_pid,
                 lan_addrs: Vec::new(),
@@ -5231,6 +5313,7 @@ mod tests {
                     lan_addrs: Vec::new(),
                     nickname: nick.to_string(),
                 },
+                pub_key: None,
                 status,
                 active_addr: addr,
                 mesh_relay_peer: None,
@@ -6010,6 +6093,59 @@ mod tests {
         assert!(
             b_got && c_got,
             "Both Bob and Charlie must decrypt Alice's party chat"
+        );
+
+        // 4. Alice must now know Bob & Charlie's pub_keys in the room and reject re-inviting Bob.
+        let id_deadline = Instant::now() + Duration::from_secs(3);
+        let mut a_knows_bob = false;
+        while Instant::now() < id_deadline && !a_knows_bob {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers.iter().any(|p| p.pub_key == Some(pk_b)) {
+                        a_knows_bob = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            a_knows_bob,
+            "Alice must receive Bob's E2EE IdentityAnnounce inside the room"
+        );
+
+        tx_a.send(MeshCommand::CallOrInviteFriend {
+            target_pub_key: pk_b,
+        })
+        .await
+        .unwrap();
+
+        let dup_deadline = Instant::now() + Duration::from_millis(250);
+        let mut a_got_error = false;
+        let mut bob_got_dup_call = false;
+        while Instant::now() < dup_deadline {
+            while let Ok(ev) = rx_a.try_recv() {
+                if matches!(ev, MeshEvent::Error(ref msg) if msg.contains("already in the room")) {
+                    a_got_error = true;
+                }
+                assert!(
+                    !matches!(ev, MeshEvent::FriendInviteSent { target_pub_key } if target_pub_key == pk_b),
+                    "Alice must not emit FriendInviteSent for peer already in room"
+                );
+            }
+            while let Ok(ev) = rx_b.try_recv() {
+                if matches!(ev, MeshEvent::IncomingFriendCall(_)) {
+                    bob_got_dup_call = true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            a_got_error,
+            "Alice must receive error when attempting to re-invite Bob who is already in room"
+        );
+        assert!(
+            !bob_got_dup_call,
+            "Bob must never receive duplicate call invite while already in the same room"
         );
 
         let _ = tx_a.send(MeshCommand::Shutdown).await;

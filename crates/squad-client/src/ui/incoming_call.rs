@@ -235,14 +235,23 @@ pub fn view_invite_friends_modal(app: &SquadApp) -> Element<'_, Message> {
                 .filter(|p| !p.nickname.trim().is_empty())
                 .map(|p| p.nickname.as_str())
                 .unwrap_or(friend.nickname.as_str());
-            let (status_label, status_color) = match presence {
-                Some(p) if p.in_room => ("In Voice Room", M3_WARNING),
-                Some(_) => ("Online", M3_SUCCESS),
-                None => ("Offline", M3_ON_SURFACE_VARIANT),
+            let in_this_room = app.is_friend_in_current_room(&friend.pub_key);
+            let (status_label, status_color) = if in_this_room {
+                ("In This Room", M3_SUCCESS)
+            } else {
+                match presence {
+                    Some(p) if p.in_room => ("In Voice Room", M3_WARNING),
+                    Some(_) => ("Online", M3_SUCCESS),
+                    None => ("Offline", M3_ON_SURFACE_VARIANT),
+                }
             };
             let invited = app.invited_friends_session.contains(&friend.pub_key);
 
-            let action_btn = if invited {
+            let action_btn = if in_this_room {
+                button(text("In Room ✓").size(12))
+                    .padding([7, 14])
+                    .style(pill_tonal_button)
+            } else if invited {
                 button(text("Invited ✓").size(12))
                     .padding([7, 14])
                     .style(pill_success_button)
