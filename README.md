@@ -9,6 +9,7 @@
 </p>
 
 <p align="center">
+  <a href="https://squadair.app/"><img src="https://img.shields.io/badge/Website-squadair.app-3B82F6?style=flat-square" alt="Official Website — squadair.app" /></a>
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/ci.yml?branch=main&label=CI&style=flat-square" alt="CI" /></a>
   <a href=".github/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/release.yml?branch=main&label=Release&style=flat-square" alt="Release" /></a>
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2021%20(Pure%20Native)-orange?style=flat-square&logo=rust" alt="Rust 2021" /></a>
@@ -20,6 +21,7 @@
 </p>
 
 <p align="center">
+  <a href="https://squadair.app/"><strong>Website (squadair.app)</strong></a> •
   <a href="#why-squadair">Why SquadAir?</a> •
   <a href="#benchmarks">Benchmarks</a> •
   <a href="#features">Features</a> •
@@ -29,7 +31,7 @@
 
 ---
 
-**SquadAir** sends voice, 1080p60 screen streams, screenshots, and files **directly peer-to-peer over a single encrypted UDP socket** (`ChaCha20-Poly1305`). No Electron runtime, no central media servers, no accounts, and no background bloat stealing 1% lows during clutch rounds.
+[**SquadAir**](https://squadair.app/) sends voice, 1080p60 screen streams, screenshots, and files **directly peer-to-peer over a single encrypted UDP socket** (`ChaCha20-Poly1305`). No Electron runtime, no central media servers, no accounts, and no background bloat stealing 1% lows during clutch rounds.
 
 ---
 

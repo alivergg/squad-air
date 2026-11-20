@@ -215,5 +215,7 @@ jobs:
           tag_name: ${{ needs.prepare-version.outputs.version_tag }}
           name: "SquadAir ${{ needs.prepare-version.outputs.version_tag }}"
           target_commitish: ${{ github.sha }}
+          body: |
+            Official website & downloads: **https://squadair.app/**
           generate_release_notes: true
           files: release-assets/*
