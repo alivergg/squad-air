@@ -281,12 +281,9 @@ where
         renderer: &Renderer,
         translation: Vector,
     ) -> Option<overlay::Element<'b, Message, Theme, Renderer>> {
-        self.content.as_widget_mut().overlay(
-            &mut tree.children[0],
-            layout,
-            renderer,
-            translation,
-        )
+        self.content
+            .as_widget_mut()
+            .overlay(&mut tree.children[0], layout, renderer, translation)
     }
 }
 
