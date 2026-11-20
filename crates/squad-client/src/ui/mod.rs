@@ -8,6 +8,7 @@ pub mod overlay_platform;
 pub mod room;
 pub mod settings;
 pub mod share_modal;
+pub mod shortcut_normalizer;
 pub mod stream_view;
 pub mod theme;
 pub mod video_shader;
@@ -30,6 +31,7 @@ use crate::ui::avatar::{
     save_cached_avatar_jpeg, AvatarCache,
 };
 use crate::ui::share_modal::ShareSourceTab;
+use crate::ui::shortcut_normalizer::{matches_layout_agnostic_key, shortcut_normalizer};
 use crate::ui::theme::{
     material_dark_theme, pill_danger_button, pill_primary_button, pill_success_button,
     pill_tonal_button, root_container_style, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_OUTLINE,
@@ -2340,22 +2342,20 @@ impl SquadApp {
             .height(Length::Fill)
             .style(root_container_style);
 
-        if let Some(ref call) = self.incoming_call {
-            return stack![base, incoming_call::view_incoming_call_modal(self, call)].into();
-        }
-
-        if let Some(blob_id) = self.lightbox_blob_id {
+        let root: Element<'_, Message> = if let Some(ref call) = self.incoming_call {
+            stack![base, incoming_call::view_incoming_call_modal(self, call)].into()
+        } else if let Some(blob_id) = self.lightbox_blob_id {
             if let Some(handle) = self.image_handles.get(&blob_id) {
                 let title = self
                     .inline_image_bytes
                     .get(&blob_id)
                     .map(|(name, _)| name.as_str())
                     .unwrap_or("Image Preview");
-                return stack![base, view_image_lightbox(blob_id, title, handle.clone())].into();
+                stack![base, view_image_lightbox(blob_id, title, handle.clone())].into()
+            } else {
+                base.into()
             }
-        }
-
-        if let Some(ref lan_room) = self.lan_password_modal_room {
+        } else if let Some(ref lan_room) = self.lan_password_modal_room {
             stack![base, incoming_call::view_lan_password_modal(self, lan_room)].into()
         } else if self.add_friend_modal_open {
             stack![base, incoming_call::view_add_friend_modal(self)].into()
@@ -2379,7 +2379,9 @@ impl SquadApp {
             }
         } else {
             base.into()
-        }
+        };
+
+        shortcut_normalizer(root)
     }
 
     fn rebind_hotkeys(&self) {
@@ -2954,29 +2956,17 @@ fn listen_normal_event(
         return None;
     };
 
-    let is_c = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("c"))
-        || matches!(
-            physical_key,
-            keyboard::key::Physical::Code(keyboard::key::Code::KeyC)
-        );
-    if modifiers.command() && is_c && status != iced::event::Status::Captured {
+    let is_c = matches_layout_agnostic_key(&key, physical_key, b'c', keyboard::key::Code::KeyC);
+    if modifiers.command() && !modifiers.alt() && is_c && status != iced::event::Status::Captured {
         return Some(Message::CopySelectedChatText);
     }
-    let is_v = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("v"))
-        || matches!(
-            physical_key,
-            keyboard::key::Physical::Code(keyboard::key::Code::KeyV)
-        );
-    if modifiers.command() && is_v {
+    let is_v = matches_layout_agnostic_key(&key, physical_key, b'v', keyboard::key::Code::KeyV);
+    if modifiers.command() && !modifiers.alt() && is_v {
         return Some(Message::PasteFromClipboard {
             text_input_focused: status == iced::event::Status::Captured,
         });
     }
-    let is_f = matches!(key, keyboard::Key::Character(ref ch) if ch.eq_ignore_ascii_case("f"))
-        || matches!(
-            physical_key,
-            keyboard::key::Physical::Code(keyboard::key::Code::KeyF)
-        );
+    let is_f = matches_layout_agnostic_key(&key, physical_key, b'f', keyboard::key::Code::KeyF);
     if status != iced::event::Status::Captured
         && !modifiers.command()
         && !modifiers.control()
