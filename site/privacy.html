@@ -8,7 +8,8 @@
   <meta name="theme-color" content="#181818">
   <link rel="canonical" href="https://squadair.app/privacy.html">
   <link rel="manifest" href="/site.webmanifest">
-  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/assets/img/icon-192.png" sizes="192x192" type="image/png">
   <link rel="stylesheet" href="assets/css/main.css">
   <script defer src="assets/js/app.js"></script>
 </head>
@@ -18,7 +19,10 @@
   <header class="site-header">
     <div class="header-inner">
       <a href="/" class="site-logo">
-        <img src="assets/img/logo.svg" width="28" height="28" alt="" aria-hidden="true">
+        <picture>
+          <source type="image/webp" srcset="assets/img/app-icon-64.webp">
+          <img src="assets/img/app-icon-64.png" width="28" height="28" class="brand-icon" alt="" aria-hidden="true">
+        </picture>
         <span>SquadAir</span>
       </a>
 
@@ -170,11 +174,14 @@
       <div class="footer-grid">
         <div style="display: grid; gap: var(--space-100); align-content: start;">
           <a href="/" class="site-logo">
-            <img src="assets/img/logo.svg" width="24" height="24" alt="" aria-hidden="true">
+            <picture>
+              <source type="image/webp" srcset="assets/img/app-icon-64.webp">
+              <img src="assets/img/app-icon-64.png" width="24" height="24" class="brand-icon" alt="" aria-hidden="true">
+            </picture>
             <span>SquadAir</span>
           </a>
           <p class="body-6 text-secondary" style="max-inline-size: 36ch;">
-            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the MIT License.
+            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the GNU AGPLv3 License.
           </p>
         </div>
 
@@ -207,7 +214,7 @@
       </div>
 
       <div class="footer-bottom caption-2">
-        <span>SquadAir Contributors · MIT License</span>
+        <span>SquadAir Contributors · GNU AGPLv3</span>
         <span>Zero cookies · Zero analytics · Zero accounts</span>
       </div>
     </div>

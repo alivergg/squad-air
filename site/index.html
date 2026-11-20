@@ -8,7 +8,7 @@
   <meta name="theme-color" content="#181818">
   <link rel="canonical" href="https://squadair.app/">
   <link rel="manifest" href="/site.webmanifest">
-  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.ico" sizes="any">
   <link rel="icon" href="/assets/img/icon-192.png" sizes="192x192" type="image/png">
   <link rel="apple-touch-icon" href="/assets/img/icon-192.png">
 
@@ -46,7 +46,7 @@
         "alternateName": "squadair",
         "applicationCategory": "CommunicationApplication",
         "operatingSystem": "Windows 10, Windows 11, macOS 13+",
-        "softwareVersion": "1.0.0",
+        "softwareVersion": "1.3",
         "downloadUrl": "https://github.com/alivergg/squad-air/releases/latest",
         "isAccessibleForFree": true,
         "license": "https://github.com/alivergg/squad-air/blob/main/LICENSE",
@@ -115,7 +115,10 @@
   <header class="site-header">
     <div class="header-inner">
       <a href="/" class="site-logo" aria-current="page">
-        <img src="assets/img/logo.svg" width="28" height="28" alt="" aria-hidden="true">
+        <picture>
+          <source type="image/webp" srcset="assets/img/app-icon-64.webp">
+          <img src="assets/img/app-icon-64.png" width="28" height="28" class="brand-icon" alt="" aria-hidden="true">
+        </picture>
         <span>SquadAir</span>
       </a>
 
@@ -164,24 +167,24 @@
     <section class="hero container" aria-labelledby="main-content">
       <div class="hero-top">
         <div class="hero-copy">
-          <div class="section-kicker caption-1">
+          <div class="section-kicker caption-1 hero-anim" style="--hero-delay: 0ms;">
             <span class="status-led" aria-hidden="true"></span>
-            <span>Native Rust 1.0.0 client and stateless coordinator</span>
+            <span>Native Rust v1.3 client and stateless coordinator</span>
           </div>
 
-          <h1 id="main-content" class="heading-1 hero-title" tabindex="-1">
+          <h1 id="main-content" class="heading-1 hero-title hero-anim" style="--hero-delay: 70ms;" tabindex="-1">
             P2P voice and 1080p60<br>without the FPS tax
           </h1>
 
-          <p class="hero-sub">
+          <p class="hero-sub hero-anim" style="--hero-delay: 140ms;">
             SquadAir (<span class="mono-num">squadair</span>) sends encrypted 10 ms Opus voice, 60 fps screen shares, and swarm files directly between teammates over one UDP socket. No Chromium shell, no accounts, and no central media server.
           </p>
 
-          <div class="hero-actions-wrap">
+          <div class="hero-actions-wrap hero-anim" style="--hero-delay: 210ms;">
             <div class="hero-actions">
               <a
                 href="https://github.com/alivergg/squad-air/releases/latest"
-                class="btn btn--primary btn--lg button-md"
+                class="btn btn--primary btn--lg btn--download button-md"
               >
                 <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <path d="M12 3v12m0 0-4.5-4.5M12 15l4.5-4.5M4 19.5h16"/>
@@ -208,7 +211,7 @@
             </div>
 
             <p class="caption-2 text-muted mono-num" data-download-artifact>
-              SquadAir-Setup-windows-x86_64.exe · ~35 MB standalone installer · Windows 10 &amp; 11
+              SquadAir-Setup-windows-x86_64.exe · 34.7 MB standalone installer · Windows 10 &amp; 11
             </p>
 
             <p class="hero-proof caption-1">
@@ -217,7 +220,7 @@
           </div>
         </div>
 
-        <aside class="hero-facts-rack" aria-label="SquadAir measured runtime specifications">
+        <aside class="hero-facts-rack hero-anim" style="--hero-delay: 260ms;" aria-label="SquadAir measured runtime specifications">
           <div class="rack-stat">
             <span class="caption-4 text-muted">Active call + 1080p60</span>
             <span class="rack-stat-value rack-stat-value--green mono-num">~48 MB</span>
@@ -279,23 +282,25 @@
           <div id="panel-room" class="tab-panel" role="tabpanel" aria-labelledby="tab-room">
             <div class="tab-panel-inner">
               <div class="screenshot-frame">
-                <picture>
-                  <source type="image/webp" srcset="assets/img/lobby.webp">
-                  <img
-                    src="assets/img/lobby.png"
-                    width="2696"
-                    height="1788"
-                    fetchpriority="high"
-                    loading="eager"
-                    class="screenshot-img"
-                    alt="SquadAir active voice room CS2 Lobby displaying a live 1080p60 Counter-Strike 2 stream, speaking indicator ring, P2P 6 ms readout, and encrypted room chat"
-                  >
-                </picture>
-                <div class="screenshot-highlight is-active" data-highlight-box style="inset-inline-start: 1%; inset-block-start: 14%; inline-size: 52%; block-size: 38%;" aria-hidden="true"></div>
+                <div class="screenshot-viewport">
+                  <picture>
+                    <source type="image/webp" srcset="assets/img/lobby.webp">
+                    <img
+                      src="assets/img/lobby.png"
+                      width="2696"
+                      height="1788"
+                      fetchpriority="high"
+                      loading="eager"
+                      class="screenshot-img"
+                      alt="SquadAir active voice room CS2 Lobby displaying a live 1080p60 Counter-Strike 2 stream, speaking indicator ring, P2P 6 ms readout, and encrypted room chat"
+                    >
+                  </picture>
+                  <div class="screenshot-highlight is-active" data-highlight-box style="inset-inline-start: 1%; inset-block-start: 13.85%; inline-size: 52.85%; block-size: 38%;" aria-hidden="true"></div>
+                </div>
               </div>
 
               <div class="callout-column" aria-label="Active room interface callouts">
-                <button type="button" class="callout-btn" data-callout-btn data-box="1,14,52,38" aria-pressed="true">
+                <button type="button" class="callout-btn" data-callout-btn data-box="1.0,13.85,52.85,38.0" aria-pressed="true">
                   <div class="callout-head">
                     <span class="title-4">1080p 60 FPS GPU stream viewer</span>
                     <span class="callout-index caption-4 mono-num">01</span>
@@ -303,7 +308,7 @@
                   <p class="body-6 text-secondary">Uploads frames straight into a persistent <span class="mono-num">wgpu::Texture</span> fragment shader with independent stream audio volume and zero capture load when unwatched.</p>
                 </button>
 
-                <button type="button" class="callout-btn" data-callout-btn data-box="1,53,52,40" aria-pressed="false">
+                <button type="button" class="callout-btn" data-callout-btn data-box="1.0,53.2,52.85,37.65" aria-pressed="false">
                   <div class="callout-head">
                     <span class="title-4">Voice telemetry &amp; 5x5 identicons</span>
                     <span class="callout-index caption-4 mono-num">02</span>
@@ -311,7 +316,7 @@
                   <p class="body-6 text-secondary">Live speaking LED border, <span class="mono-num">P2P · 6 ms · +10ms buf</span> jitter telemetry, and deterministic <span class="mono-num">BLAKE3</span> avatars with <span class="mono-num">0%–200%</span> per-peer gain.</p>
                 </button>
 
-                <button type="button" class="callout-btn" data-callout-btn data-box="54,14,45,78" aria-pressed="false">
+                <button type="button" class="callout-btn" data-callout-btn data-box="54.9,13.85,44.05,77.0" aria-pressed="false">
                   <div class="callout-head">
                     <span class="title-4">Encrypted chat &amp; clipboard screenshots</span>
                     <span class="callout-index caption-4 mono-num">03</span>
@@ -319,7 +324,7 @@
                   <p class="body-6 text-secondary">Paste screenshots with <kbd class="keycap">Ctrl/Cmd+V</kbd> for inline preview under <span class="mono-num">200 KB</span> or share files in <span class="mono-num">1024 B</span> <span class="mono-num">BLAKE3</span>-verified swarm chunks.</p>
                 </button>
 
-                <button type="button" class="callout-btn" data-callout-btn data-box="52,6,46,6" aria-pressed="false">
+                <button type="button" class="callout-btn" data-callout-btn data-box="54.0,5.2,44.8,7.1" aria-pressed="false">
                   <div class="callout-head">
                     <span class="title-4">6-Digit code &amp; party invites</span>
                     <span class="callout-index caption-4 mono-num">04</span>
@@ -333,23 +338,25 @@
           <div id="panel-lobby" class="tab-panel" role="tabpanel" aria-labelledby="tab-lobby" hidden="until-found">
             <div class="tab-panel-inner">
               <div class="screenshot-frame">
-                <picture>
-                  <source type="image/webp" srcset="assets/img/main.webp">
-                  <img
-                    src="assets/img/main.png"
-                    width="2696"
-                    height="1788"
-                    fetchpriority="low"
-                    loading="lazy"
-                    class="screenshot-img"
-                    alt="SquadAir lobby screen with 6-digit SPAKE2 voice code input, LAN room host options, saved channels sidebar, and X25519 friends list"
-                  >
-                </picture>
-                <div class="screenshot-highlight is-active" data-highlight-box style="inset-inline-start: 20%; inset-block-start: 13%; inline-size: 46%; block-size: 18%;" aria-hidden="true"></div>
+                <div class="screenshot-viewport">
+                  <picture>
+                    <source type="image/webp" srcset="assets/img/main.webp">
+                    <img
+                      src="assets/img/main.png"
+                      width="2696"
+                      height="1788"
+                      fetchpriority="low"
+                      loading="lazy"
+                      class="screenshot-img"
+                      alt="SquadAir lobby screen with 6-digit SPAKE2 voice code input, LAN room host options, saved channels sidebar, and X25519 friends list"
+                    >
+                  </picture>
+                  <div class="screenshot-highlight is-active" data-highlight-box style="inset-inline-start: 21.3%; inset-block-start: 14.3%; inline-size: 43.9%; block-size: 15.7%;" aria-hidden="true"></div>
+                </div>
               </div>
 
               <div class="callout-column" aria-label="Lobby interface callouts">
-                <button type="button" class="callout-btn" data-callout-btn data-box="20,13,46,18" aria-pressed="true">
+                <button type="button" class="callout-btn" data-callout-btn data-box="21.3,14.3,43.9,15.7" aria-pressed="true">
                   <div class="callout-head">
                     <span class="title-4">Quick 6-digit SPAKE2 voice code</span>
                     <span class="callout-index caption-4 mono-num">01</span>
@@ -357,7 +364,7 @@
                   <p class="body-6 text-secondary">Dictate <span class="mono-num">482-910</span> in game voice. <span class="mono-num">SPAKE2</span> derives an ephemeral session key so even the coordinator never sees your room secret.</p>
                 </button>
 
-                <button type="button" class="callout-btn" data-callout-btn data-box="20,32,46,29" aria-pressed="false">
+                <button type="button" class="callout-btn" data-callout-btn data-box="21.3,31.8,43.9,28.45" aria-pressed="false">
                   <div class="callout-head">
                     <span class="title-4">Private internet &amp; zero-config LAN rooms</span>
                     <span class="callout-index caption-4 mono-num">02</span>
@@ -365,7 +372,7 @@
                   <p class="body-6 text-secondary">Create an encrypted <span class="mono-num">squad://</span> link in one click or host a password-protected LAN room with automatic host failover.</p>
                 </button>
 
-                <button type="button" class="callout-btn" data-callout-btn data-box="67,5,32,90" aria-pressed="false">
+                <button type="button" class="callout-btn" data-callout-btn data-box="67.75,5.15,31.2,93.2" aria-pressed="false">
                   <div class="callout-head">
                     <span class="title-4">Decentralized X25519 friends directory</span>
                     <span class="callout-index caption-4 mono-num">03</span>
@@ -373,7 +380,7 @@
                   <p class="body-6 text-secondary">Stored locally in <span class="mono-num">friends.json</span>. Ring teammates via encrypted friend invites using your <span class="mono-num">sqf_</span> public identity key.</p>
                 </button>
 
-                <button type="button" class="callout-btn" data-callout-btn data-box="1,5,18,90" aria-pressed="false">
+                <button type="button" class="callout-btn" data-callout-btn data-box="1.0,5.15,17.8,93.2" aria-pressed="false">
                   <div class="callout-head">
                     <span class="title-4">Saved channels &amp; local profile</span>
                     <span class="callout-index caption-4 mono-num">04</span>
@@ -623,17 +630,17 @@
             <div class="benchmark-row">
               <span class="body-5">SquadAir</span>
               <div class="bar-track"><div class="bar-fill bar-fill--squadair" style="--ratio: 0.075"></div></div>
-              <span class="caption-1 mono-num bar-val bar-val--highlight">~48 MB</span>
+              <span class="caption-1 mono-num bar-val bar-val--highlight" data-count-to="48" data-count-prefix="~" data-count-suffix=" MB">~48 MB</span>
             </div>
             <div class="benchmark-row">
               <span class="body-6 text-secondary">TeamSpeak 6</span>
               <div class="bar-track"><div class="bar-fill bar-fill--ts" style="--ratio: 0.28"></div></div>
-              <span class="caption-2 mono-num bar-val">~190 MB</span>
+              <span class="caption-2 mono-num bar-val" data-count-to="190" data-count-prefix="~" data-count-suffix=" MB">~190 MB</span>
             </div>
             <div class="benchmark-row">
               <span class="body-6 text-secondary">Discord (Electron)</span>
               <div class="bar-track"><div class="bar-fill" style="--ratio: 1.0"></div></div>
-              <span class="caption-2 mono-num bar-val">~680+ MB</span>
+              <span class="caption-2 mono-num bar-val" data-count-to="680" data-count-prefix="~" data-count-suffix="+ MB">~680+ MB</span>
             </div>
           </div>
 
@@ -645,7 +652,7 @@
             <div class="benchmark-row">
               <span class="body-5">SquadAir</span>
               <div class="bar-track"><div class="bar-fill bar-fill--squadair" style="--ratio: 0.125"></div></div>
-              <span class="caption-1 mono-num bar-val bar-val--highlight">&lt; 1.5%</span>
+              <span class="caption-1 mono-num bar-val bar-val--highlight" data-count-to="1.5" data-count-decimals="1" data-count-prefix="< " data-count-suffix="%">&lt; 1.5%</span>
             </div>
             <div class="benchmark-row">
               <span class="body-6 text-secondary">TeamSpeak 6</span>
@@ -667,17 +674,17 @@
             <div class="benchmark-row">
               <span class="body-5">SquadAir</span>
               <div class="bar-track"><div class="bar-fill bar-fill--squadair" style="--ratio: 0.08"></div></div>
-              <span class="caption-1 mono-num bar-val bar-val--highlight">~21 MB</span>
+              <span class="caption-1 mono-num bar-val bar-val--highlight" data-count-to="21" data-count-prefix="~" data-count-suffix=" MB">~21 MB</span>
             </div>
             <div class="benchmark-row">
               <span class="body-6 text-secondary">TeamSpeak 6</span>
               <div class="bar-track"><div class="bar-fill bar-fill--ts" style="--ratio: 0.34"></div></div>
-              <span class="caption-2 mono-num bar-val">~120 MB</span>
+              <span class="caption-2 mono-num bar-val" data-count-to="120" data-count-prefix="~" data-count-suffix=" MB">~120 MB</span>
             </div>
             <div class="benchmark-row">
               <span class="body-6 text-secondary">Discord (Electron)</span>
               <div class="bar-track"><div class="bar-fill" style="--ratio: 1.0"></div></div>
-              <span class="caption-2 mono-num bar-val">~350+ MB</span>
+              <span class="caption-2 mono-num bar-val" data-count-to="350" data-count-prefix="~" data-count-suffix="+ MB">~350+ MB</span>
             </div>
           </div>
 
@@ -689,7 +696,7 @@
             <div class="benchmark-row">
               <span class="body-5">SquadAir</span>
               <div class="bar-track"><div class="bar-fill bar-fill--squadair" style="--ratio: 0.17"></div></div>
-              <span class="caption-1 mono-num bar-val bar-val--highlight">10 ms P2P</span>
+              <span class="caption-1 mono-num bar-val bar-val--highlight" data-count-to="10" data-count-suffix=" ms P2P">10 ms P2P</span>
             </div>
             <div class="benchmark-row">
               <span class="body-6 text-secondary">Cloud VoIP</span>
@@ -770,7 +777,7 @@
               </tr>
               <tr>
                 <th scope="row" class="body-5">Open source license</th>
-                <td class="body-6 cell-good">Yes (MIT)</td>
+                <td class="body-6 cell-good">Yes (GNU AGPLv3)</td>
                 <td class="body-6 text-secondary">No</td>
                 <td class="body-6 text-secondary">No</td>
               </tr>
@@ -947,8 +954,8 @@
         <h3 class="heading-3" id="faq-heading">Frequently Asked Questions</h3>
       </div>
 
-      <div class="faq-list" aria-labelledby="faq-heading" data-reveal>
-        <details class="faq-item" open>
+      <div class="faq-list" aria-labelledby="faq-heading">
+        <details class="faq-item" data-reveal open>
           <summary class="title-3">How does SquadAir work with zero accounts and end-to-end encryption</summary>
           <div class="faq-body">
             <p class="body-6">
@@ -957,7 +964,7 @@
           </div>
         </details>
 
-        <details class="faq-item">
+        <details class="faq-item" data-reveal>
           <summary class="title-3">Will SquadAir reduce FPS in CS2, Valorant, or Apex Legends</summary>
           <div class="faq-body">
             <p class="body-6">
@@ -966,7 +973,7 @@
           </div>
         </details>
 
-        <details class="faq-item">
+        <details class="faq-item" data-reveal>
           <summary class="title-3">Is 1080p 60fps screen sharing actually free without limits</summary>
           <div class="faq-body">
             <p class="body-6">
@@ -975,7 +982,7 @@
           </div>
         </details>
 
-        <details class="faq-item">
+        <details class="faq-item" data-reveal>
           <summary class="title-3">What happens on mobile hotspot CGNAT or symmetric corporate NAT</summary>
           <div class="faq-body">
             <p class="body-6">
@@ -984,11 +991,11 @@
           </div>
         </details>
 
-        <details class="faq-item">
+        <details class="faq-item" data-reveal>
           <summary class="title-3">Why does Windows SmartScreen warn on the first .exe launch</summary>
           <div class="faq-body">
             <p class="body-6">
-              Microsoft SmartScreen flags new unsigned open-source executables until enough users run them or the publisher buys a commercial EV certificate. You can click <span class="mono-num">More info</span> then <span class="mono-num">Run anyway</span>, verify the installer hash against <span class="mono-num">SHA256SUMS.txt</span> on GitHub Releases, or inspect and compile the MIT-licensed Rust code directly.
+              Microsoft SmartScreen flags new unsigned open-source executables until enough users run them or the publisher buys a commercial EV certificate. You can click <span class="mono-num">More info</span> then <span class="mono-num">Run anyway</span>, verify the installer hash against <span class="mono-num">SHA256SUMS.txt</span> on GitHub Releases, or inspect and compile the GNU AGPLv3-licensed Rust code directly.
             </p>
           </div>
         </details>
@@ -1004,12 +1011,15 @@
             Download the native Windows, macOS, or Linux release with SHA-256 verification or self-host <span class="mono-num">squad-rendezvous</span> on one UDP port.
           </p>
           <p class="caption-2 text-muted mono-num" data-download-artifact>
-            SquadAir-Setup-windows-x86_64.exe · ~35 MB standalone installer · Windows 10 &amp; 11
+            SquadAir-Setup-windows-x86_64.exe · 34.7 MB standalone installer · Windows 10 &amp; 11
           </p>
         </div>
 
         <div class="hero-actions">
-          <a href="https://github.com/alivergg/squad-air/releases/latest" class="btn btn--primary btn--lg button-md">
+          <a href="https://github.com/alivergg/squad-air/releases/latest" class="btn btn--primary btn--lg btn--download button-md">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M12 3v12m0 0-4.5-4.5M12 15l4.5-4.5M4 19.5h16"/>
+            </svg>
             <span data-download-label>Download for Windows (.exe)</span>
           </a>
           <a href="https://github.com/alivergg/squad-air/releases" class="btn btn--secondary btn--lg button-md">
@@ -1025,11 +1035,14 @@
       <div class="footer-grid">
         <div style="display: grid; gap: var(--space-100); align-content: start;">
           <a href="/" class="site-logo">
-            <img src="assets/img/logo.svg" width="24" height="24" alt="" aria-hidden="true">
+            <picture>
+              <source type="image/webp" srcset="assets/img/app-icon-64.webp">
+              <img src="assets/img/app-icon-64.png" width="24" height="24" class="brand-icon" alt="" aria-hidden="true">
+            </picture>
             <span>SquadAir</span>
           </a>
           <p class="body-6 text-secondary" style="max-inline-size: 36ch;">
-            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the MIT License.
+            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the GNU AGPLv3 License.
           </p>
         </div>
 
@@ -1064,7 +1077,7 @@
       </div>
 
       <div class="footer-bottom caption-2">
-        <span>SquadAir Contributors · MIT License</span>
+        <span>SquadAir Contributors · GNU AGPLv3</span>
         <span>Zero cookies · Zero analytics · Zero accounts</span>
       </div>
     </div>

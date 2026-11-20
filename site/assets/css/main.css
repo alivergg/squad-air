@@ -478,10 +478,25 @@ pre {
   line-height: 24px;
   font-weight: 600;
   padding-block: var(--space-50);
+  transition: transform 200ms var(--ease-out);
 }
 
 .site-logo:hover {
   color: var(--text-primary);
+  transform: translateY(-1px);
+}
+
+.brand-icon {
+  border-radius: 7px;
+  flex-shrink: 0;
+}
+
+section[id],
+div[id],
+article[id],
+h2[id],
+h3[id] {
+  scroll-margin-top: 88px;
 }
 
 .site-nav {
@@ -508,11 +523,20 @@ pre {
   background-color: var(--bg-raised);
   color: var(--text-primary);
   cursor: pointer;
-  transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+  transition:
+    transform 200ms var(--ease-out),
+    background-color 200ms var(--ease-out),
+    border-color 200ms var(--ease-out),
+    color 200ms var(--ease-out);
 }
 
 .menu-button:hover {
   background-color: var(--bg-hover);
+  transform: translateY(-1px);
+}
+
+.menu-button:active {
+  transform: scale(0.975);
 }
 
 .site-menu {
@@ -612,6 +636,22 @@ pre {
   padding: var(--space-75) var(--space-100);
 }
 
+.site-header.is-wide .site-menu a::after {
+  content: "";
+  position: absolute;
+  inset-block-end: 4px;
+  inset-inline: var(--space-100);
+  border-block-end: 2px solid var(--accent-ink);
+  transform: scaleX(0);
+  transform-origin: center;
+  transition: transform 220ms var(--ease-out);
+}
+
+.site-header.is-wide .site-menu a:hover::after,
+.site-header.is-wide .site-menu a[aria-current="page"]::after {
+  transform: scaleX(1);
+}
+
 .nav-github-link {
   display: none;
 }
@@ -626,12 +666,20 @@ pre {
     border-radius: var(--radius-md);
     color: var(--text-secondary);
     text-decoration: none;
-    transition: color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
+    transition:
+      transform 200ms var(--ease-out),
+      color 200ms var(--ease-out),
+      background-color 200ms var(--ease-out);
   }
 
   .nav-github-link:hover {
     color: var(--text-primary);
     background-color: var(--bg-raised);
+    transform: translateY(-1px);
+  }
+
+  .nav-github-link:active {
+    transform: scale(0.975);
   }
 }
 
@@ -648,14 +696,29 @@ pre {
   text-decoration: none;
   cursor: pointer;
   transition:
-    background-color var(--dur-fast) var(--ease-out),
-    border-color var(--dur-fast) var(--ease-out),
-    color var(--dur-fast) var(--ease-out),
-    transform var(--dur-fast) var(--ease-out);
+    transform 220ms var(--ease-out),
+    background-color 220ms var(--ease-out),
+    border-color 220ms var(--ease-out),
+    box-shadow 220ms var(--ease-out),
+    color 220ms var(--ease-out);
+}
+
+.btn svg {
+  transition: transform 220ms var(--ease-out);
+}
+
+.btn:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.38);
+}
+
+.btn--download:hover svg {
+  transform: translateY(2px);
 }
 
 .btn:active {
-  transform: scale(0.98);
+  transform: translateY(1px) scale(0.965);
+  box-shadow: none;
 }
 
 .btn--lg {
@@ -672,6 +735,7 @@ pre {
 .btn--primary:hover {
   background-color: var(--accent-hover);
   color: #FFFFFF;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 8px 20px rgba(0, 0, 0, 0.4);
 }
 
 .btn--secondary {
@@ -788,12 +852,21 @@ pre {
   background-color: transparent;
   color: var(--text-secondary);
   cursor: pointer;
-  transition: background-color var(--dur-fast) var(--ease-out), color var(--dur-fast) var(--ease-out);
+  transition:
+    transform 200ms var(--ease-out),
+    background-color 200ms var(--ease-out),
+    border-color 200ms var(--ease-out),
+    color 200ms var(--ease-out);
 }
 
 .os-btn:hover {
   color: var(--text-primary);
   background-color: var(--bg-raised);
+  transform: translateY(-1px);
+}
+
+.os-btn:active {
+  transform: scale(0.975);
 }
 
 .os-btn[aria-pressed="true"] {
@@ -833,6 +906,31 @@ pre {
   border-radius: var(--radius-md);
   background-color: var(--bg-inset);
   border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.rack-stat:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+}
+
+@keyframes heroEnter {
+  from {
+    opacity: 0;
+    transform: translateY(18px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.hero-anim {
+  animation: heroEnter 620ms var(--ease-out) both;
+  animation-delay: var(--hero-delay, 0ms);
 }
 
 .rack-stat-value {
@@ -881,12 +979,20 @@ pre {
   background-color: transparent;
   color: var(--text-secondary);
   cursor: pointer;
-  transition: color var(--dur-fast) var(--ease-out), background-color var(--dur-fast) var(--ease-out);
+  transition:
+    transform 200ms var(--ease-out),
+    color 200ms var(--ease-out),
+    background-color 200ms var(--ease-out);
 }
 
 .tab-btn:hover {
   color: var(--text-primary);
   background-color: var(--bg-card);
+  transform: translateY(-1px);
+}
+
+.tab-btn:active {
+  transform: scale(0.975);
 }
 
 .tab-btn[aria-selected="true"] {
@@ -908,6 +1014,15 @@ pre {
 
 .tab-panel {
   grid-area: 1 / 1;
+  position: relative;
+  z-index: 2;
+  transition: opacity 280ms var(--ease-out);
+}
+
+.tab-panel[hidden] {
+  pointer-events: none;
+  visibility: hidden;
+  z-index: 0;
 }
 
 /* Panel inner wrapper carries padding/border so hidden="until-found" never renders an empty strip */
@@ -930,11 +1045,16 @@ pre {
 }
 
 .screenshot-frame {
-  position: relative;
   padding: var(--space-75);
   border-radius: var(--radius-xl);
   background-color: var(--bg-raised);
   border: 1px solid var(--border-strong);
+  overflow: hidden;
+}
+
+.screenshot-viewport {
+  position: relative;
+  border-radius: var(--radius-md);
   overflow: hidden;
 }
 
@@ -948,10 +1068,16 @@ pre {
   position: absolute;
   pointer-events: none;
   border: 2px solid var(--signal-green-ink);
-  border-radius: var(--radius-md);
-  background-color: rgba(76, 195, 138, 0.08);
+  border-radius: 10px;
+  background-color: rgba(76, 195, 138, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(76, 195, 138, 0.25);
   opacity: 0;
-  transition: opacity var(--dur-ui) var(--ease-out);
+  transition:
+    inset-inline-start 340ms var(--ease-out),
+    inset-block-start 340ms var(--ease-out),
+    inline-size 340ms var(--ease-out),
+    block-size 340ms var(--ease-out),
+    opacity 240ms var(--ease-out);
 }
 
 .screenshot-highlight.is-active {
@@ -973,13 +1099,25 @@ pre {
   border: 1px solid var(--border-hairline);
   background-color: var(--bg-inset);
   cursor: pointer;
-  transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+  transition:
+    transform 200ms var(--ease-out),
+    background-color 200ms var(--ease-out),
+    border-color 200ms var(--ease-out);
 }
 
-.callout-btn:hover,
-.callout-btn[aria-pressed="true"] {
+.callout-btn:hover {
   background-color: var(--bg-raised);
   border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+
+.callout-btn:active {
+  transform: scale(0.975);
+}
+
+.callout-btn[aria-pressed="true"] {
+  background-color: var(--bg-raised);
+  border-color: var(--signal-green);
 }
 
 .callout-head {
@@ -1233,12 +1371,20 @@ pre {
   background-color: var(--bg-inset);
   color: var(--text-primary);
   cursor: pointer;
-  transition: background-color var(--dur-fast) var(--ease-out), border-color var(--dur-fast) var(--ease-out);
+  transition:
+    transform 200ms var(--ease-out),
+    background-color 200ms var(--ease-out),
+    border-color 200ms var(--ease-out);
 }
 
 .hud-toggle-btn:hover {
   background-color: var(--bg-raised);
   border-color: var(--border-strong);
+  transform: translateY(-1px);
+}
+
+.hud-toggle-btn:active {
+  transform: scale(0.975);
 }
 
 .hud-toggle-btn[aria-pressed="true"] {
@@ -1329,6 +1475,15 @@ input[type="range"] {
   border-radius: var(--radius-xl);
   background-color: var(--bg-card);
   border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.pillar-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
 }
 
 .pillar-card--lead {
@@ -1462,8 +1617,16 @@ input[type="range"] {
   border-radius: 4px;
   background-color: #484C56;
   transform-origin: left center;
-  transform: scaleX(0.04);
-  transition: transform 680ms var(--ease-out);
+  transform: scaleX(0);
+  transition: transform 920ms var(--ease-out);
+}
+
+.benchmark-row:nth-of-type(2) .bar-fill {
+  transition-delay: 110ms;
+}
+
+.benchmark-row:nth-of-type(3) .bar-fill {
+  transition-delay: 220ms;
 }
 
 .benchmark-group.is-visible .bar-fill {
@@ -1505,6 +1668,15 @@ input[type="range"] {
   border-radius: var(--radius-xl);
   background-color: var(--bg-card);
   border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.telemetry-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
 }
 
 .telemetry-figure {
@@ -1664,6 +1836,15 @@ input[type="range"] {
   border-radius: var(--radius-xl);
   background-color: var(--bg-card);
   border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.tier-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
 }
 
 .tier-header {
@@ -1706,6 +1887,15 @@ input[type="range"] {
   border-radius: var(--radius-lg);
   background-color: var(--bg-inset);
   border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.crate-item:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
 }
 
 /* First Run & SmartScreen Guide */
@@ -1729,6 +1919,15 @@ input[type="range"] {
   border-radius: var(--radius-xl);
   background-color: var(--bg-card);
   border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.firstrun-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
 }
 
 .step-list {
@@ -1773,6 +1972,11 @@ input[type="range"] {
   border-radius: var(--radius-xl);
   background-color: var(--bg-card);
   border: 1px solid var(--border-hairline);
+  transition: border-color 200ms var(--ease-out);
+}
+
+.faq-item:hover {
+  border-color: var(--border-strong);
 }
 
 .faq-item summary {
@@ -1785,7 +1989,7 @@ input[type="range"] {
   color: var(--text-primary);
   cursor: pointer;
   border-radius: var(--radius-xl);
-  transition: background-color var(--dur-fast) var(--ease-out);
+  transition: background-color 200ms var(--ease-out);
 }
 
 .faq-item summary::-webkit-details-marker {
@@ -1804,38 +2008,21 @@ input[type="range"] {
   background-color: var(--text-secondary);
   mask: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='black' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E") no-repeat center / contain;
   rotate: -90deg;
+  transition: rotate 280ms var(--ease-out);
 }
 
 .faq-item[open] > summary::before {
   rotate: 0deg;
 }
 
-@media (prefers-reduced-motion: no-preference) {
-  .faq-item summary::before {
-    transition: rotate 200ms var(--ease-out);
-  }
-
-  .faq-item::details-content {
-    transition: block-size, content-visibility, display;
-    transition-duration: 300ms;
-    transition-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
-    transition-behavior: allow-discrete;
-  }
-}
-
-.faq-item::details-content {
-  interpolate-size: allow-keywords;
-  overflow: clip;
-  contain: layout;
-}
-
-.faq-item:not([open])::details-content {
-  block-size: 0;
+.faq-item.is-closing > summary::before {
+  rotate: -90deg;
 }
 
 .faq-body {
   padding: 0 var(--space-300) var(--space-300);
   color: var(--text-secondary);
+  overflow: hidden;
 }
 
 /* Final CTA Band */
@@ -2039,13 +2226,16 @@ input[type="range"] {
 /* Scroll Reveal (IntersectionObserver) */
 [data-reveal] {
   opacity: 0;
-  transform: translateY(12px);
-  transition: opacity var(--dur-enter) var(--ease-out), transform var(--dur-enter) var(--ease-out);
+  transform: translateY(28px) scale(0.985);
+  transition:
+    opacity 680ms var(--ease-out),
+    transform 680ms var(--ease-out);
+  transition-delay: var(--reveal-delay, 0ms);
 }
 
 [data-reveal].is-visible {
   opacity: 1;
-  transform: translateY(0);
+  transform: translateY(0) scale(1);
 }
 
 /* Touch Target Sizing on Coarse Pointers */

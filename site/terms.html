@@ -4,11 +4,12 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Terms of Use &amp; Open Source License — SquadAir</title>
-  <meta name="description" content="Terms of use for the free SquadAir open-source software (MIT License) and acceptable use policy for the public rv.squadair.app signaling coordinator.">
+  <meta name="description" content="Terms of use for the free SquadAir open-source software (GNU AGPLv3) and acceptable use policy for the public rv.squadair.app signaling coordinator.">
   <meta name="theme-color" content="#181818">
   <link rel="canonical" href="https://squadair.app/terms.html">
   <link rel="manifest" href="/site.webmanifest">
-  <link rel="icon" href="/assets/img/favicon.svg" type="image/svg+xml">
+  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/assets/img/icon-192.png" sizes="192x192" type="image/png">
   <link rel="stylesheet" href="assets/css/main.css">
   <script defer src="assets/js/app.js"></script>
 </head>
@@ -18,7 +19,10 @@
   <header class="site-header">
     <div class="header-inner">
       <a href="/" class="site-logo">
-        <img src="assets/img/logo.svg" width="28" height="28" alt="" aria-hidden="true">
+        <picture>
+          <source type="image/webp" srcset="assets/img/app-icon-64.webp">
+          <img src="assets/img/app-icon-64.png" width="28" height="28" class="brand-icon" alt="" aria-hidden="true">
+        </picture>
         <span>SquadAir</span>
       </a>
 
@@ -56,7 +60,7 @@
       <aside class="doc-toc" aria-label="Table of contents">
         <span class="title-4">On this page</span>
         <ul>
-          <li><a href="#license">MIT Open Source License</a></li>
+          <li><a href="#license">GNU AGPLv3 License</a></li>
           <li><a href="#coordinator">Public coordinator usage</a></li>
           <li><a href="#acceptable-use">Acceptable use &amp; limits</a></li>
           <li><a href="#disclaimer">Disclaimer of warranty</a></li>
@@ -72,17 +76,17 @@
           </div>
           <h1 id="main-content" class="heading-2" tabindex="-1">Terms of Use &amp; Open Source License</h1>
           <p class="body-3 text-secondary">
-            SquadAir is free, open-source software distributed under the MIT License alongside an optional public UDP signaling coordinator at <span class="mono-num">rv.squadair.app:3478</span>.
+            SquadAir is free, open-source software distributed under the GNU Affero General Public License v3.0 (GNU AGPLv3) alongside an optional public UDP signaling coordinator at <span class="mono-num">rv.squadair.app:3478</span>.
           </p>
         </header>
 
         <section id="license" class="doc-section">
-          <h2 class="heading-4">1. Open Source Software License (MIT)</h2>
+          <h2 class="heading-4">1. Open Source Software License (GNU AGPLv3)</h2>
           <p class="body-6">
-            The SquadAir client, audio engine, video pipeline, wire protocol, and rendezvous server source code are copyright (c) 2026 SquadAir Contributors and licensed under the <a href="https://github.com/alivergg/squad-air/blob/main/LICENSE" rel="noopener">MIT License</a>.
+            The SquadAir client, audio engine, video pipeline, wire protocol, and rendezvous server source code are licensed under the <a href="https://github.com/alivergg/squad-air/blob/main/LICENSE" rel="noopener">GNU Affero General Public License v3.0</a> (<a href="https://www.gnu.org/licenses/agpl-3.0.en.html" rel="noopener">agpl-3.0.en.html</a>).
           </p>
           <p class="body-6">
-            You are free to use, inspect, compile, modify, distribute, and self-host the software at zero cost subject to preserving the copyright and permission notice in the <span class="mono-num">LICENSE</span> file.
+            You are free to run, inspect, modify, distribute, and self-host the software at zero cost under the terms of GNU AGPLv3, provided that modified copies, redistributed builds, and modified network services remain under GNU AGPLv3 with corresponding source availability.
           </p>
         </section>
 
@@ -139,11 +143,14 @@
       <div class="footer-grid">
         <div style="display: grid; gap: var(--space-100); align-content: start;">
           <a href="/" class="site-logo">
-            <img src="assets/img/logo.svg" width="24" height="24" alt="" aria-hidden="true">
+            <picture>
+              <source type="image/webp" srcset="assets/img/app-icon-64.webp">
+              <img src="assets/img/app-icon-64.png" width="24" height="24" class="brand-icon" alt="" aria-hidden="true">
+            </picture>
             <span>SquadAir</span>
           </a>
           <p class="body-6 text-secondary" style="max-inline-size: 36ch;">
-            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the MIT License.
+            Open-source, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust under the GNU AGPLv3 License.
           </p>
         </div>
 
@@ -176,7 +183,7 @@
       </div>
 
       <div class="footer-bottom caption-2">
-        <span>SquadAir Contributors · MIT License</span>
+        <span>SquadAir Contributors · GNU AGPLv3</span>
         <span>Zero cookies · Zero analytics · Zero accounts</span>
       </div>
     </div>

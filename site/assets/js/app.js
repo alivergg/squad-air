@@ -124,6 +124,73 @@
     updateNavLayout(true);
   }
 
+  /* 1b. Smooth Animated Anchor Scrolling */
+  function initSmoothAnchors() {
+    let scrollRaf = 0;
+
+    function cancelScroll() {
+      if (scrollRaf) {
+        window.cancelAnimationFrame(scrollRaf);
+        scrollRaf = 0;
+      }
+    }
+
+    window.addEventListener("wheel", cancelScroll, { passive: true });
+    window.addEventListener("touchstart", cancelScroll, { passive: true });
+
+    document.addEventListener("click", (event) => {
+      const link = event.target.closest('a[href^="#"]');
+      if (!link) return;
+
+      const hash = link.getAttribute("href");
+      if (!hash || hash === "#") return;
+
+      const target = document.getElementById(hash.slice(1));
+      if (!target) return;
+
+      event.preventDefault();
+      cancelScroll();
+
+      const header = document.querySelector(".site-header");
+      const headerHeight = header ? header.getBoundingClientRect().height : 56;
+      const maxScroll = Math.max(0, document.documentElement.scrollHeight - window.innerHeight);
+      const targetY = Math.min(
+        maxScroll,
+        Math.max(0, target.getBoundingClientRect().top + window.scrollY - headerHeight - 24)
+      );
+
+      if (window.history && window.history.pushState) {
+        window.history.pushState(null, "", hash);
+      }
+
+      if (prefersReducedMotion) {
+        window.scrollTo({ top: targetY, behavior: "instant" });
+        return;
+      }
+
+      const startY = window.scrollY;
+      const distance = targetY - startY;
+      if (Math.abs(distance) < 2) return;
+
+      const duration = Math.min(720, Math.max(460, Math.abs(distance) * 0.35));
+      const startTime = performance.now();
+
+      function step(now) {
+        const elapsed = now - startTime;
+        const progress = Math.min(1, elapsed / duration);
+        const eased = 1 - Math.pow(1 - progress, 3);
+        window.scrollTo({ top: startY + distance * eased, behavior: "instant" });
+        if (progress < 1) {
+          scrollRaf = window.requestAnimationFrame(step);
+        } else {
+          scrollRaf = 0;
+        }
+      }
+
+      scrollRaf = window.requestAnimationFrame(step);
+    });
+  }
+
   /* 2. OS Auto-Detection & Download Switcher */
   function initPlatformDownload() {
     const labelNodes = document.querySelectorAll("[data-download-label]");
@@ -134,17 +201,17 @@
     const specs = {
       windows: {
         label: "Download for Windows (.exe)",
-        artifact: "SquadAir-Setup-windows-x86_64.exe · ~35 MB standalone installer · Windows 10 & 11",
+        artifact: "SquadAir-Setup-windows-x86_64.exe · 34.7 MB standalone installer · Windows 10 & 11",
         name: "Windows",
       },
       macos: {
         label: "Download for macOS",
-        artifact: "SquadAir-Installer-macos-arm64.pkg · 12 MB Apple Silicon installer · macOS 13+",
+        artifact: "SquadAir-Installer-macos-arm64.pkg · 11.6 MB Apple Silicon installer · macOS 13+",
         name: "macOS",
       },
       linux: {
         label: "Download for Linux",
-        artifact: "Native packages (.deb, .rpm, Arch .pkg.tar.zst, .tar.gz) · Linux x86_64",
+        artifact: "Native packages (.deb, .rpm, Arch .pkg.tar.zst, .tar.gz) · 11.7–15.3 MB · Linux x86_64",
         name: "Linux",
       },
     };
@@ -192,19 +259,19 @@
 
     function selectTab(targetTab, focusTab) {
       const panelId = targetTab.dataset.panelTarget;
-      for (const tab of tabs) {
+      tabs.forEach((tab) => {
         const active = tab === targetTab;
         tab.setAttribute("aria-selected", String(active));
         tab.tabIndex = active ? 0 : -1;
-      }
-      for (const panel of panels) {
+      });
+      panels.forEach((panel) => {
         const active = panel.id === panelId;
         if (active) {
           panel.removeAttribute("hidden");
         } else {
           panel.setAttribute("hidden", "until-found");
         }
-      }
+      });
       if (focusTab) {
         targetTab.focus({ preventScroll: true });
       }
@@ -232,7 +299,7 @@
       }
     });
 
-    for (const panel of panels) {
+    panels.forEach((panel) => {
       panel.addEventListener("beforematch", () => {
         const matchingTab = tabs.find((t) => t.dataset.panelTarget === panel.id);
         if (matchingTab) selectTab(matchingTab, false);
@@ -241,10 +308,10 @@
       const highlightBox = panel.querySelector("[data-highlight-box]");
       const callouts = Array.from(panel.querySelectorAll("[data-callout-btn]"));
 
-      function activateCallout(btn) {
-        for (const item of callouts) {
+      const activateCallout = (btn) => {
+        callouts.forEach((item) => {
           item.setAttribute("aria-pressed", String(item === btn));
-        }
+        });
         if (!highlightBox) return;
         const coords = (btn.dataset.box || "").split(",").map(Number);
         if (coords.length === 4 && coords.every(Number.isFinite)) {
@@ -254,12 +321,12 @@
           highlightBox.style.blockSize = `${coords[3]}%`;
           highlightBox.classList.add("is-active");
         }
-      }
+      };
 
-      for (const btn of callouts) {
+      callouts.forEach((btn) => {
         btn.addEventListener("click", () => activateCallout(btn));
-      }
-    }
+      });
+    });
   }
 
   /* 4. Interactive Click-Through In-Game HUD Overlay Simulator & Code Copy */
@@ -402,17 +469,60 @@
     }
   }
 
-  /* 5. IntersectionObserver Reveals & Benchmark Bar Transitions */
-  function initReveals() {
-    const targets = document.querySelectorAll("[data-reveal], .benchmark-group");
-    if (!targets.length) return;
+  /* 5. IntersectionObserver Reveals, Stagger & Benchmark Bar Counters */
+  function animateCounter(el) {
+    const target = Number(el.dataset.countTo);
+    if (!Number.isFinite(target)) return;
+    const prefix = el.dataset.countPrefix || "";
+    const suffix = el.dataset.countSuffix || "";
+    const decimals = Number(el.dataset.countDecimals || 0);
 
-    if (prefersReducedMotion || !("IntersectionObserver" in window)) {
-      for (const el of targets) el.classList.add("is-visible");
+    if (prefersReducedMotion) {
+      el.textContent = `${prefix}${target.toFixed(decimals)}${suffix}`;
       return;
     }
 
-    const observer = new IntersectionObserver(
+    const duration = 760;
+    const start = performance.now();
+    function tick(now) {
+      const progress = Math.min(1, (now - start) / duration);
+      const eased = 1 - Math.pow(1 - progress, 3);
+      const val = (target * eased).toFixed(decimals);
+      el.textContent = `${prefix}${val}${suffix}`;
+      if (progress < 1) {
+        window.requestAnimationFrame(tick);
+      } else {
+        el.textContent = `${prefix}${target.toFixed(decimals)}${suffix}`;
+      }
+    }
+    window.requestAnimationFrame(tick);
+  }
+
+  function initReveals() {
+    const revealTargets = document.querySelectorAll("[data-reveal]");
+    const benchmarkGroups = document.querySelectorAll(".benchmark-group");
+
+    // Assign clean sibling stagger inside card grids
+    const staggerContainers = document.querySelectorAll(
+      ".pillars-grid, .arch-grid, .crate-strip, .firstrun-grid, .telemetry-stack, .faq-list"
+    );
+    staggerContainers.forEach((container) => {
+      const children = container.querySelectorAll(":scope > [data-reveal]");
+      children.forEach((child, idx) => {
+        child.style.setProperty("--reveal-delay", `${Math.min(idx * 80, 360)}ms`);
+      });
+    });
+
+    if (prefersReducedMotion || !("IntersectionObserver" in window)) {
+      revealTargets.forEach((el) => el.classList.add("is-visible"));
+      benchmarkGroups.forEach((el) => {
+        el.classList.add("is-visible");
+        el.querySelectorAll("[data-count-to]").forEach(animateCounter);
+      });
+      return;
+    }
+
+    const revealObserver = new IntersectionObserver(
       (entries, obs) => {
         for (const entry of entries) {
           if (entry.isIntersecting) {
@@ -421,18 +531,41 @@
           }
         }
       },
-      { threshold: 0.01, rootMargin: "0px 0px 40px 0px" }
+      { threshold: 0.08, rootMargin: "0px 0px -72px 0px" }
     );
 
     const vh = window.innerHeight || 900;
-    for (const el of targets) {
+    revealTargets.forEach((el) => {
       const rect = el.getBoundingClientRect();
-      if (rect.top < vh) {
+      if (rect.top < vh * 0.85) {
         el.classList.add("is-visible");
       } else {
-        observer.observe(el);
+        revealObserver.observe(el);
       }
-    }
+    });
+
+    const benchObserver = new IntersectionObserver(
+      (entries, obs) => {
+        for (const entry of entries) {
+          if (entry.isIntersecting) {
+            entry.target.classList.add("is-visible");
+            entry.target.querySelectorAll("[data-count-to]").forEach(animateCounter);
+            obs.unobserve(entry.target);
+          }
+        }
+      },
+      { threshold: 0.25, rootMargin: "0px 0px -80px 0px" }
+    );
+
+    benchmarkGroups.forEach((group) => {
+      const rect = group.getBoundingClientRect();
+      if (rect.top < vh * 0.82) {
+        group.classList.add("is-visible");
+        group.querySelectorAll("[data-count-to]").forEach(animateCounter);
+      } else {
+        benchObserver.observe(group);
+      }
+    });
   }
 
   /* 6. B11 Tagline Word-by-Word Scroll Reveal (rAF-throttled only while in view) */
@@ -507,10 +640,70 @@
     }
   }
 
+  /* 7. Cross-Browser Smooth FAQ Accordion Animation */
+  function initFaqAccordion() {
+    const items = document.querySelectorAll(".faq-item");
+    if (!items.length || prefersReducedMotion || typeof Element.prototype.animate !== "function") return;
+
+    const easing = "cubic-bezier(0.22, 1, 0.36, 1)";
+
+    items.forEach((details) => {
+      const summary = details.querySelector(":scope > summary");
+      const body = details.querySelector(":scope > .faq-body");
+      if (!summary || !body) return;
+
+      let activeAnim = null;
+
+      summary.addEventListener("click", (event) => {
+        event.preventDefault();
+        if (activeAnim) {
+          activeAnim.cancel();
+          activeAnim = null;
+        }
+
+        if (details.open && !details.classList.contains("is-closing")) {
+          const startHeight = body.offsetHeight;
+          details.classList.add("is-closing");
+          activeAnim = body.animate(
+            [
+              { height: `${startHeight}px`, paddingBottom: "24px", opacity: 1, transform: "translateY(0)" },
+              { height: "0px", paddingBottom: "0px", opacity: 0, transform: "translateY(-4px)" },
+            ],
+            { duration: 280, easing }
+          );
+          activeAnim.onfinish = () => {
+            details.open = false;
+            details.classList.remove("is-closing");
+            activeAnim = null;
+          };
+          activeAnim.oncancel = () => {
+            details.classList.remove("is-closing");
+          };
+        } else {
+          details.classList.remove("is-closing");
+          details.open = true;
+          const endHeight = body.offsetHeight;
+          activeAnim = body.animate(
+            [
+              { height: "0px", paddingBottom: "0px", opacity: 0, transform: "translateY(-6px)" },
+              { height: `${endHeight}px`, paddingBottom: "24px", opacity: 1, transform: "translateY(0)" },
+            ],
+            { duration: 320, easing }
+          );
+          activeAnim.onfinish = () => {
+            activeAnim = null;
+          };
+        }
+      });
+    });
+  }
+
   initNavbar();
+  initSmoothAnchors();
   initPlatformDownload();
   initTabs();
   initHudSimulator();
   initReveals();
   initTaglineReveal();
+  initFaqAccordion();
 })();
