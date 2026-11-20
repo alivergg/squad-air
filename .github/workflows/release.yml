@@ -9,6 +9,7 @@ on:
       - "LICENSE"
       - ".gitignore"
       - ".dockerignore"
+      - "site/**"
   workflow_dispatch:
     inputs:
       tag:
