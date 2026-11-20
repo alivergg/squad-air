@@ -16,7 +16,7 @@
   <img src="https://img.shields.io/badge/E2EE-ChaCha20--Poly1305%20%2B%20SPAKE2%20%2B%20X25519-brightgreen?style=flat-square" alt="E2EE" />
   <img src="https://img.shields.io/badge/Audio-10ms%20Opus%20%2B%20AEC3%20%2B%20RNNoise%2FDF3-purple?style=flat-square" alt="Audio DSP" />
   <img src="https://img.shields.io/badge/Video-1080p60%20%2B%20DXGI%20%2F%20VideoToolbox%20%2B%20wgpu-cyan?style=flat-square" alt="Screen Share" />
-  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-lightgrey?style=flat-square" alt="MIT License" /></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-AGPLv3-lightgrey?style=flat-square" alt="GNU AGPLv3 License" /></a>
 </p>
 
 <p align="center">
@@ -107,7 +107,7 @@ Client Binary / Installer Footprint:
 | Click-Through In-Game HUD Overlay | **Yes (Native AppKit / Win32)** | Yes | Via Plugin | Overlay (Legacy hooks) |
 | P2P Swarm File & Screenshot Sharing | **Yes (`BLAKE3` verified)** | Server-uploaded | Server-uploaded | No |
 | Self-Hostable Coordinator (`1.7 MB` / `2.7 MB` RAM) | **Yes (1 UDP port / Docker)** | No | Heavy proprietary server | `murmurd` |
-| Open Source | **Yes (MIT)** | No | No | Yes |
+| Open Source | **Yes (GNU AGPLv3)** | No | No | Yes |
 
 ---
 
@@ -275,5 +275,5 @@ Place an exported ONNX model at `assets/models/deepfilternet3.onnx` or `<config_
 ---
 
 <p align="center">
-  Licensed under the <a href="LICENSE">MIT License</a>.
+  Licensed under the <a href="LICENSE">GNU AGPLv3 License</a>.
 </p>

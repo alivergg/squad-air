@@ -5,7 +5,7 @@ pkgrel=1
 pkgdesc="Lightweight E2EE P2P voice chat, screen sharing, and squad messaging desktop app"
 arch=('x86_64')
 url="https://github.com/alivergg/squad-air"
-license=('MIT')
+license=('AGPL-3.0-only')
 depends=(
   'alsa-lib'
   'gtk3'
