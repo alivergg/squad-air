@@ -17,6 +17,10 @@
 
 - [SquadAir Official Website](https://squadair.app/): Product overview, interactive HUD simulator, live benchmarks, and platform quick-start guide.
 - [SquadAir on Microsoft Store ($1.99)](https://apps.microsoft.com/detail/9PH8NXTQMC73): Official Microsoft-signed Windows MSIX release with automatic Windows updates and zero SmartScreen prompts.
+- [SquadAir on Snap Store (Linux)](https://snapcraft.io/squad-air): Official confined Snap package (`sudo snap install squad-air`) with automatic updates from `latest/stable`.
+- [SquadAir Homebrew Tap (macOS Apple Silicon)](https://github.com/alivergg/homebrew-tap): Auto-updated Homebrew Cask (`brew install --cask alivergg/tap/squadair`).
+- [SquadAir Scoop Bucket (Windows)](https://github.com/alivergg/scoop-bucket): Auto-updated portable Windows bucket (`scoop bucket add squadair https://github.com/alivergg/scoop-bucket && scoop install squadair/squadair`).
+- [Winget Submission (`SquadAir.SquadAir`)](https://github.com/microsoft/winget-pkgs/pull/485946): Windows Package Manager manifest PR (`#485946`, validation passed, awaiting merge).
 - [Download Latest Release (Free)](https://github.com/alivergg/squad-air/releases/latest): Prebuilt installers and packages for Windows (`x86_64`), macOS (`arm64`), and Linux, plus `SHA256SUMS.txt`.
 - [All Releases & Changelog](https://github.com/alivergg/squad-air/releases): Version history and release artifacts.
 - [Source Code (GitHub)](https://github.com/alivergg/squad-air): Full 5-crate Rust workspace source code, CI workflows, and packaging scripts.

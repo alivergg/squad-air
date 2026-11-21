@@ -73,7 +73,7 @@
         "alternateName": "squadair",
         "applicationCategory": "CommunicationApplication",
         "operatingSystem": "Windows 10, Windows 11, macOS 13+, Linux",
-        "softwareVersion": "1.6",
+        "softwareVersion": "1.8",
         "image": "https://squadair.app/assets/img/thumb-square.png",
         "screenshot": [
           "https://squadair.app/assets/img/lobby.png",
@@ -99,7 +99,10 @@
         ],
         "sameAs": [
           "https://github.com/alivergg/squad-air",
-          "https://apps.microsoft.com/detail/9PH8NXTQMC73"
+          "https://apps.microsoft.com/detail/9PH8NXTQMC73",
+          "https://snapcraft.io/squad-air",
+          "https://github.com/alivergg/homebrew-tap",
+          "https://github.com/alivergg/scoop-bucket"
         ]
       },
       {
@@ -184,6 +187,7 @@
           <li><a href="#interface" class="body-5">Interface</a></li>
           <li><a href="#benchmarks" class="body-5">Benchmarks</a></li>
           <li><a href="#architecture" class="body-5">Architecture</a></li>
+          <li><a href="#install" class="body-5">Install</a></li>
           <li><a href="#first-run" class="body-5">First Run &amp; FAQ</a></li>
         </ul>
       </nav>
@@ -212,7 +216,7 @@
         <div class="hero-copy">
           <div class="section-kicker caption-1 hero-anim" style="--hero-delay: 0ms;">
             <span class="status-led" aria-hidden="true"></span>
-            <span>Native Rust v1.3 client and stateless coordinator</span>
+            <span>Native Rust client and stateless coordinator</span>
           </div>
 
           <h1 id="main-content" class="heading-1 hero-title hero-anim" style="--hero-delay: 70ms;" tabindex="-1">
@@ -262,11 +266,33 @@
             </div>
 
             <p class="caption-2 text-muted mono-num" data-download-artifact>
-              SquadAir-Setup-windows-x86_64.exe · 34.7 MB standalone installer · Windows 10 &amp; 11
+              SquadAir-Setup-windows-x86_64.exe · Standalone installer · Windows 10 &amp; 11
             </p>
 
+            <div class="hero-quick-install">
+              <div class="hero-quick-head">
+                <span class="caption-4 text-secondary" data-hero-install-label>Install with Scoop (Windows):</span>
+                <a href="#install" class="caption-4">All package channels</a>
+              </div>
+              <div class="install-cmd-box">
+                <code id="cmd-hero-install" class="install-code mono-num" data-hero-install-cmd>scoop bucket add squadair https://github.com/alivergg/scoop-bucket &amp;&amp; scoop install squadair/squadair</code>
+                <span class="copy-wrap">
+                  <button type="button" class="copy-btn" command="--copy" commandfor="cmd-hero-install" aria-label="Copy quick install command">
+                    <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <rect x="9" y="9" width="13" height="13" rx="2"/>
+                      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                    </svg>
+                    <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                      <path d="M20 6 9 17l-5-5"/>
+                    </svg>
+                  </button>
+                  <span class="copy-tip caption-5" role="status"></span>
+                </span>
+              </div>
+            </div>
+
             <p class="hero-proof caption-1">
-              Open Source · Zero Accounts · ~21 MB Native Binary · Windows &amp; macOS
+              Open Source (GNU AGPLv3) · Zero Accounts · Windows, macOS &amp; Linux
             </p>
           </div>
         </div>
@@ -919,6 +945,247 @@
       </div>
     </section>
 
+    <!-- Package Managers, Stores & Direct Downloads -->
+    <section id="install" class="section container" aria-labelledby="install-heading">
+      <div class="section-header" data-reveal>
+        <div class="section-kicker caption-1">
+          <span class="status-led" aria-hidden="true"></span>
+          <span>Package managers, stores &amp; direct packages</span>
+        </div>
+        <h2 id="install-heading" class="heading-2">Install via your platform’s native store</h2>
+        <p class="body-3 text-secondary">
+          Every tagged release on <span class="mono-num">main</span> automatically builds and publishes updated installers and packages for Scoop, Homebrew Cask, Snap Store, and Linux distros.
+        </p>
+      </div>
+
+      <div class="install-grid">
+        <article class="install-card" data-reveal>
+          <div class="tier-header">
+            <h3 class="heading-4">Windows (x86_64)</h3>
+            <span class="tier-badge caption-4 mono-num">
+              <span class="status-led" aria-hidden="true"></span>
+              Win10 / Win11
+            </span>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Microsoft Store ($1.99)</span>
+              <span class="install-pill install-pill--live caption-4">Live · Signed MSIX</span>
+            </div>
+            <p class="body-6 text-secondary">
+              Zero SmartScreen prompts, automatic Store updates, and direct support for SquadAir development.
+            </p>
+            <div>
+              <a href="https://apps.microsoft.com/detail/9PH8NXTQMC73" class="btn btn--primary button-sm" rel="noopener">
+                Open in Microsoft Store
+              </a>
+            </div>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Scoop Bucket (Free)</span>
+              <span class="install-pill install-pill--live caption-4">Live · Auto-Updated</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-scoop" class="install-code mono-num">scoop bucket add squadair https://github.com/alivergg/scoop-bucket
+scoop install squadair/squadair</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-scoop" aria-label="Copy Scoop install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Winget (Free)</span>
+              <span class="install-pill install-pill--pending caption-4">PR #485946 · Review</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-winget" class="install-code mono-num">winget install SquadAir.SquadAir</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-winget" aria-label="Copy Winget install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+            <p class="caption-2 text-muted">
+              <a href="https://github.com/microsoft/winget-pkgs/pull/485946" rel="noopener">All 10 Microsoft checks passed</a>; awaiting moderator merge.
+            </p>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Standalone Installer (Free)</span>
+              <span class="install-pill caption-4">Auto-Updater</span>
+            </div>
+            <p class="body-6 text-secondary">
+              Download <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">SquadAir-Setup-windows-x86_64.exe</span></a> (supports <span class="mono-num">/S</span> silent install, zero admin required).
+            </p>
+          </div>
+        </article>
+
+        <article class="install-card" data-reveal>
+          <div class="tier-header">
+            <h3 class="heading-4">macOS (Apple Silicon)</h3>
+            <span class="tier-badge caption-4 mono-num">
+              <span class="status-led" aria-hidden="true"></span>
+              arm64 · macOS 13+
+            </span>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Homebrew Cask (Free)</span>
+              <span class="install-pill install-pill--live caption-4">Live · Auto-Updated</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-brew" class="install-code mono-num">brew install --cask alivergg/tap/squadair</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-brew" aria-label="Copy Homebrew Cask install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+            <p class="caption-2 text-muted">
+              Updated automatically from GitHub Releases in <a href="https://github.com/alivergg/homebrew-tap" rel="noopener">alivergg/homebrew-tap</a>.
+            </p>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Direct Installer (`.pkg`)</span>
+              <span class="install-pill caption-4">Auto-Updater</span>
+            </div>
+            <p class="body-6 text-secondary">
+              Download <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">SquadAir-Installer-macos-arm64.pkg</span></a> to upgrade <span class="mono-num">/Applications/SquadAir.app</span> in place.
+            </p>
+          </div>
+        </article>
+
+        <article class="install-card" data-reveal>
+          <div class="tier-header">
+            <h3 class="heading-4">Linux (x86_64)</h3>
+            <span class="tier-badge caption-4 mono-num">
+              <span class="status-led" aria-hidden="true"></span>
+              Wayland / X11
+            </span>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Snap Store</span>
+              <span class="install-pill install-pill--live caption-4">Live · Auto-Updated</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-snap" class="install-code mono-num">sudo snap install squad-air</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-snap" aria-label="Copy Snap install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+            <p class="caption-2 text-muted">
+              Official listing on <a href="https://snapcraft.io/squad-air" rel="noopener">Snapcraft Store</a> (<span class="mono-num">latest/stable</span>).
+            </p>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Debian / Ubuntu (`.deb`)</span>
+              <span class="install-pill caption-4">GitHub Release</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-deb" class="install-code mono-num">sudo apt install ./squad-air_*_amd64.deb</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-deb" aria-label="Copy Debian package install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Fedora / RPM / Arch</span>
+              <span class="install-pill caption-4">GitHub Release</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-rpm" class="install-code mono-num">sudo dnf install ./squad-air-*.x86_64.rpm</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-rpm" aria-label="Copy RPM package install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-arch" class="install-code mono-num">sudo pacman -U ./squad-air-*-x86_64.pkg.tar.zst</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-arch" aria-label="Copy Arch package install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+            <p class="caption-2 text-muted">
+              Portable <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener">.tar.gz</a>, Arch <span class="mono-num">PKGBUILD</span>, and validated Flatpak/AUR manifests are included in the repository.
+            </p>
+          </div>
+        </article>
+      </div>
+    </section>
+
     <!-- First Run & SmartScreen Guide + FAQ -->
     <section id="first-run" class="section container" aria-labelledby="firstrun-heading">
       <div class="section-header" data-reveal>
@@ -1104,6 +1371,9 @@
           <h2 class="title-4">Product</h2>
           <ul class="footer-list body-6">
             <li><a href="https://apps.microsoft.com/detail/9PH8NXTQMC73" rel="noopener">Microsoft Store ($1.99)</a></li>
+            <li><a href="https://snapcraft.io/squad-air" rel="noopener">Snap Store (Linux)</a></li>
+            <li><a href="https://github.com/alivergg/homebrew-tap" rel="noopener">Homebrew Tap (macOS)</a></li>
+            <li><a href="https://github.com/alivergg/scoop-bucket" rel="noopener">Scoop Bucket (Windows)</a></li>
             <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download (Free)</a></li>
             <li><a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a></li>
             <li><a href="https://github.com/alivergg/squad-air">Source Code</a></li>

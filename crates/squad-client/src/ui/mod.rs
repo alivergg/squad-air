@@ -110,6 +110,8 @@ pub enum Message {
     HostLanRoom,
     JoinLanRoom(DiscoveredLanRoom),
     InviteInputChanged(String),
+    PasteInviteFromClipboard,
+    InviteClipboardLoaded(Option<String>),
     JoinRoomWithInput,
     LeaveRoom,
     CopyInviteUri,
@@ -1122,6 +1124,24 @@ impl SquadApp {
                 self.invite_input = val;
                 Task::none()
             }
+            Message::PasteInviteFromClipboard => Task::perform(
+                async move {
+                    tokio::task::spawn_blocking(read_invite_clipboard_text)
+                        .await
+                        .ok()
+                        .flatten()
+                },
+                Message::InviteClipboardLoaded,
+            ),
+            Message::InviteClipboardLoaded(raw) => {
+                if let Some(text) = raw.as_deref().and_then(sanitize_invite_clipboard_text) {
+                    self.invite_input = text;
+                    self.status_banner = None;
+                } else {
+                    self.status_banner = Some("Clipboard has no text to paste".to_string());
+                }
+                Task::none()
+            }
             Message::JoinRoomWithInput => {
                 let uri = self.invite_input.clone();
                 self.try_join_uri(&uri)
@@ -1937,7 +1957,11 @@ impl SquadApp {
             Message::OverlayOpacityChanged(opacity) => {
                 self.config.overlay_opacity = opacity.clamp(0.30, 1.0);
                 let _ = self.config.save();
-                Task::none()
+                if let Some(ov_id) = self.overlay_window_id {
+                    overlay_platform::set_overlay_opacity(ov_id, self.config.overlay_opacity)
+                } else {
+                    Task::none()
+                }
             }
             Message::WindowOpened(id) => {
                 if self.main_window_id == Some(id) {
@@ -1949,7 +1973,7 @@ impl SquadApp {
             Message::OverlayConfigured => Task::none(),
             Message::OverlayWindowOpened(id) => {
                 if self.overlay_window_id == Some(id) {
-                    overlay_platform::configure_overlay_window(id)
+                    overlay_platform::configure_overlay_window(id, self.config.overlay_opacity)
                 } else {
                     Task::none()
                 }
@@ -2814,6 +2838,21 @@ fn view_update_modal<'a>(
         .into()
 }
 
+fn sanitize_invite_clipboard_text(raw: &str) -> Option<String> {
+    let single_line = raw.replace(['\r', '\n'], " ");
+    let trimmed = single_line.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn read_invite_clipboard_text() -> Option<String> {
+    let mut cb = arboard::Clipboard::new().ok()?;
+    cb.get_text().ok()
+}
+
 fn read_clipboard_payload(
     screen: Screen,
     text_input_focused: bool,
@@ -3178,5 +3217,23 @@ fn iced_key_to_hotkey_name(
         keyboard::Key::Named(Named::Control) => Some("Ctrl".to_string()),
         keyboard::Key::Named(Named::Alt) => Some("Alt".to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_invite_clipboard_text;
+
+    #[test]
+    fn sanitize_invite_clipboard_trims_and_rejects_empty() {
+        assert_eq!(sanitize_invite_clipboard_text("   \r\n\t "), None);
+        assert_eq!(
+            sanitize_invite_clipboard_text("  squad://abc\r\ndef  "),
+            Some("squad://abc  def".to_string())
+        );
+        assert_eq!(
+            sanitize_invite_clipboard_text("\n  squad://room-key  \n"),
+            Some("squad://room-key".to_string())
+        );
     }
 }

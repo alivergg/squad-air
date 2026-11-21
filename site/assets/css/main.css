@@ -105,6 +105,7 @@ main,
 .arch-grid > *,
 .crate-strip > *,
 .firstrun-grid > *,
+.install-grid > *,
 .pillars-grid > *,
 .final-cta > *,
 .doc-grid > * {
@@ -881,6 +882,190 @@ h3[id] {
   align-items: center;
   gap: var(--space-100);
   color: var(--text-secondary);
+}
+
+/* Quick Install Box & Multi-Store Grid */
+.hero-quick-install {
+  display: grid;
+  gap: var(--space-75);
+  max-inline-size: 580px;
+}
+
+.hero-quick-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-75);
+}
+
+.install-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-200);
+}
+
+@media (min-width: 980px) {
+  .install-grid {
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+}
+
+.install-card {
+  display: grid;
+  align-content: start;
+  gap: var(--space-200);
+  padding: var(--space-300);
+  border-radius: var(--radius-xl);
+  background-color: var(--bg-card);
+  border: 1px solid var(--border-hairline);
+  transition:
+    transform 260ms var(--ease-out),
+    border-color 260ms var(--ease-out),
+    background-color 260ms var(--ease-out);
+}
+
+.install-card:hover {
+  transform: translateY(-2px);
+  border-color: var(--border-strong);
+}
+
+.install-method {
+  display: grid;
+  gap: var(--space-75);
+  padding: var(--space-100);
+  border-radius: var(--radius-lg);
+  background-color: var(--bg-inset);
+  border: 1px solid var(--border-hairline);
+}
+
+.install-method-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-75);
+}
+
+.install-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  background-color: var(--bg-raised);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-secondary);
+}
+
+.install-pill--live {
+  border-color: rgba(35, 165, 90, 0.35);
+  color: var(--signal-green-ink);
+}
+
+.install-pill--pending {
+  border-color: rgba(229, 169, 60, 0.35);
+  color: var(--signal-amber);
+}
+
+.install-cmd-box {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-75);
+  padding: var(--space-75) var(--space-100);
+  border-radius: var(--radius-md);
+  background-color: var(--bg-base);
+  border: 1px solid var(--border-hairline);
+}
+
+.install-code {
+  min-inline-size: 0;
+  flex: 1 1 auto;
+  font-size: 12.5px;
+  line-height: 18px;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.copy-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+
+.copy-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-inline-size: 32px;
+  min-block-size: 32px;
+  padding: 6px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--border-strong);
+  background-color: var(--bg-raised);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition:
+    transform var(--dur-fast) var(--ease-out),
+    background-color var(--dur-fast) var(--ease-out),
+    border-color var(--dur-fast) var(--ease-out),
+    color var(--dur-fast) var(--ease-out);
+}
+
+.copy-btn:hover {
+  background-color: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.copy-btn:active {
+  transform: scale(0.95);
+}
+
+.copy-btn .icon-check {
+  display: none;
+}
+
+.copy-btn[data-copied] {
+  border-color: var(--signal-green);
+  color: var(--signal-green-ink);
+}
+
+.copy-btn[data-copied] .icon-copy {
+  display: none;
+}
+
+.copy-btn[data-copied] .icon-check {
+  display: block;
+}
+
+.copy-btn[data-failed] {
+  border-color: var(--signal-red);
+  color: var(--signal-red);
+}
+
+.copy-tip {
+  position: absolute;
+  inset-block-end: calc(100% + 6px);
+  inset-inline-end: 0;
+  padding: 3px 8px;
+  border-radius: var(--radius-sm);
+  background-color: var(--bg-raised);
+  border: 1px solid var(--border-strong);
+  color: var(--text-primary);
+  white-space: nowrap;
+  pointer-events: none;
+  opacity: 0;
+  transform: translateY(4px);
+  transition:
+    opacity var(--dur-fast) var(--ease-out),
+    transform var(--dur-fast) var(--ease-out);
+}
+
+.copy-btn:is([data-copied], [data-failed]) + .copy-tip {
+  opacity: 1;
+  transform: translateY(0);
 }
 
 .hero-facts-rack {
@@ -2245,8 +2430,13 @@ input[type="range"] {
   .os-btn,
   .hud-toggle-btn,
   .menu-button,
+  .copy-btn,
   .site-menu a {
     min-block-size: 44px;
+  }
+
+  .copy-btn {
+    min-inline-size: 44px;
   }
 }
 
@@ -2271,6 +2461,11 @@ input[type="range"] {
   .bar-fill {
     transform: scaleX(var(--ratio, 0.5));
   }
+
+  .copy-tip,
+  .copy-btn:active {
+    transform: none;
+  }
 }
 
 /* Forced Colors / High Contrast Mode */
@@ -2281,10 +2476,12 @@ input[type="range"] {
   .chart-card,
   .telemetry-card,
   .tier-card,
+  .install-card,
   .firstrun-card,
   .faq-item,
   .final-cta,
   .btn,
+  .copy-btn,
   .table-wrapper,
   .site-menu {
     border: 1px solid CanvasText;

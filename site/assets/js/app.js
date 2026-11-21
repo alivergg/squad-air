@@ -196,22 +196,30 @@
     const labelNodes = document.querySelectorAll("[data-download-label]");
     const artifactNodes = document.querySelectorAll("[data-download-artifact]");
     const osButtons = document.querySelectorAll("[data-os-switch]");
+    const heroInstallLabel = document.querySelector("[data-hero-install-label]");
+    const heroInstallCmd = document.querySelector("[data-hero-install-cmd]");
     if (!labelNodes.length) return;
 
     const specs = {
       windows: {
         label: "Download for Windows (.exe)",
-        artifact: "SquadAir-Setup-windows-x86_64.exe · 34.7 MB standalone installer · Windows 10 & 11",
+        artifact: "SquadAir-Setup-windows-x86_64.exe · Standalone installer · Windows 10 & 11",
+        installLabel: "Install with Scoop (Windows):",
+        installCmd: "scoop bucket add squadair https://github.com/alivergg/scoop-bucket && scoop install squadair/squadair",
         name: "Windows",
       },
       macos: {
-        label: "Download for macOS",
-        artifact: "SquadAir-Installer-macos-arm64.pkg · 11.6 MB Apple Silicon installer · macOS 13+",
+        label: "Download for macOS (.pkg)",
+        artifact: "SquadAir-Installer-macos-arm64.pkg · Apple Silicon installer · macOS 13+",
+        installLabel: "Install with Homebrew (macOS arm64):",
+        installCmd: "brew install --cask alivergg/tap/squadair",
         name: "macOS",
       },
       linux: {
         label: "Download for Linux",
-        artifact: "Native packages (.deb, .rpm, Arch .pkg.tar.zst, .tar.gz) · 11.7–15.3 MB · Linux x86_64",
+        artifact: "Snap Store (squad-air) & native .deb / .rpm / Arch / .tar.gz · Linux x86_64",
+        installLabel: "Install from Snap Store (Linux):",
+        installCmd: "sudo snap install squad-air",
         name: "Linux",
       },
     };
@@ -232,6 +240,12 @@
       for (const el of artifactNodes) {
         el.textContent = spec.artifact;
       }
+      if (heroInstallLabel) {
+        heroInstallLabel.textContent = spec.installLabel;
+      }
+      if (heroInstallCmd) {
+        heroInstallCmd.textContent = spec.installCmd;
+      }
       for (const btn of osButtons) {
         btn.setAttribute("aria-pressed", String(btn.dataset.osSwitch === key));
       }
@@ -247,6 +261,107 @@
     }
 
     applyPlatform(detectPlatform(), false);
+  }
+
+  /* 2b. Declarative Copy Buttons (Invoker Commands + Fallback) */
+  function initCopyButtons() {
+    const timers = new WeakMap();
+    let lastMessage = "";
+
+    function legacyCopy(text) {
+      const field = Object.assign(document.createElement("textarea"), { value: text });
+      field.setAttribute("readonly", "");
+      field.style.cssText = "position:fixed;inset-block-start:0;opacity:0";
+      document.body.append(field);
+      field.select();
+      try {
+        return document.execCommand("copy");
+      } finally {
+        field.remove();
+      }
+    }
+
+    function report(button, ok) {
+      const tip = button.nextElementSibling;
+      window.clearTimeout(timers.get(button));
+      button.removeAttribute("data-copied");
+      button.removeAttribute("data-failed");
+
+      let message = ok ? "Copied" : "Copy failed";
+      if (message === lastMessage) {
+        message += "\u00A0";
+      }
+      lastMessage = message;
+
+      if (tip) {
+        tip.textContent = "";
+      }
+      void button.offsetWidth;
+      button.setAttribute(ok ? "data-copied" : "data-failed", "");
+      if (tip) {
+        window.requestAnimationFrame(() => {
+          tip.textContent = message;
+        });
+      }
+
+      timers.set(
+        button,
+        window.setTimeout(() => {
+          button.removeAttribute("data-copied");
+          button.removeAttribute("data-failed");
+          if (tip) {
+            tip.textContent = "";
+          }
+        }, 1800)
+      );
+    }
+
+    async function copyTarget(button, target) {
+      if (!button || !target) return;
+      const text = target.matches("input, textarea")
+        ? target.value.trim()
+        : target.innerText.trim();
+      if (!text) return;
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(text);
+        } else if (!legacyCopy(text)) {
+          throw new Error("Copy failed");
+        }
+        report(button, true);
+      } catch {
+        try {
+          if (legacyCopy(text)) {
+            report(button, true);
+            return;
+          }
+        } catch {
+          // Handled via failed status report below.
+        }
+        report(button, false);
+      }
+    }
+
+    document.addEventListener(
+      "command",
+      (event) => {
+        if (typeof event.command === "string" && event.command.startsWith("--copy")) {
+          copyTarget(event.source, event.target);
+        }
+      },
+      true
+    );
+
+    if (!("CommandEvent" in window)) {
+      document.addEventListener("click", (event) => {
+        const button = event.target.closest('button[command^="--copy"]');
+        if (!button) return;
+        const target = document.getElementById(button.getAttribute("commandfor") || "");
+        if (target) {
+          copyTarget(button, target);
+        }
+      });
+    }
   }
 
   /* 3. Accessible Interface Tabs & Callout Highlighter */
@@ -504,7 +619,7 @@
 
     // Assign clean sibling stagger inside card grids
     const staggerContainers = document.querySelectorAll(
-      ".pillars-grid, .arch-grid, .crate-strip, .firstrun-grid, .telemetry-stack, .faq-list"
+      ".pillars-grid, .arch-grid, .crate-strip, .install-grid, .firstrun-grid, .telemetry-stack, .faq-list"
     );
     staggerContainers.forEach((container) => {
       const children = container.querySelectorAll(":scope > [data-reveal]");
@@ -701,6 +816,7 @@
   initNavbar();
   initSmoothAnchors();
   initPlatformDownload();
+  initCopyButtons();
   initTabs();
   initHudSimulator();
   initReveals();

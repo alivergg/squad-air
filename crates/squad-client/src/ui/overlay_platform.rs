@@ -2,15 +2,85 @@ use crate::ui::Message;
 use iced::window::raw_window_handle::RawWindowHandle;
 use iced::{window, Task};
 
-pub fn configure_overlay_window(id: window::Id) -> Task<Message> {
-    window::enable_mouse_passthrough(id).chain(window::run_with_handle(id, |handle| {
-        apply_raw_overlay_flags(handle.as_raw());
+pub fn configure_overlay_window(id: window::Id, opacity: f32) -> Task<Message> {
+    window::enable_mouse_passthrough(id).chain(window::run_with_handle(id, move |handle| {
+        apply_raw_overlay_flags(handle.as_raw(), opacity);
         Message::OverlayConfigured
     }))
 }
 
+pub fn set_overlay_opacity(id: window::Id, opacity: f32) -> Task<Message> {
+    #[cfg(target_os = "macos")]
+    {
+        window::run_with_handle(id, move |handle| {
+            apply_macos_overlay_opacity(handle.as_raw(), opacity);
+            Message::OverlayConfigured
+        })
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (id, opacity);
+        Task::none()
+    }
+}
+
 #[cfg(target_os = "macos")]
-fn apply_raw_overlay_flags(raw: RawWindowHandle) {
+unsafe fn macos_ns_window(raw: RawWindowHandle) -> Option<*mut std::ffi::c_void> {
+    use std::ffi::{c_char, c_void};
+    use std::mem::transmute;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    let RawWindowHandle::AppKit(handle) = raw else {
+        return None;
+    };
+    let ns_view = handle.ns_view.as_ptr();
+    if ns_view.is_null() {
+        return None;
+    }
+
+    let send_ptr: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+        transmute(objc_msgSend as *const ());
+    let ns_window = send_ptr(ns_view, sel_registerName(c"window".as_ptr()));
+    (!ns_window.is_null()).then_some(ns_window)
+}
+
+#[cfg(target_os = "macos")]
+unsafe fn apply_macos_ns_window_alpha(ns_window: *mut std::ffi::c_void, opacity: f32) {
+    use std::ffi::{c_char, c_void};
+    use std::mem::transmute;
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    let clamped = opacity.clamp(0.30, 1.0) as f64;
+    let send_void_f64: unsafe extern "C" fn(*mut c_void, *mut c_void, f64) =
+        transmute(objc_msgSend as *const ());
+    send_void_f64(
+        ns_window,
+        sel_registerName(c"setAlphaValue:".as_ptr()),
+        clamped,
+    );
+}
+
+#[cfg(target_os = "macos")]
+fn apply_macos_overlay_opacity(raw: RawWindowHandle, opacity: f32) {
+    unsafe {
+        if let Some(ns_window) = macos_ns_window(raw) {
+            apply_macos_ns_window_alpha(ns_window, opacity);
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn apply_raw_overlay_flags(raw: RawWindowHandle, opacity: f32) {
     use std::ffi::{c_char, c_void};
     use std::mem::transmute;
 
@@ -24,15 +94,10 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle) {
         fn objc_msgSend();
     }
 
-    let RawWindowHandle::AppKit(handle) = raw else {
-        return;
-    };
-
     unsafe {
-        let ns_view = handle.ns_view.as_ptr();
-        if ns_view.is_null() {
+        let Some(ns_window) = macos_ns_window(raw) else {
             return;
-        }
+        };
 
         let send_ptr: unsafe extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
             transmute(objc_msgSend as *const ());
@@ -44,11 +109,6 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle) {
             transmute(objc_msgSend as *const ());
         let send_void_usize: unsafe extern "C" fn(*mut c_void, *mut c_void, usize) =
             transmute(objc_msgSend as *const ());
-
-        let ns_window = send_ptr(ns_view, sel_registerName(c"window".as_ptr()));
-        if ns_window.is_null() {
-            return;
-        }
 
         let ns_color_cls = objc_getClass(c"NSColor".as_ptr());
         let clear_color = send_ptr(ns_color_cls, sel_registerName(c"clearColor".as_ptr()));
@@ -79,11 +139,12 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle) {
             sel_registerName(c"setCollectionBehavior:".as_ptr()),
             (1 << 0) | (1 << 8),
         );
+        apply_macos_ns_window_alpha(ns_window, opacity);
     }
 }
 
 #[cfg(target_os = "windows")]
-fn apply_raw_overlay_flags(raw: RawWindowHandle) {
+fn apply_raw_overlay_flags(raw: RawWindowHandle, _opacity: f32) {
     use std::ffi::c_void;
     use std::mem::size_of;
 
@@ -210,4 +271,4 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle) {
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
-fn apply_raw_overlay_flags(_raw: RawWindowHandle) {}
+fn apply_raw_overlay_flags(_raw: RawWindowHandle, _opacity: f32) {}

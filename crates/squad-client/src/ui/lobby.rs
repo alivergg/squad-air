@@ -241,9 +241,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                 text_input("Paste invite link...", &app.invite_input)
                     .on_input(Message::InviteInputChanged)
                     .on_submit(Message::JoinRoomWithInput)
+                    .width(Length::Fill)
                     .padding(11)
                     .size(13)
                     .style(m3_text_input_style),
+                button(text("Paste").size(13))
+                    .padding([11, 14])
+                    .style(pill_tonal_button)
+                    .on_press(Message::PasteInviteFromClipboard),
                 button(text("Join Now").size(13))
                     .padding([11, 20])
                     .style(pill_primary_button)

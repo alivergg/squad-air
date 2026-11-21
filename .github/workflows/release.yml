@@ -465,11 +465,17 @@ jobs:
         env:
           WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
         run: |
-          if [[ -n "${WINGET_TOKEN}" ]]; then
-            echo "configured=true" >> "$GITHUB_OUTPUT"
-          else
+          if [[ -z "${WINGET_TOKEN}" ]]; then
             echo "configured=false" >> "$GITHUB_OUTPUT"
             echo "WINGET_TOKEN secret not configured yet; skipping winget-pkgs PR."
+          elif ! curl -fsSI \
+            -H "Authorization: Bearer ${WINGET_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/microsoft/winget-pkgs/contents/manifests/s/SquadAir/SquadAir" >/dev/null 2>&1; then
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "SquadAir.SquadAir is not merged into microsoft/winget-pkgs master yet; skipping winget-releaser update."
+          else
+            echo "configured=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Submit PR to winget-pkgs

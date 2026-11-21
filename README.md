@@ -11,6 +11,9 @@
 <p align="center">
   <a href="https://squadair.app/"><img src="https://img.shields.io/badge/Website-squadair.app-3B82F6?style=flat-square" alt="Official Website — squadair.app" /></a>
   <a href="https://apps.microsoft.com/detail/9PH8NXTQMC73"><img src="https://img.shields.io/badge/Microsoft%20Store-%241.99%20(No%20SmartScreen)-0078D4?style=flat-square&logo=microsoft" alt="Microsoft Store" /></a>
+  <a href="https://snapcraft.io/squad-air"><img src="https://img.shields.io/badge/Snap%20Store-squad--air-82BEA0?style=flat-square&logo=snapcraft" alt="Snap Store" /></a>
+  <a href="https://github.com/alivergg/homebrew-tap"><img src="https://img.shields.io/badge/Homebrew%20Cask-alivergg%2Ftap-FBB040?style=flat-square&logo=homebrew" alt="Homebrew Tap" /></a>
+  <a href="https://github.com/alivergg/scoop-bucket"><img src="https://img.shields.io/badge/Scoop-alivergg%2Fscoop--bucket-4CC38A?style=flat-square" alt="Scoop Bucket" /></a>
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/ci.yml?branch=main&label=CI&style=flat-square" alt="CI" /></a>
   <a href=".github/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/release.yml?branch=main&label=Release&style=flat-square" alt="Release" /></a>
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2021%20(Pure%20Native)-orange?style=flat-square&logo=rust" alt="Rust 2021" /></a>
@@ -186,18 +189,29 @@ flowchart LR
 
 ### 1. Download & Install ([Latest Release](https://github.com/alivergg/squad-air/releases/latest))
 
+| Platform | Channel | Install / Link | Release Sync on `main` |
+| :--- | :--- | :--- | :--- |
+| **Windows (`x86_64`)** | [**Microsoft Store (`$1.99`)**](https://apps.microsoft.com/detail/9PH8NXTQMC73) | Signed MSIX, zero SmartScreen prompts | Manual upload (`release-windows-msix` artifact) |
+| **Windows (`x86_64`)** | [**Scoop Bucket**](https://github.com/alivergg/scoop-bucket) | `scoop bucket add squadair https://github.com/alivergg/scoop-bucket && scoop install squadair/squadair` | Automatic on every release |
+| **Windows (`x86_64`)** | [**Winget**](https://github.com/microsoft/winget-pkgs/pull/485946) *(PR `#485946` awaiting merge)* | `winget install SquadAir.SquadAir` | Automatic PR via `winget-releaser` after merge |
+| **Windows (`x86_64`)** | [**Direct Installer (`.exe`)**](https://github.com/alivergg/squad-air/releases/latest) | `SquadAir-Setup-windows-x86_64.exe` (`/S` silent) | Automatic + in-app updater |
+| **macOS (`arm64`)** | [**Homebrew Tap**](https://github.com/alivergg/homebrew-tap) | `brew install --cask alivergg/tap/squadair` | Automatic on every release |
+| **macOS (`arm64`)** | [**Direct Installer (`.pkg`)**](https://github.com/alivergg/squad-air/releases/latest) | `SquadAir-Installer-macos-arm64.pkg` | Automatic + in-app updater |
+| **Linux (`x86_64`)** | [**Snap Store**](https://snapcraft.io/squad-air) | `sudo snap install squad-air` | Automatic (`latest/stable`) |
+| **Linux (`x86_64`)** | [**`.deb` / `.rpm` / Arch / `.tar.gz`**](https://github.com/alivergg/squad-air/releases/latest) | Native distro packages + `PKGBUILD` | Automatic GitHub Release assets |
+
 - **Windows (`x86_64`):**
+  - **Microsoft Store (`$1.99`):** Install from the [Microsoft Store](https://apps.microsoft.com/detail/9PH8NXTQMC73) for a Microsoft-signed MSIX package, zero SmartScreen prompts, automatic Store updates, and to support ongoing development.
   - **Scoop:**
     ```powershell
     scoop bucket add squadair https://github.com/alivergg/scoop-bucket
     scoop install squadair/squadair
     ```
-  - **Winget** *(manifest PR pending review)*:
+  - **Winget** *([PR #485946](https://github.com/microsoft/winget-pkgs/pull/485946) passed all checks, awaiting moderator merge)*:
     ```powershell
     winget install SquadAir.SquadAir
     ```
   - **Free Direct Installer:** Download `SquadAir-Setup-windows-x86_64.exe` and run it (supports `/S` silent install). Installs to `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` with no admin elevation required and preserves `%APPDATA%\squad-air\config.toml`.
-  - **Microsoft Store (`$1.99`):** Install from the [Microsoft Store](https://apps.microsoft.com/detail/9PH8NXTQMC73) for a Microsoft-signed MSIX package, zero SmartScreen prompts, automatic Store updates, and to support ongoing development.
 - **macOS (`Apple Silicon`):**
   - **Homebrew Tap:**
     ```bash
@@ -208,24 +222,26 @@ flowchart LR
     - **Microphone:** Required for voice capture.
     - **Accessibility** & **Input Monitoring:** Required for global hotkeys (`Push-to-Talk`, `Push-to-Mute`, `Mouse4`/`Mouse5`) while fullscreen games are focused.
     - **Screen & System Audio Recording:** Required to share your display or windows.
-- **Ubuntu / Debian (`.deb`):**
-  ```bash
-  sudo apt install ./squad-air_*_amd64.deb
-  ```
-- **Fedora / RHEL / openSUSE (`.rpm`):**
-  ```bash
-  sudo dnf install ./squad-air-*.x86_64.rpm
-  ```
-- **Arch Linux (`AUR` / `.pkg.tar.zst` / `PKGBUILD`):**
-  ```bash
-  sudo pacman -U ./squad-air-*-x86_64.pkg.tar.zst
-  ```
-  Or build from the release `PKGBUILD` using `makepkg -si` (packaging files for AUR `squad-air-bin` live in [`packaging/aur/squad-air-bin`](packaging/aur/squad-air-bin)).
-- **Flatpak / Snapcraft** *(store packaging manifests in [`packaging/flatpak`](packaging/flatpak) and [`snap/snapcraft.yaml`](snap/snapcraft.yaml), pending initial store registration/review)*:
-  - Flatpak App ID: `app.squadair.SquadAir`
-  - Snap package name: `squad-air`
-- **Portable Linux (`.tar.gz`):**
-  Extract `squad-client-linux-x86_64.tar.gz` and run `./squad-client`.
+- **Linux (`x86_64`):**
+  - **Snap Store ([`squad-air`](https://snapcraft.io/squad-air)):**
+    ```bash
+    sudo snap install squad-air
+    ```
+  - **Ubuntu / Debian (`.deb`):**
+    ```bash
+    sudo apt install ./squad-air_*_amd64.deb
+    ```
+  - **Fedora / RHEL / openSUSE (`.rpm`):**
+    ```bash
+    sudo dnf install ./squad-air-*.x86_64.rpm
+    ```
+  - **Arch Linux (`.pkg.tar.zst` / `PKGBUILD`):**
+    ```bash
+    sudo pacman -U ./squad-air-*-x86_64.pkg.tar.zst
+    ```
+    Or build from the release `PKGBUILD` with `makepkg -si` (`squad-air-bin` packaging files live in [`packaging/aur/squad-air-bin`](packaging/aur/squad-air-bin); AUR push automation is ready once `aur.archlinux.org` reopens new account registration).
+  - **Flatpak Manifests:** Validated manifests for `app.squadair.SquadAir` live in [`packaging/flatpak`](packaging/flatpak).
+  - **Portable Binary (`.tar.gz`):** Extract `squad-client-linux-x86_64.tar.gz` and run `./squad-client`.
 
 ---
 
