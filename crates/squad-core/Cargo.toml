@@ -1,0 +1,38 @@
+[package]
+name = "squad-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[lib]
+name = "squad_core"
+crate-type = ["rlib", "cdylib"]
+
+[features]
+default = ["desktop-dsp"]
+desktop-dsp = ["squad-dsp/df3-onnx"]
+
+[dependencies]
+squad-proto = { path = "../squad-proto" }
+squad-dsp = { path = "../squad-dsp", default-features = false }
+squad-rendezvous = { path = "../squad-rendezvous" }
+squad-video = { path = "../squad-video" }
+tokio.workspace = true
+bytes.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+toml.workspace = true
+rand.workspace = true
+uuid.workspace = true
+bs58.workspace = true
+dirs.workspace = true
+if-addrs.workspace = true
+blake3.workspace = true
+image.workspace = true
+socket2 = "0.6"
+x25519-dalek.workspace = true
+spake2.workspace = true
+chacha20poly1305.workspace = true

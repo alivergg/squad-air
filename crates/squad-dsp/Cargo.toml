@@ -18,9 +18,13 @@ ringbuf.workspace = true
 rubato.workspace = true
 nnnoiseless.workspace = true
 aec3.workspace = true
-tract-onnx.workspace = true
+tract-onnx = { workspace = true, optional = true }
 audiopus.workspace = true
 hound.workspace = true
 symphonia = { version = "0.5", default-features = false, features = ["mp3", "wav", "pcm"] }
 dirs.workspace = true
 tokio.workspace = true
+
+[features]
+default = ["df3-onnx"]
+df3-onnx = ["dep:tract-onnx"]

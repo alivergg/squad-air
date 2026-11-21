@@ -1,9 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
-mod config;
-mod crypto_identity;
+pub use squad_core::{config, crypto_identity, net};
 mod hotkeys;
-mod net;
 mod tray;
 mod ui;
 #[cfg(not(feature = "managed_updates"))]

@@ -5,6 +5,7 @@ members = [
     "crates/squad-rendezvous",
     "crates/squad-dsp",
     "crates/squad-video",
+    "crates/squad-core",
     "crates/squad-client",
 ]
 

@@ -5315,6 +5315,7 @@ dependencies = [
  "serde",
  "socket2",
  "spake2",
+ "squad-core",
  "squad-dsp",
  "squad-proto",
  "squad-rendezvous",
@@ -5325,6 +5326,34 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "tray-icon",
+ "uuid",
+ "x25519-dalek",
+]
+
+[[package]]
+name = "squad-core"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "bs58",
+ "bytes",
+ "chacha20poly1305",
+ "dirs 5.0.1",
+ "if-addrs",
+ "image 0.25.10",
+ "rand 0.8.8",
+ "serde",
+ "socket2",
+ "spake2",
+ "squad-dsp",
+ "squad-proto",
+ "squad-rendezvous",
+ "squad-video",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+ "tracing",
  "uuid",
  "x25519-dalek",
 ]

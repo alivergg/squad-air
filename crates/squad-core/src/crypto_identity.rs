@@ -35,11 +35,7 @@ pub struct DecryptedFriendInvite {
 }
 
 pub fn friends_file_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|mut dir| {
-        dir.push("squad-air");
-        dir.push("friends.json");
-        dir
-    })
+    Some(crate::storage_paths::app_config_root_dir().join("friends.json"))
 }
 
 pub fn load_friends() -> Vec<FriendContact> {

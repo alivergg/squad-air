@@ -12,7 +12,7 @@ use crate::net::transfer::{
     app_data_root_dir, BlobTransferState, ChatItemUi, SwarmChatManager, TransferCtx, TransferEvent,
 };
 use crate::net::PeerEndpoint;
-use crate::tray::release_os_memory;
+use crate::mem::release_os_memory;
 use rand::{rngs::OsRng, Rng};
 use spake2::{Ed25519Group, Spake2};
 use squad_dsp::{AudioEngineHandle, OutboundAudioFrame, SoundCue};

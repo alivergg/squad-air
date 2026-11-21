@@ -120,11 +120,7 @@ impl Default for AppConfig {
 
 impl AppConfig {
     pub fn config_path() -> Option<PathBuf> {
-        dirs::config_dir().map(|mut dir| {
-            dir.push("squad-air");
-            dir.push("config.toml");
-            dir
-        })
+        Some(crate::storage_paths::app_config_root_dir().join("config.toml"))
     }
 
     pub fn load_or_create() -> Self {

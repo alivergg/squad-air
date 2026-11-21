@@ -1185,7 +1185,7 @@ impl SwarmChatManager {
                 {
                     return;
                 }
-                if let Some(cached) = crate::ui::avatar::load_cached_avatar_jpeg(&avatar_hash) {
+                if let Some(cached) = crate::avatar_core::load_cached_avatar_jpeg(&avatar_hash) {
                     self.clear_pending_avatar_for_sender(sender_uuid, None);
                     let _ = ctx
                         .evt_tx
@@ -1345,7 +1345,7 @@ impl SwarmChatManager {
                 if *blake3::hash(&mem).as_bytes() == meta.blake3_root {
                     blob.completed = true;
                     if meta.kind == BLOB_KIND_AVATAR {
-                        let _ = crate::ui::avatar::save_cached_avatar_jpeg(&meta.blake3_root, &mem);
+                        let _ = crate::avatar_core::save_cached_avatar_jpeg(&meta.blake3_root, &mem);
                         let (target_uuid, full_hash) = self
                             .avatar_targets
                             .remove(&blob_id)
@@ -1756,15 +1756,11 @@ fn verify_and_finalize_file(part_path: &Path, meta: &BlobMetadata) -> Result<Pat
 }
 
 pub fn app_data_root_dir() -> PathBuf {
-    dirs::config_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("squad-air")
+    crate::storage_paths::app_config_root_dir()
 }
 
 pub fn downloads_root_dir() -> PathBuf {
-    dirs::download_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join("SquadAir")
+    crate::storage_paths::app_downloads_root_dir()
 }
 
 fn room_history_path(root: &Path, room_id: &RoomId) -> PathBuf {
@@ -2780,8 +2776,8 @@ mod tests {
             )
             .unwrap();
         let (jpeg_bytes, avatar_hash, _rgba128) =
-            crate::ui::avatar::process_custom_avatar_image(&raw_png).unwrap();
-        let _ = fs::remove_file(crate::ui::avatar::avatar_disk_path(&avatar_hash));
+            crate::avatar_core::process_custom_avatar_image(&raw_png).unwrap();
+        let _ = fs::remove_file(crate::avatar_core::avatar_disk_path(&avatar_hash));
 
         let invite = InviteLink::generate();
         let prefix = invite.room_prefix();
@@ -2900,7 +2896,7 @@ mod tests {
         assert_eq!(got_hash, avatar_hash);
         assert_eq!(got_jpeg, jpeg_bytes);
         assert_eq!(
-            crate::ui::avatar::load_cached_avatar_jpeg(&avatar_hash).as_deref(),
+            crate::avatar_core::load_cached_avatar_jpeg(&avatar_hash).as_deref(),
             Some(jpeg_bytes.as_slice())
         );
 
@@ -2949,7 +2945,7 @@ mod tests {
         }
         assert!(reset_ok, "Peer B must receive Identicon reset notification");
 
-        let _ = fs::remove_file(crate::ui::avatar::avatar_disk_path(&avatar_hash));
+        let _ = fs::remove_file(crate::avatar_core::avatar_disk_path(&avatar_hash));
     }
 
     #[tokio::test]

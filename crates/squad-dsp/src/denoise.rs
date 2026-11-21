@@ -1,8 +1,11 @@
 use crate::FRAME_SAMPLES;
 use nnnoiseless::DenoiseState;
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "df3-onnx")]
 use std::path::{Path, PathBuf};
+#[cfg(feature = "df3-onnx")]
 use tracing::{info, warn};
+#[cfg(feature = "df3-onnx")]
 use tract_onnx::prelude::*;
 
 const PCM16_SCALE: f32 = 32768.0;
@@ -16,11 +19,13 @@ pub enum NoiseSuppressionMode {
     DeepFilterNet3,
 }
 
+#[cfg(feature = "df3-onnx")]
 type TractRunnable = SimplePlan<TypedFact, Box<dyn TypedOp>, Graph<TypedFact, Box<dyn TypedOp>>>;
 
 pub struct NoiseSuppressor {
     mode: NoiseSuppressionMode,
     rnnoise: Box<DenoiseState<'static>>,
+    #[cfg(feature = "df3-onnx")]
     df3_model: Option<TractRunnable>,
     df3_available: bool,
     scaled_in: [f32; FRAME_SAMPLES],
@@ -29,18 +34,25 @@ pub struct NoiseSuppressor {
 
 impl NoiseSuppressor {
     pub fn new(mode: NoiseSuppressionMode) -> Self {
-        let df3_model = Self::try_load_df3_model();
-        let df3_available = df3_model.is_some();
+        #[cfg(feature = "df3-onnx")]
+        let (df3_model, df3_available) = {
+            let model = Self::try_load_df3_model();
+            let avail = model.is_some();
+            if mode == NoiseSuppressionMode::DeepFilterNet3 && !avail {
+                info!(
+                    "deepfilternet3.onnx not found in assets/models; using RNNoise fallback automatically"
+                );
+            }
+            (model, avail)
+        };
 
-        if mode == NoiseSuppressionMode::DeepFilterNet3 && !df3_available {
-            info!(
-                "deepfilternet3.onnx not found in assets/models; using RNNoise fallback automatically"
-            );
-        }
+        #[cfg(not(feature = "df3-onnx"))]
+        let df3_available = false;
 
         Self {
             mode,
             rnnoise: DenoiseState::new(),
+            #[cfg(feature = "df3-onnx")]
             df3_model,
             df3_available,
             scaled_in: [0.0; FRAME_SAMPLES],
@@ -48,6 +60,7 @@ impl NoiseSuppressor {
         }
     }
 
+    #[cfg(feature = "df3-onnx")]
     fn candidate_model_paths() -> Vec<PathBuf> {
         let mut paths = vec![PathBuf::from("assets/models/deepfilternet3.onnx")];
         if let Some(mut cfg) = dirs::config_dir() {
@@ -59,6 +72,7 @@ impl NoiseSuppressor {
         paths
     }
 
+    #[cfg(feature = "df3-onnx")]
     fn try_load_df3_model() -> Option<TractRunnable> {
         const MAX_DF3_MODEL_BYTES: u64 = 64 * 1024 * 1024;
         for path in Self::candidate_model_paths() {
@@ -78,6 +92,7 @@ impl NoiseSuppressor {
         None
     }
 
+    #[cfg(feature = "df3-onnx")]
     fn load_onnx(path: &Path) -> TractResult<TractRunnable> {
         tract_onnx::onnx()
             .model_for_path(path)?
@@ -98,7 +113,6 @@ impl NoiseSuppressor {
         self.df3_available
     }
 
-    /// Обрабатывает 480 сэмплов (10 мс @ 48 кГц) на месте.
     #[inline]
     pub fn process_frame(&mut self, frame: &mut [f32; FRAME_SAMPLES]) {
         match self.mode {
@@ -107,6 +121,7 @@ impl NoiseSuppressor {
                 self.run_rnnoise(frame);
             }
             NoiseSuppressionMode::DeepFilterNet3 => {
+                #[cfg(feature = "df3-onnx")]
                 if let Some(plan) = self.df3_model.as_ref() {
                     if Self::run_df3_tract(plan, frame).is_err() {
                         self.run_rnnoise(frame);
@@ -114,6 +129,9 @@ impl NoiseSuppressor {
                 } else {
                     self.run_rnnoise(frame);
                 }
+
+                #[cfg(not(feature = "df3-onnx"))]
+                self.run_rnnoise(frame);
             }
         }
     }
@@ -132,6 +150,7 @@ impl NoiseSuppressor {
         }
     }
 
+    #[cfg(feature = "df3-onnx")]
     fn run_df3_tract(plan: &TractRunnable, frame: &mut [f32; FRAME_SAMPLES]) -> TractResult<()> {
         let clean_in: Vec<f32> = frame
             .iter()
