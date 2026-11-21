@@ -187,10 +187,23 @@ flowchart LR
 ### 1. Download & Install ([Latest Release](https://github.com/alivergg/squad-air/releases/latest))
 
 - **Windows (`x86_64`):**
-  - **Free Direct Installer:** Download `SquadAir-Setup-windows-x86_64.exe` and run it. Installs to `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` with no admin elevation required and preserves `%APPDATA%\squad-air\config.toml`.
+  - **Scoop:**
+    ```powershell
+    scoop bucket add squadair https://github.com/alivergg/scoop-bucket
+    scoop install squadair/squadair
+    ```
+  - **Winget** *(manifest PR pending review)*:
+    ```powershell
+    winget install SquadAir.SquadAir
+    ```
+  - **Free Direct Installer:** Download `SquadAir-Setup-windows-x86_64.exe` and run it (supports `/S` silent install). Installs to `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` with no admin elevation required and preserves `%APPDATA%\squad-air\config.toml`.
   - **Microsoft Store (`$1.99`):** Install from the [Microsoft Store](https://apps.microsoft.com/detail/9PH8NXTQMC73) for a Microsoft-signed MSIX package, zero SmartScreen prompts, automatic Store updates, and to support ongoing development.
 - **macOS (`Apple Silicon`):**
-  Download `SquadAir-Installer-macos-arm64.pkg` and open it. Upgrades `/Applications/SquadAir.app` in place and preserves `~/Library/Application Support/squad-air/config.toml`.
+  - **Homebrew Tap:**
+    ```bash
+    brew install --cask alivergg/tap/squadair
+    ```
+  - **Direct Installer:** Download `SquadAir-Installer-macos-arm64.pkg` and open it. Upgrades `/Applications/SquadAir.app` in place and preserves `~/Library/Application Support/squad-air/config.toml`.
   - **macOS Permissions Checklist** (*System Settings -> Privacy & Security*):
     - **Microphone:** Required for voice capture.
     - **Accessibility** & **Input Monitoring:** Required for global hotkeys (`Push-to-Talk`, `Push-to-Mute`, `Mouse4`/`Mouse5`) while fullscreen games are focused.
@@ -203,11 +216,14 @@ flowchart LR
   ```bash
   sudo dnf install ./squad-air-*.x86_64.rpm
   ```
-- **Arch Linux (`.pkg.tar.zst` / `PKGBUILD`):**
+- **Arch Linux (`AUR` / `.pkg.tar.zst` / `PKGBUILD`):**
   ```bash
   sudo pacman -U ./squad-air-*-x86_64.pkg.tar.zst
   ```
-  Or build from the release `PKGBUILD` using `makepkg -si`.
+  Or build from the release `PKGBUILD` using `makepkg -si` (packaging files for AUR `squad-air-bin` live in [`packaging/aur/squad-air-bin`](packaging/aur/squad-air-bin)).
+- **Flatpak / Snapcraft** *(store packaging manifests in [`packaging/flatpak`](packaging/flatpak) and [`snap/snapcraft.yaml`](snap/snapcraft.yaml), pending initial store registration/review)*:
+  - Flatpak App ID: `app.squadair.SquadAir`
+  - Snap package name: `squad-air`
 - **Portable Linux (`.tar.gz`):**
   Extract `squad-client-linux-x86_64.tar.gz` and run `./squad-client`.
 

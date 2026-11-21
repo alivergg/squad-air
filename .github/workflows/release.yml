@@ -102,6 +102,7 @@ jobs:
           path: |
             dist/SquadAir-Installer-macos-arm64.pkg
             dist/SquadAir-Setup-windows-x86_64.exe
+            dist/squad-client-windows-x86_64.zip
             dist/squad-rendezvous-macos-arm64.tar.gz
 
   build-linux:
@@ -231,8 +232,8 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Remove unsigned MSIX from public GitHub Release assets
-        run: rm -f release-assets/SquadAir-msix-windows-x86_64.msix
+      - name: Remove non-release staging artifacts from public GitHub Release assets
+        run: rm -f release-assets/SquadAir-msix-windows-x86_64.msix release-assets/*.snap
 
       - name: Generate SHA256 checksums
         working-directory: release-assets
@@ -293,3 +294,218 @@ jobs:
           if ($LASTEXITCODE -ne 0) {
             throw "msstore publish failed with exit code $LASTEXITCODE"
           }
+
+  build-snap:
+    name: Build & Publish Linux Snap
+    needs: prepare-version
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set Snap version
+        env:
+          VERSION: ${{ needs.prepare-version.outputs.version_num }}
+        run: |
+          sed -i "s/^version:.*/version: \"${VERSION}\"/" snap/snapcraft.yaml
+
+      - name: Build Snap package
+        id: snap-build
+        uses: snapcore/action-build@v1
+        with:
+          snapcraft-channel: latest/stable
+
+      - name: Upload Snap artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-snap
+          path: ${{ steps.snap-build.outputs.snap }}
+
+      - name: Skip Snap Store publish when credentials are unset
+        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS == '' }}
+        run: echo "SNAPCRAFT_STORE_CREDENTIALS secret not configured yet; skipping Snap Store publish."
+
+      - name: Publish to Snap Store
+        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        uses: snapcore/action-publish@v1
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        with:
+          snap: ${{ steps.snap-build.outputs.snap }}
+          release: stable
+
+  publish-homebrew-tap:
+    name: Update Homebrew Tap (alivergg/homebrew-tap)
+    needs:
+      - prepare-version
+      - build-macos-and-windows
+      - release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS & Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos-windows
+          path: artifacts
+
+      - name: Update Homebrew Cask
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare-version.outputs.version_num }}
+        run: |
+          if [[ -z "${TAP_GITHUB_TOKEN}" ]]; then
+            echo "TAP_GITHUB_TOKEN secret not configured yet; skipping Homebrew tap update."
+            exit 0
+          fi
+          SHA="$(sha256sum artifacts/SquadAir-Installer-macos-arm64.pkg | awk '{print $1}')"
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/alivergg/homebrew-tap.git" tap
+          cat > tap/Casks/squadair.rb <<EOF
+          cask "squadair" do
+            arch arm: "arm64"
+
+            version "${VERSION}"
+            sha256 "${SHA}"
+
+            url "https://github.com/alivergg/squad-air/releases/download/v#{version}/SquadAir-Installer-macos-arm64.pkg",
+                verified: "github.com/alivergg/squad-air/"
+            name "SquadAir"
+            desc "Ultra-lightweight P2P voice chat and 1080p60 screen sharing built in Rust"
+            homepage "https://squadair.app/"
+
+            depends_on macos: ">= :ventura"
+            depends_on arch: :arm64
+
+            pkg "SquadAir-Installer-macos-arm64.pkg"
+
+            uninstall quit:    "com.squadair.client",
+                      pkgutil: "com.squadair.client",
+                      delete:  "/Applications/SquadAir.app"
+
+            zap trash: [
+              "~/Library/Application Support/squad-air",
+              "~/Library/Caches/squad-air",
+            ]
+          end
+          EOF
+          ruby -c tap/Casks/squadair.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add Casks/squadair.rb
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(squadair): release v${VERSION}"
+            git push origin HEAD:main
+          fi
+
+  publish-scoop-bucket:
+    name: Update Scoop Bucket (alivergg/scoop-bucket)
+    needs:
+      - prepare-version
+      - build-macos-and-windows
+      - release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download macOS & Windows artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-macos-windows
+          path: artifacts
+
+      - name: Update Scoop Manifest
+        env:
+          TAP_GITHUB_TOKEN: ${{ secrets.TAP_GITHUB_TOKEN }}
+          VERSION: ${{ needs.prepare-version.outputs.version_num }}
+        run: |
+          if [[ -z "${TAP_GITHUB_TOKEN}" ]]; then
+            echo "TAP_GITHUB_TOKEN secret not configured yet; skipping Scoop bucket update."
+            exit 0
+          fi
+          SHA="$(sha256sum artifacts/squad-client-windows-x86_64.zip | awk '{print $1}')"
+          git clone "https://x-access-token:${TAP_GITHUB_TOKEN}@github.com/alivergg/scoop-bucket.git" bucket
+          python3 - "$VERSION" "$SHA" "bucket/bucket/squadair.json" <<'PY'
+          import json, sys
+          version, sha, path = sys.argv[1], sys.argv[2], sys.argv[3]
+          with open(path) as f:
+              data = json.load(f)
+          data["version"] = version
+          data["architecture"]["64bit"]["url"] = f"https://github.com/alivergg/squad-air/releases/download/v{version}/squad-client-windows-x86_64.zip"
+          data["architecture"]["64bit"]["hash"] = sha
+          with open(path, "w") as f:
+              json.dump(data, f, indent=2)
+              f.write("\n")
+          PY
+          python3 -m json.tool bucket/bucket/squadair.json >/dev/null
+          cd bucket
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add bucket/squadair.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore(squadair): release v${VERSION}"
+            git push origin HEAD:main
+          fi
+
+  publish-winget:
+    name: Submit Winget Update (microsoft/winget-pkgs)
+    needs:
+      - prepare-version
+      - release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip Winget publish when WINGET_TOKEN is unset
+        if: ${{ secrets.WINGET_TOKEN == '' }}
+        run: echo "WINGET_TOKEN secret not configured yet; skipping winget-pkgs PR."
+
+      - name: Submit PR to winget-pkgs
+        if: ${{ secrets.WINGET_TOKEN != '' }}
+        uses: vedantmgoyal9/winget-releaser@v2
+        with:
+          identifier: SquadAir.SquadAir
+          version: ${{ needs.prepare-version.outputs.version_num }}
+          installers-regex: '^SquadAir-Setup-windows-x86_64\.exe$'
+          token: ${{ secrets.WINGET_TOKEN }}
+
+  publish-aur:
+    name: Update AUR Package (squad-air-bin)
+    needs:
+      - prepare-version
+      - build-linux
+      - release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download Linux artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: release-linux
+          path: artifacts
+
+      - name: Push updated PKGBUILD and .SRCINFO to AUR
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          VERSION: ${{ needs.prepare-version.outputs.version_num }}
+        run: |
+          if [[ -z "${AUR_SSH_PRIVATE_KEY}" ]]; then
+            echo "AUR_SSH_PRIVATE_KEY secret not configured yet; skipping AUR publish."
+            exit 0
+          fi
+          ARCH_VER="${VERSION//-/_}"
+          PKG_FILE="artifacts/squad-air-${ARCH_VER}-1-x86_64.pkg.tar.zst"
+          SHA="$(sha256sum "${PKG_FILE}" | awk '{print $1}')"
+          mkdir -p ~/.ssh
+          printf '%s\n' "${AUR_SSH_PRIVATE_KEY}" > ~/.ssh/aur_id
+          chmod 600 ~/.ssh/aur_id
+          ssh-keyscan -H aur.archlinux.org >> ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i ~/.ssh/aur_id -o IdentitiesOnly=yes"
+          git clone ssh://aur@aur.archlinux.org/squad-air-bin.git aur-repo
+          chmod +x scripts/update_aur_pkgbuild.sh
+          ./scripts/update_aur_pkgbuild.sh "${VERSION}" "${SHA}" aur-repo
+          cd aur-repo
+          git config user.name "SquadAir Release Bot"
+          git config user.email "support@squadair.app"
+          git add PKGBUILD .SRCINFO
+          if ! git diff --cached --quiet; then
+            git commit -m "Update to v${VERSION}"
+            git push origin HEAD:master
+          fi

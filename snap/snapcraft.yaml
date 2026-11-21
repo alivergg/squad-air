@@ -1,0 +1,69 @@
+name: squad-air
+base: core24
+version: "1.6"
+summary: Ultra-lightweight P2P voice chat and 1080p60 screen sharing in Rust
+description: |
+  SquadAir is a fast, native desktop voice chat and screen-sharing app built in
+  pure Rust for gamers and squads who want crisp, low-latency comms without
+  Electron bloat, accounts, or central media servers.
+
+  Features include 10 ms Opus voice DSP with WebRTC AEC3 and RNNoise, free
+  1080p 60fps screen sharing, ChaCha20-Poly1305 end-to-end encryption, 6-digit
+  SPAKE2 voice codes, decentralized X25519 friends, zero-config LAN rooms with
+  host failover, and BLAKE3-verified P2P swarm file transfers.
+license: AGPL-3.0-only
+grade: stable
+confinement: strict
+
+platforms:
+  amd64:
+
+apps:
+  squad-air:
+    command: bin/squad-client
+    extensions: [gnome]
+    desktop: usr/share/applications/squad-air.desktop
+    plugs:
+      - home
+      - network
+      - network-bind
+      - audio-playback
+      - audio-record
+      - desktop
+      - desktop-legacy
+      - wayland
+      - x11
+      - opengl
+      - screen-inhibit-control
+
+parts:
+  squad-air:
+    source: .
+    plugin: rust
+    rust-path: ["crates/squad-client"]
+    rust-features: ["managed_updates"]
+    build-packages:
+      - build-essential
+      - cmake
+      - nasm
+      - pkg-config
+      - libopus-dev
+      - libasound2-dev
+      - libgtk-3-dev
+      - libayatana-appindicator3-dev
+      - libx11-dev
+      - libxcb-shape0-dev
+      - libxcb-xfixes0-dev
+      - libxdo-dev
+      - libxkbcommon-dev
+    stage-packages:
+      - libasound2t64
+      - libayatana-appindicator3-1
+      - libopus0
+      - libxdo3
+    override-build: |
+      craftctl default
+      install -Dm644 installer/linux/squad-air.desktop "$CRAFT_PART_INSTALL/usr/share/applications/squad-air.desktop"
+      sed -i 's|^Exec=squad-client|Exec=squad-air|' "$CRAFT_PART_INSTALL/usr/share/applications/squad-air.desktop"
+      sed -i 's|^Icon=squad-air|Icon=/usr/share/icons/hicolor/512x512/apps/squad-air.png|' "$CRAFT_PART_INSTALL/usr/share/applications/squad-air.desktop"
+      install -Dm644 site/assets/img/icon-512.png "$CRAFT_PART_INSTALL/usr/share/icons/hicolor/512x512/apps/squad-air.png"

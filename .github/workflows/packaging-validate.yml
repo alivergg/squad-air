@@ -1,0 +1,82 @@
+name: Packaging Validate
+
+on:
+  push:
+    branches: [main, dev]
+    paths:
+      - "packaging/**"
+      - "snap/**"
+      - "installer/linux/**"
+      - "scripts/update_aur_pkgbuild.sh"
+      - "Cargo.lock"
+      - ".github/workflows/packaging-validate.yml"
+  pull_request:
+    paths:
+      - "packaging/**"
+      - "snap/**"
+      - "installer/linux/**"
+      - "scripts/update_aur_pkgbuild.sh"
+      - "Cargo.lock"
+      - ".github/workflows/packaging-validate.yml"
+  workflow_dispatch:
+
+jobs:
+  validate-manifests:
+    name: Validate Desktop, AppStream, YAML, AUR, and Flatpak Cargo Sources
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            appstream \
+            desktop-file-utils \
+            python3-aiohttp \
+            python3-tomlkit \
+            python3-yaml
+
+      - name: Validate desktop entries
+        run: |
+          desktop-file-validate installer/linux/squad-air.desktop
+          desktop-file-validate packaging/flatpak/app.squadair.SquadAir.desktop
+
+      - name: Validate AppStream metainfo XML (Flathub pedantic)
+        run: appstreamcli validate --no-net --pedantic packaging/flatpak/app.squadair.SquadAir.metainfo.xml
+
+      - name: Validate YAML and JSON manifests
+        run: |
+          python3 - <<'PY'
+          import json, yaml, glob
+          for path in glob.glob("packaging/**/*.yaml", recursive=True) + glob.glob("packaging/**/*.yml", recursive=True) + ["snap/snapcraft.yaml"]:
+              with open(path) as f:
+                  yaml.safe_load(f)
+              print("YAML OK:", path)
+          with open("packaging/flatpak/flathub.json") as f:
+              json.load(f)
+          print("JSON OK: packaging/flatpak/flathub.json")
+          PY
+
+      - name: Validate AUR PKGBUILD & .SRCINFO generator
+        run: |
+          chmod +x scripts/update_aur_pkgbuild.sh
+          TMP_AUR="$(mktemp -d)"
+          ./scripts/update_aur_pkgbuild.sh "1.6" "f13f0db4e46463e6fa70ffcc3fe5c1b8523cfc2577a3b377246cf24be71b9b5e" "$TMP_AUR"
+          diff -u packaging/aur/squad-air-bin/PKGBUILD "$TMP_AUR/PKGBUILD"
+          diff -u packaging/aur/squad-air-bin/.SRCINFO "$TMP_AUR/.SRCINFO"
+          rm -rf "$TMP_AUR"
+
+      - name: Generate and verify Flathub cargo-sources.json from Cargo.lock
+        run: |
+          curl -fsSL https://raw.githubusercontent.com/flatpak/flatpak-builder-tools/master/cargo/flatpak-cargo-generator.py -o /tmp/flatpak-cargo-generator.py
+          python3 /tmp/flatpak-cargo-generator.py Cargo.lock -o /tmp/cargo-sources.json
+          python3 -m json.tool /tmp/cargo-sources.json >/dev/null
+          ls -lh /tmp/cargo-sources.json
+
+      - name: Upload generated Flatpak cargo-sources.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: flatpak-cargo-sources
+          path: /tmp/cargo-sources.json

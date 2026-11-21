@@ -455,7 +455,7 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
 
     let min_to_tray = app.config.minimize_to_tray;
     let current_ver = crate::current_app_version();
-    #[cfg(not(feature = "ms_store"))]
+    #[cfg(not(feature = "managed_updates"))]
     let update_subtitle = if let Some(ref info) = app.available_update {
         format!("Update available: {} ({})", info.tag_name, info.asset_name)
     } else if let Some(ref status) = app.update_status_text {
@@ -465,14 +465,16 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     };
     #[cfg(feature = "ms_store")]
     let update_subtitle = "Updates are managed automatically by Microsoft Store".to_string();
+    #[cfg(all(feature = "managed_updates", not(feature = "ms_store")))]
+    let update_subtitle = "Updates are managed automatically by your package manager".to_string();
 
-    #[cfg(not(feature = "ms_store"))]
+    #[cfg(not(feature = "managed_updates"))]
     let mut app_actions = row![button(text("Check for Updates").size(12))
         .padding([6, 12])
         .style(pill_tonal_button)
         .on_press(Message::CheckForUpdatesManual),]
     .spacing(8);
-    #[cfg(not(feature = "ms_store"))]
+    #[cfg(not(feature = "managed_updates"))]
     if let Some(ref info) = app.available_update {
         app_actions = app_actions.push(
             button(text(format!("Update to {}", info.tag_name)).size(12))
@@ -483,6 +485,10 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
     }
     #[cfg(feature = "ms_store")]
     let app_actions = row![text("Microsoft Store")
+        .size(12)
+        .color(M3_ON_SURFACE_VARIANT)];
+    #[cfg(all(feature = "managed_updates", not(feature = "ms_store")))]
+    let app_actions = row![text("Package Managed")
         .size(12)
         .color(M3_ON_SURFACE_VARIANT)];
 

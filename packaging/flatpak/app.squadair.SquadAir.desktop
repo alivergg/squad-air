@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=SquadAir
+GenericName=P2P Voice & Screen Share
+Comment=End-to-end encrypted P2P voice chat, screen sharing, and squad messaging
+Exec=squad-client %u
+Icon=app.squadair.SquadAir
+Terminal=false
+Categories=Network;InstantMessaging;AudioVideo;Game;
+MimeType=x-scheme-handler/squad;x-scheme-handler/voice;
+StartupWMClass=SquadAir
+Keywords=voice;chat;p2p;gaming;voip;opus;

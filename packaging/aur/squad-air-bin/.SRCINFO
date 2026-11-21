@@ -1,0 +1,20 @@
+pkgbase = squad-air-bin
+	pkgdesc = Ultra-lightweight, zero-knowledge P2P voice chat and 1080p60 screen sharing built in pure Rust
+	pkgver = 1.6
+	pkgrel = 1
+	url = https://squadair.app/
+	arch = x86_64
+	license = AGPL-3.0-only
+	depends = alsa-lib
+	depends = gtk3
+	depends = libx11
+	depends = libxcb
+	depends = libxkbcommon
+	depends = libayatana-appindicator
+	depends = opus
+	provides = squad-air
+	conflicts = squad-air
+	source = squad-air-1.6-1-x86_64.pkg.tar.zst::https://github.com/alivergg/squad-air/releases/download/v1.6/squad-air-1.6-1-x86_64.pkg.tar.zst
+	sha256sums = f13f0db4e46463e6fa70ffcc3fe5c1b8523cfc2577a3b377246cf24be71b9b5e
+
+pkgname = squad-air-bin

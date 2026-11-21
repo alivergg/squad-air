@@ -86,7 +86,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     .width(Length::Fill)
     .style(canvas_panel_style);
 
-    #[cfg_attr(feature = "ms_store", allow(unused_mut))]
+    #[cfg_attr(feature = "managed_updates", allow(unused_mut))]
     let mut sidebar_head = column![
         text("SquadAir").size(20).color(M3_PRIMARY),
         text("Private Voice & Screen Share")
@@ -95,7 +95,7 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     ]
     .spacing(2);
 
-    #[cfg(not(feature = "ms_store"))]
+    #[cfg(not(feature = "managed_updates"))]
     if let Some(ref info) = app.available_update {
         sidebar_head = sidebar_head.push(
             container(

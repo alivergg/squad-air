@@ -11,7 +11,13 @@
 #include <wchar.h>
 
 #define APP_NAME L"SquadAir"
-#define APP_VERSION L"0.1.0"
+#define WIDEN2(x) L##x
+#define WIDEN(x) WIDEN2(x)
+#ifdef APP_VERSION_STR
+#define APP_VERSION WIDEN(APP_VERSION_STR)
+#else
+#define APP_VERSION L"1.0"
+#endif
 #define RESOURCE_PAYLOAD_ID 101
 #define IDC_INSTALL_BTN 1001
 #define IDC_CANCEL_BTN 1002
@@ -245,16 +251,65 @@ static void write_uninstall_registry(void) {
                    (DWORD)((wcslen(APP_NAME) + 1) * sizeof(wchar_t)));
     RegSetValueExW(hkey, L"DisplayVersion", 0, REG_SZ, (const BYTE *)APP_VERSION,
                    (DWORD)((wcslen(APP_VERSION) + 1) * sizeof(wchar_t)));
-    RegSetValueExW(hkey, L"Publisher", 0, REG_SZ, (const BYTE *)L"SquadAir Open Source",
-                   (DWORD)((wcslen(L"SquadAir Open Source") + 1) * sizeof(wchar_t)));
+    RegSetValueExW(hkey, L"Publisher", 0, REG_SZ, (const BYTE *)L"SquadAir",
+                   (DWORD)((wcslen(L"SquadAir") + 1) * sizeof(wchar_t)));
+    RegSetValueExW(hkey, L"URLInfoAbout", 0, REG_SZ, (const BYTE *)L"https://squadair.app/",
+                   (DWORD)((wcslen(L"https://squadair.app/") + 1) * sizeof(wchar_t)));
     RegSetValueExW(hkey, L"InstallLocation", 0, REG_SZ, (const BYTE *)g_install_dir,
                    (DWORD)((wcslen(g_install_dir) + 1) * sizeof(wchar_t)));
     RegSetValueExW(hkey, L"DisplayIcon", 0, REG_SZ, (const BYTE *)g_exe_path,
                    (DWORD)((wcslen(g_exe_path) + 1) * sizeof(wchar_t)));
+    const wchar_t *uninstall_cmd =
+        L"cmd.exe /c taskkill /f /im SquadAir.exe >nul 2>&1 & "
+        L"rmdir /s /q \"%LOCALAPPDATA%\\Programs\\SquadAir\" & "
+        L"del /f /q \"%APPDATA%\\Microsoft\\Windows\\Start Menu\\Programs\\SquadAir.lnk\" & "
+        L"reg delete HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\SquadAir /f";
+    DWORD uninstall_len = (DWORD)((wcslen(uninstall_cmd) + 1) * sizeof(wchar_t));
+    RegSetValueExW(hkey, L"UninstallString", 0, REG_SZ, (const BYTE *)uninstall_cmd, uninstall_len);
+    RegSetValueExW(hkey, L"QuietUninstallString", 0, REG_SZ, (const BYTE *)uninstall_cmd, uninstall_len);
     DWORD one = 1;
     RegSetValueExW(hkey, L"NoModify", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
     RegSetValueExW(hkey, L"NoRepair", 0, REG_DWORD, (const BYTE *)&one, sizeof(one));
     RegCloseKey(hkey);
+}
+
+static BOOL has_flag(const wchar_t *cmd, const wchar_t *flag) {
+    if (!cmd || !flag) {
+        return FALSE;
+    }
+    size_t flag_len = wcslen(flag);
+    const wchar_t *p = cmd;
+    while (*p) {
+        while (*p == L' ' || *p == L'\t') {
+            p++;
+        }
+        if (*p == L'\0') {
+            break;
+        }
+        const wchar_t *start = p;
+        while (*p && *p != L' ' && *p != L'\t') {
+            p++;
+        }
+        size_t tok_len = (size_t)(p - start);
+        if (tok_len == flag_len && _wcsnicmp(start, flag, flag_len) == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static int run_silent_installation(void) {
+    kill_running_instances();
+    if (!ensure_install_dir() || !extract_payload_atomically()) {
+        return 1;
+    }
+    HRESULT hr_co = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (SUCCEEDED(hr_co)) {
+        create_start_menu_shortcut();
+        CoUninitialize();
+    }
+    write_uninstall_registry();
+    return 0;
 }
 
 static void run_installation(HWND hwnd) {
@@ -390,11 +445,18 @@ static LRESULT CALLBACK wnd_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
 
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLine, int nCmdShow) {
     (void)hPrevInstance;
-    (void)lpCmdLine;
     harden_dll_search_path();
     g_hinst = hInstance;
 
+    BOOL silent = has_flag(lpCmdLine, L"/S") ||
+                  has_flag(lpCmdLine, L"/SILENT") ||
+                  has_flag(lpCmdLine, L"/VERYSILENT") ||
+                  has_flag(lpCmdLine, L"--silent");
+
     if (!init_install_paths()) {
+        if (silent) {
+            return 1;
+        }
         MessageBoxW(
             NULL,
             L"Could not locate the Local AppData directory.",
@@ -402,6 +464,10 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, PWSTR lpCmdLin
             MB_OK | MB_ICONERROR
         );
         return 1;
+    }
+
+    if (silent) {
+        return run_silent_installation();
     }
 
     const wchar_t *cls_name = L"SquadAirSetupWindow";

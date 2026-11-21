@@ -95,7 +95,7 @@ Name:           squad-air
 Version:        ${RPM_VER}
 Release:        1
 Summary:        Lightweight E2EE P2P voice chat, screen sharing, and squad messaging
-License:        MIT
+License:        AGPL-3.0-only
 URL:            https://github.com/alivergg/squad-air
 AutoReqProv:    no
 Requires:       alsa-lib, gtk3, libX11, libxkbcommon
@@ -139,7 +139,7 @@ builddate = ${BUILD_DATE}
 packager = SquadAir Contributors <noreply@github.com>
 size = ${INSTALLED_BYTES}
 arch = x86_64
-license = MIT
+license = AGPL-3.0-only
 depend = alsa-lib
 depend = gtk3
 depend = libx11

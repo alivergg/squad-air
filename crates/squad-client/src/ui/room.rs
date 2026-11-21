@@ -149,7 +149,7 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                 .on_press(Message::CopyInviteUri),
         );
 
-    #[cfg(not(feature = "ms_store"))]
+    #[cfg(not(feature = "managed_updates"))]
     if let Some(ref info) = app.available_update {
         header_row = header_row.push(
             button(text(format!("Update {}", info.tag_name)).size(12))

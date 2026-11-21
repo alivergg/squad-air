@@ -6,7 +6,7 @@ mod hotkeys;
 mod net;
 mod tray;
 mod ui;
-#[cfg(not(feature = "ms_store"))]
+#[cfg(not(feature = "managed_updates"))]
 mod updater;
 
 use ui::SquadApp;

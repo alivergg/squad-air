@@ -1,0 +1,50 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>app.squadair.SquadAir</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only</project_license>
+  <name>SquadAir</name>
+  <summary>Ultra-lightweight P2P voice chat and 1080p60 screen sharing</summary>
+  <developer id="app.squadair">
+    <name>SquadAir Contributors</name>
+  </developer>
+  <description>
+    <p>
+      SquadAir is a fast, native desktop voice chat and screen-sharing app built in pure Rust for competitive gamers and squads who want crisp, low-latency comms without Electron bloat, accounts, or central media servers.
+    </p>
+    <p>Key features:</p>
+    <ul>
+      <li>Direct peer-to-peer encrypted UDP transport using ChaCha20-Poly1305 with client-side BLAKE3 keys and zero accounts</li>
+      <li>Free 1080p 60fps screen sharing with atomic 64x64 tile updates, XOR-FEC, and direct GPU shader presentation</li>
+      <li>10 ms Opus voice DSP with WebRTC AEC3 echo cancellation, RNNoise suppression, and adaptive jitter profiles</li>
+      <li>2-second squad connect via 6-digit SPAKE2 voice codes, decentralized X25519 friends, LAN rooms with automatic host failover, and squad:// invite links</li>
+      <li>Encrypted room chat with inline clipboard screenshots and BLAKE3-verified P2P swarm file transfers</li>
+    </ul>
+  </description>
+  <launchable type="desktop-id">app.squadair.SquadAir.desktop</launchable>
+  <url type="homepage">https://squadair.app/</url>
+  <url type="bugtracker">https://github.com/alivergg/squad-air/issues</url>
+  <url type="vcs-browser">https://github.com/alivergg/squad-air</url>
+  <screenshots>
+    <screenshot type="default">
+      <caption>Active voice room with 1080p60 screen sharing, P2P telemetry, and encrypted chat</caption>
+      <image>https://raw.githubusercontent.com/alivergg/squad-air/main/installer/msix/StoreListing/Screenshot-Room-Win.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Lobby with 6-digit SPAKE2 voice code, LAN discovery, and X25519 friends</caption>
+      <image>https://raw.githubusercontent.com/alivergg/squad-air/main/installer/msix/StoreListing/Screenshot-Lobby-Win.png</image>
+    </screenshot>
+  </screenshots>
+  <content_rating type="oars-1.1">
+    <content_attribute id="social-chat">intense</content_attribute>
+    <content_attribute id="social-audio">intense</content_attribute>
+  </content_rating>
+  <releases>
+    <release version="1.6" date="2026-11-20">
+      <url type="details">https://github.com/alivergg/squad-air/releases/tag/v1.6</url>
+      <description>
+        <p>Native pure-Rust P2P voice chat, 1080p60 screen sharing, and Microsoft Store packaging support.</p>
+      </description>
+    </release>
+  </releases>
+</component>

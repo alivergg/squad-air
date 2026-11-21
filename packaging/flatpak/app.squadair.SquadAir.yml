@@ -1,0 +1,52 @@
+app-id: app.squadair.SquadAir
+runtime: org.gnome.Platform
+runtime-version: '47'
+sdk: org.gnome.Sdk
+sdk-extensions:
+  - org.freedesktop.Sdk.Extension.rust-stable
+command: squad-client
+finish-args:
+  - --share=ipc
+  - --share=network
+  - --socket=fallback-x11
+  - --socket=wayland
+  - --socket=pulseaudio
+  - --device=dri
+  - --talk-name=org.kde.StatusNotifierWatcher
+build-options:
+  append-path: /usr/lib/sdk/rust-stable/bin
+  env:
+    CARGO_HOME: /run/build/squad-air/cargo
+modules:
+  - name: libxdo
+    buildsystem: simple
+    build-commands:
+      - make WITHOUT_RPATH_FIX=1 libxdo.so libxdo.pc
+      - make PREFIX=/app installlib installheader installpc
+    sources:
+      - type: archive
+        url: https://github.com/jordansissel/xdotool/archive/refs/tags/v4.20260303.1.tar.gz
+        sha256: c1f971a384da588eb99ca0755fc4300316d49c1e612537e3f1de52215e104fa3
+    cleanup:
+      - /include
+      - /lib/pkgconfig
+
+  - name: squad-air
+    buildsystem: simple
+    build-commands:
+      - cargo --offline fetch --manifest-path Cargo.toml --verbose
+      - cargo --offline build --release --locked -p squad-client --features managed_updates
+      - install -Dm755 target/release/squad-client /app/bin/squad-client
+      - install -Dm644 packaging/flatpak/app.squadair.SquadAir.desktop /app/share/applications/app.squadair.SquadAir.desktop
+      - install -Dm644 packaging/flatpak/app.squadair.SquadAir.metainfo.xml /app/share/metainfo/app.squadair.SquadAir.metainfo.xml
+      - install -Dm644 site/assets/img/icon-512.png /app/share/icons/hicolor/512x512/apps/app.squadair.SquadAir.png
+      - install -Dm644 LICENSE /app/share/licenses/app.squadair.SquadAir/LICENSE
+    sources:
+      - type: git
+        url: https://github.com/alivergg/squad-air.git
+        tag: v1.6
+        commit: 20d5164905e2e5fc4afd199c0da8f6ca24e40406
+        x-checker-data:
+          type: git
+          tag-pattern: ^v([\d.]+)$
+      - cargo-sources.json

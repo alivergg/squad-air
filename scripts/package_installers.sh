@@ -21,8 +21,9 @@ fi
 
 PKGBUILD_BIN="/usr/bin/pkgbuild"
 
-VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
-VERSION="${VERSION:-0.1.0}"
+CARGO_VERSION="$(awk -F'"' '/^version = / { print $2; exit }' "$ROOT_DIR/Cargo.toml")"
+VERSION="${SQUADAIR_VERSION:-${CARGO_VERSION:-0.1.0}}"
+VERSION="${VERSION#v}"
 
 DIST_DIR="$ROOT_DIR/dist"
 STAGING_DIR="$ROOT_DIR/target/pkg-staging"
@@ -32,6 +33,7 @@ APP_BUNDLE="$MAC_ROOT/SquadAir.app"
 DIST_APP="$DIST_DIR/SquadAir.app"
 MAC_PKG="$DIST_DIR/SquadAir-Installer-macos-arm64.pkg"
 WIN_SETUP="$DIST_DIR/SquadAir-Setup-windows-x86_64.exe"
+WIN_ZIP="$DIST_DIR/squad-client-windows-x86_64.zip"
 
 echo "==> [1/4] Building macOS release binary (v${VERSION})..."
 "$CARGO_BIN" build --release --locked -p squad-client
@@ -138,12 +140,13 @@ echo "==> [4/4] Packaging Windows setup executable (${WIN_SETUP})..."
     -O coff \
     -o "$STAGING_DIR/win_payload.o"
 
-rm -f "$WIN_SETUP"
+rm -f "$WIN_SETUP" "$WIN_ZIP"
 "$MINGW_GCC_BIN" \
     -finput-charset=UTF-8 \
     -O2 \
     -municode \
     -mwindows \
+    -DAPP_VERSION_STR="\"${VERSION}\"" \
     "$ROOT_DIR/scripts/windows_installer.c" \
     "$STAGING_DIR/win_payload.o" \
     -o "$WIN_SETUP" \
@@ -159,5 +162,8 @@ rm -f "$WIN_SETUP"
     -Wl,-Bstatic -lssp -Wl,-Bdynamic \
     -s
 
+cp "$ROOT_DIR/target/x86_64-pc-windows-gnu/release/squad-client.exe" "$STAGING_DIR/SquadAir.exe"
+zip -j "$WIN_ZIP" "$STAGING_DIR/SquadAir.exe"
+
 echo "==> Done! Generated installers:"
-ls -lh "$MAC_PKG" "$WIN_SETUP"
+ls -lh "$MAC_PKG" "$WIN_SETUP" "$WIN_ZIP"
