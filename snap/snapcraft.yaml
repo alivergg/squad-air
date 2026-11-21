@@ -1,6 +1,6 @@
 name: squad-air
 base: core24
-version: "1.6"
+version: "1.7"
 summary: Ultra-lightweight P2P voice chat and 1080p60 screen sharing in Rust
 description: |
   SquadAir is a fast, native desktop voice chat and screen-sharing app built in
@@ -37,9 +37,21 @@ apps:
       - screen-inhibit-control
 
 parts:
+  rust-deps:
+    plugin: nil
+    build-packages:
+      - curl
+      - ca-certificates
+    override-build: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --profile minimal
+      ln -sf "$HOME/.cargo/bin/cargo" /usr/local/bin/cargo
+      ln -sf "$HOME/.cargo/bin/rustc" /usr/local/bin/rustc
+
   squad-air:
+    after: [rust-deps]
     source: .
     plugin: rust
+    rust-channel: "none"
     rust-path: ["crates/squad-client"]
     rust-features: ["managed_updates"]
     build-packages:

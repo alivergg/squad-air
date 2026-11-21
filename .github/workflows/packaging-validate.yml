@@ -80,3 +80,23 @@ jobs:
         with:
           name: flatpak-cargo-sources
           path: /tmp/cargo-sources.json
+
+  build-snap-check:
+    name: Verify Snapcraft Build (dev)
+    if: github.ref == 'refs/heads/dev'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Snap package
+        id: snap-build
+        uses: snapcore/action-build@v1
+        with:
+          snapcraft-channel: latest/stable
+
+      - name: Upload Snap verification artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-linux-snap
+          path: ${{ steps.snap-build.outputs.snap }}
