@@ -10,6 +10,7 @@
 
 <p align="center">
   <a href="https://squadair.app/"><img src="https://img.shields.io/badge/Website-squadair.app-3B82F6?style=flat-square" alt="Official Website — squadair.app" /></a>
+  <a href="https://apps.microsoft.com/detail/9PH8NXTQMC73"><img src="https://img.shields.io/badge/Microsoft%20Store-%241.99%20(No%20SmartScreen)-0078D4?style=flat-square&logo=microsoft" alt="Microsoft Store" /></a>
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/ci.yml?branch=main&label=CI&style=flat-square" alt="CI" /></a>
   <a href=".github/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/release.yml?branch=main&label=Release&style=flat-square" alt="Release" /></a>
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2021%20(Pure%20Native)-orange?style=flat-square&logo=rust" alt="Rust 2021" /></a>
@@ -186,7 +187,8 @@ flowchart LR
 ### 1. Download & Install ([Latest Release](https://github.com/alivergg/squad-air/releases/latest))
 
 - **Windows (`x86_64`):**
-  Download `SquadAir-Setup-windows-x86_64.exe` and run it. Installs to `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` with no admin elevation required and preserves `%APPDATA%\squad-air\config.toml`.
+  - **Free Direct Installer:** Download `SquadAir-Setup-windows-x86_64.exe` and run it. Installs to `%LOCALAPPDATA%\Programs\SquadAir\SquadAir.exe` with no admin elevation required and preserves `%APPDATA%\squad-air\config.toml`.
+  - **Microsoft Store (`$1.99`):** Install from the [Microsoft Store](https://apps.microsoft.com/detail/9PH8NXTQMC73) for a Microsoft-signed MSIX package, zero SmartScreen prompts, automatic Store updates, and to support ongoing development.
 - **macOS (`Apple Silicon`):**
   Download `SquadAir-Installer-macos-arm64.pkg` and open it. Upgrades `/Applications/SquadAir.app` in place and preserves `~/Library/Application Support/squad-air/config.toml`.
   - **macOS Permissions Checklist** (*System Settings -> Privacy & Security*):

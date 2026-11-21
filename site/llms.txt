@@ -16,7 +16,8 @@
 ## Official Links & Documentation
 
 - [SquadAir Official Website](https://squadair.app/): Product overview, interactive HUD simulator, live benchmarks, and platform quick-start guide.
-- [Download Latest Release](https://github.com/alivergg/squad-air/releases/latest): Prebuilt installers and packages for Windows (`x86_64`), macOS (`arm64`), and Linux, plus `SHA256SUMS.txt`.
+- [SquadAir on Microsoft Store ($1.99)](https://apps.microsoft.com/detail/9PH8NXTQMC73): Official Microsoft-signed Windows MSIX release with automatic Windows updates and zero SmartScreen prompts.
+- [Download Latest Release (Free)](https://github.com/alivergg/squad-air/releases/latest): Prebuilt installers and packages for Windows (`x86_64`), macOS (`arm64`), and Linux, plus `SHA256SUMS.txt`.
 - [All Releases & Changelog](https://github.com/alivergg/squad-air/releases): Version history and release artifacts.
 - [Source Code (GitHub)](https://github.com/alivergg/squad-air): Full 5-crate Rust workspace source code, CI workflows, and packaging scripts.
 - [Security & Cryptography Specification](https://squadair.app/security.html): Packet nonces, AAD layout, `X25519`/`SPAKE2` protocols, Tier 3 anti-amplification relay limits, and vulnerability disclosure.

@@ -5,13 +5,26 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>SquadAir — Ultra-Light P2P Voice Chat &amp; 1080p60 Screen Share (Zero Accounts)</title>
   <meta name="description" content="SquadAir (squadair) is a native Rust P2P voice chat and free 1080p60 screen share app using under 50 MB RAM with ChaCha20-Poly1305 E2EE and zero accounts.">
+  <meta name="robots" content="index, follow, max-image-preview:large">
+  <meta name="thumbnail" content="https://squadair.app/assets/img/thumb-square.png">
   <meta name="theme-color" content="#181818">
   <link rel="canonical" href="https://squadair.app/">
   <link rel="alternate" type="text/plain" title="SquadAir LLM Context" href="https://squadair.app/llms.txt">
   <link rel="manifest" href="/site.webmanifest">
-  <link rel="icon" href="/favicon.ico" sizes="any">
+  <link rel="icon" href="/favicon.ico" sizes="48x48 32x32 16x16">
+  <link rel="icon" href="/assets/img/icon-48.png" sizes="48x48" type="image/png">
+  <link rel="icon" href="/assets/img/icon-96.png" sizes="96x96" type="image/png">
   <link rel="icon" href="/assets/img/icon-192.png" sizes="192x192" type="image/png">
   <link rel="apple-touch-icon" href="/assets/img/icon-192.png">
+  <!--
+    <PageMap>
+      <DataObject type="thumbnail">
+        <Attribute name="src" value="https://squadair.app/assets/img/thumb-square.png"/>
+        <Attribute name="width" value="1080"/>
+        <Attribute name="height" value="1080"/>
+      </DataObject>
+    </PageMap>
+  -->
 
   <meta property="og:type" content="website">
   <meta property="og:site_name" content="SquadAir">
@@ -39,7 +52,20 @@
         "@type": "WebSite",
         "name": "SquadAir",
         "alternateName": "squadair",
-        "url": "https://squadair.app/"
+        "url": "https://squadair.app/",
+        "image": "https://squadair.app/assets/img/thumb-square.png"
+      },
+      {
+        "@type": "WebPage",
+        "url": "https://squadair.app/",
+        "name": "SquadAir — Ultra-Light P2P Voice Chat & 1080p60 Screen Share",
+        "thumbnailUrl": "https://squadair.app/assets/img/thumb-square.png",
+        "primaryImageOfPage": {
+          "@type": "ImageObject",
+          "url": "https://squadair.app/assets/img/thumb-square.png",
+          "width": 1080,
+          "height": 1080
+        }
       },
       {
         "@type": "SoftwareApplication",
@@ -47,17 +73,33 @@
         "alternateName": "squadair",
         "applicationCategory": "CommunicationApplication",
         "operatingSystem": "Windows 10, Windows 11, macOS 13+, Linux",
-        "softwareVersion": "1.3",
+        "softwareVersion": "1.6",
+        "image": "https://squadair.app/assets/img/thumb-square.png",
+        "screenshot": [
+          "https://squadair.app/assets/img/lobby.png",
+          "https://squadair.app/assets/img/main.png"
+        ],
         "downloadUrl": "https://github.com/alivergg/squad-air/releases/latest",
+        "installUrl": "https://apps.microsoft.com/detail/9PH8NXTQMC73",
         "isAccessibleForFree": true,
         "license": "https://github.com/alivergg/squad-air/blob/main/LICENSE",
-        "offers": {
-          "@type": "Offer",
-          "price": "0",
-          "priceCurrency": "USD"
-        },
+        "offers": [
+          {
+            "@type": "Offer",
+            "price": "0",
+            "priceCurrency": "USD",
+            "url": "https://github.com/alivergg/squad-air/releases/latest"
+          },
+          {
+            "@type": "Offer",
+            "price": "1.99",
+            "priceCurrency": "USD",
+            "url": "https://apps.microsoft.com/detail/9PH8NXTQMC73"
+          }
+        ],
         "sameAs": [
-          "https://github.com/alivergg/squad-air"
+          "https://github.com/alivergg/squad-air",
+          "https://apps.microsoft.com/detail/9PH8NXTQMC73"
         ]
       },
       {
@@ -191,6 +233,14 @@
                   <path d="M12 3v12m0 0-4.5-4.5M12 15l4.5-4.5M4 19.5h16"/>
                 </svg>
                 <span data-download-label>Download for Windows (.exe)</span>
+              </a>
+
+              <a
+                href="https://apps.microsoft.com/detail/9PH8NXTQMC73"
+                class="btn btn--secondary btn--lg button-md"
+                rel="noopener"
+              >
+                Microsoft Store ($1.99)
               </a>
 
               <a
@@ -889,7 +939,7 @@
             <span class="keycap">SquadAir-Setup-windows-x86_64.exe</span>
           </div>
           <p class="body-6 text-secondary">
-            SquadAir is an independent open-source project without a paid commercial EV code-signing certificate, so Windows Defender SmartScreen displays <span class="body-5">Windows protected your PC</span> on a fresh release binary.
+            SquadAir is free and open source on GitHub (without a commercial EV code-signing certificate, so Windows Defender SmartScreen displays <span class="body-5">Windows protected your PC</span> on first run). Prefer 1-click Microsoft-signed installation with automatic Windows updates and zero SmartScreen prompts? Get it on the <a href="https://apps.microsoft.com/detail/9PH8NXTQMC73" rel="noopener">Microsoft Store ($1.99)</a>.
           </p>
           <ol class="step-list">
             <li class="step-item">
@@ -1023,6 +1073,9 @@
             </svg>
             <span data-download-label>Download for Windows (.exe)</span>
           </a>
+          <a href="https://apps.microsoft.com/detail/9PH8NXTQMC73" class="btn btn--secondary btn--lg button-md" rel="noopener">
+            Microsoft Store ($1.99)
+          </a>
           <a href="https://github.com/alivergg/squad-air/releases" class="btn btn--secondary btn--lg button-md">
             Release Notes
           </a>
@@ -1050,7 +1103,8 @@
         <div>
           <h2 class="title-4">Product</h2>
           <ul class="footer-list body-6">
-            <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download</a></li>
+            <li><a href="https://apps.microsoft.com/detail/9PH8NXTQMC73" rel="noopener">Microsoft Store ($1.99)</a></li>
+            <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download (Free)</a></li>
             <li><a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a></li>
             <li><a href="https://github.com/alivergg/squad-air">Source Code</a></li>
             <li><a href="#first-run">First Run &amp; SmartScreen</a></li>
