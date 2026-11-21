@@ -905,16 +905,16 @@ h3[id] {
   gap: var(--space-200);
 }
 
-@media (min-width: 980px) {
+@media (min-width: 1040px) {
   .install-grid {
     grid-template-columns: repeat(3, minmax(0, 1fr));
   }
 }
 
 .install-card {
-  display: grid;
-  align-content: start;
-  gap: var(--space-200);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-100);
   padding: var(--space-300);
   border-radius: var(--radius-xl);
   background-color: var(--bg-card);
@@ -945,6 +945,20 @@ h3[id] {
   align-items: center;
   justify-content: space-between;
   gap: var(--space-75);
+}
+
+.install-cta-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-75);
+  padding-block-start: var(--space-25);
+}
+
+.install-foot {
+  margin: 0;
+  margin-block-start: auto;
+  padding-block-start: var(--space-100);
+  border-block-start: 1px solid var(--border-hairline);
 }
 
 .install-pill {
@@ -981,7 +995,7 @@ h3[id] {
 .install-code {
   min-inline-size: 0;
   flex: 1 1 auto;
-  font-size: 12.5px;
+  font-size: 12px;
   line-height: 18px;
   color: var(--text-primary);
   white-space: pre-wrap;

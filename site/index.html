@@ -41,8 +41,8 @@
   <meta name="twitter:description" content="Pure Rust P2P voice and free 1080p60 screen sharing under 50 MB RAM. Zero accounts, zero central media servers.">
   <meta name="twitter:image" content="https://squadair.app/assets/img/og-cover.png">
 
-  <link rel="stylesheet" href="assets/css/main.css">
-  <script defer src="assets/js/app.js"></script>
+  <link rel="stylesheet" href="assets/css/main.css?v=20261121">
+  <script defer src="assets/js/app.js?v=20261121"></script>
 
   <script type="application/ld+json">
   {
@@ -961,10 +961,10 @@
       <div class="install-grid">
         <article class="install-card" data-reveal>
           <div class="tier-header">
-            <h3 class="heading-4">Windows (x86_64)</h3>
+            <h3 class="heading-4">Windows</h3>
             <span class="tier-badge caption-4 mono-num">
               <span class="status-led" aria-hidden="true"></span>
-              Win10 / Win11
+              x86_64 · Win10/11
             </span>
           </div>
 
@@ -974,9 +974,9 @@
               <span class="install-pill install-pill--live caption-4">Live · Signed MSIX</span>
             </div>
             <p class="body-6 text-secondary">
-              Zero SmartScreen prompts, automatic Store updates, and direct support for SquadAir development.
+              Microsoft-signed install with zero SmartScreen prompts and automatic Store updates.
             </p>
-            <div>
+            <div class="install-cta-row">
               <a href="https://apps.microsoft.com/detail/9PH8NXTQMC73" class="btn btn--primary button-sm" rel="noopener">
                 Open in Microsoft Store
               </a>
@@ -1031,23 +1031,17 @@ scoop install squadair/squadair</code>
             </p>
           </div>
 
-          <div class="install-method">
-            <div class="install-method-head">
-              <span class="body-5">Standalone Installer (Free)</span>
-              <span class="install-pill caption-4">Auto-Updater</span>
-            </div>
-            <p class="body-6 text-secondary">
-              Download <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">SquadAir-Setup-windows-x86_64.exe</span></a> (supports <span class="mono-num">/S</span> silent install, zero admin required).
-            </p>
-          </div>
+          <p class="install-foot caption-2 text-muted">
+            Direct installer: <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">SquadAir-Setup-windows-x86_64.exe</span></a> (<span class="mono-num">/S</span> silent + built-in updater).
+          </p>
         </article>
 
         <article class="install-card" data-reveal>
           <div class="tier-header">
-            <h3 class="heading-4">macOS (Apple Silicon)</h3>
+            <h3 class="heading-4">macOS</h3>
             <span class="tier-badge caption-4 mono-num">
               <span class="status-led" aria-hidden="true"></span>
-              arm64 · macOS 13+
+              Apple Silicon · 13+
             </span>
           </div>
 
@@ -1071,34 +1065,62 @@ scoop install squadair/squadair</code>
                 <span class="copy-tip caption-5" role="status"></span>
               </span>
             </div>
-            <p class="caption-2 text-muted">
-              Updated automatically from GitHub Releases in <a href="https://github.com/alivergg/homebrew-tap" rel="noopener">alivergg/homebrew-tap</a>.
-            </p>
           </div>
 
           <div class="install-method">
             <div class="install-method-head">
-              <span class="body-5">Direct Installer (`.pkg`)</span>
-              <span class="install-pill caption-4">Auto-Updater</span>
+              <span class="body-5">Update via Homebrew</span>
+              <span class="install-pill caption-4">SHA-256 Verified</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-brew-upgrade" class="install-code mono-num">brew upgrade --cask squadair</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-brew-upgrade" aria-label="Copy Homebrew upgrade command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Direct Installer (<span class="mono-num">.pkg</span>)</span>
+              <span class="install-pill caption-4">Built-in Updater</span>
             </div>
             <p class="body-6 text-secondary">
-              Download <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">SquadAir-Installer-macos-arm64.pkg</span></a> to upgrade <span class="mono-num">/Applications/SquadAir.app</span> in place.
+              Upgrades <span class="mono-num">/Applications/SquadAir.app</span> in place and preserves your local config.
             </p>
+            <div class="install-cta-row">
+              <a href="https://github.com/alivergg/squad-air/releases/latest" class="btn btn--secondary button-sm" rel="noopener">
+                Download .pkg Installer
+              </a>
+            </div>
           </div>
+
+          <p class="install-foot caption-2 text-muted">
+            Tap source: <a href="https://github.com/alivergg/homebrew-tap" rel="noopener">alivergg/homebrew-tap</a> · See <a href="#first-run">macOS permissions checklist</a> below.
+          </p>
         </article>
 
         <article class="install-card" data-reveal>
           <div class="tier-header">
-            <h3 class="heading-4">Linux (x86_64)</h3>
+            <h3 class="heading-4">Linux</h3>
             <span class="tier-badge caption-4 mono-num">
               <span class="status-led" aria-hidden="true"></span>
-              Wayland / X11
+              x86_64 · Wayland/X11
             </span>
           </div>
 
           <div class="install-method">
             <div class="install-method-head">
-              <span class="body-5">Snap Store</span>
+              <span class="body-5">Snap Store (Free)</span>
               <span class="install-pill install-pill--live caption-4">Live · Auto-Updated</span>
             </div>
             <div class="install-cmd-box">
@@ -1123,7 +1145,7 @@ scoop install squadair/squadair</code>
 
           <div class="install-method">
             <div class="install-method-head">
-              <span class="body-5">Debian / Ubuntu (`.deb`)</span>
+              <span class="body-5">Debian / Ubuntu (<span class="mono-num">.deb</span>)</span>
               <span class="install-pill caption-4">GitHub Release</span>
             </div>
             <div class="install-cmd-box">
@@ -1145,7 +1167,7 @@ scoop install squadair/squadair</code>
 
           <div class="install-method">
             <div class="install-method-head">
-              <span class="body-5">Fedora / RPM / Arch</span>
+              <span class="body-5">Fedora / Arch Packages</span>
               <span class="install-pill caption-4">GitHub Release</span>
             </div>
             <div class="install-cmd-box">
@@ -1178,10 +1200,11 @@ scoop install squadair/squadair</code>
                 <span class="copy-tip caption-5" role="status"></span>
               </span>
             </div>
-            <p class="caption-2 text-muted">
-              Portable <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener">.tar.gz</a>, Arch <span class="mono-num">PKGBUILD</span>, and validated Flatpak/AUR manifests are included in the repository.
-            </p>
           </div>
+
+          <p class="install-foot caption-2 text-muted">
+            Portable <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">.tar.gz</span></a>, <span class="mono-num">PKGBUILD</span>, and validated Flatpak/AUR manifests are included in the repo.
+          </p>
         </article>
       </div>
     </section>
