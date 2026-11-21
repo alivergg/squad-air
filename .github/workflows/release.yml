@@ -321,16 +321,25 @@ jobs:
           name: release-linux-snap
           path: ${{ steps.snap-build.outputs.snap }}
 
-      - name: Skip Snap Store publish when credentials are unset
-        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS == '' }}
-        run: echo "SNAPCRAFT_STORE_CREDENTIALS secret not configured yet; skipping Snap Store publish."
+      - name: Check Snap Store credentials
+        id: snap-auth
+        env:
+          SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
+        run: |
+          if [[ -n "${SNAPCRAFT_STORE_CREDENTIALS}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "SNAPCRAFT_STORE_CREDENTIALS secret not configured yet; skipping Snap Store publish."
+          fi
 
       - name: Publish to Snap Store
-        if: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS != '' }}
+        if: steps.snap-auth.outputs.configured == 'true'
         uses: snapcore/action-publish@v1
         env:
           SNAPCRAFT_STORE_CREDENTIALS: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
         with:
+          store_login: ${{ secrets.SNAPCRAFT_STORE_CREDENTIALS }}
           snap: ${{ steps.snap-build.outputs.snap }}
           release: stable
 
@@ -451,16 +460,25 @@ jobs:
       - release
     runs-on: ubuntu-latest
     steps:
-      - name: Skip Winget publish when WINGET_TOKEN is unset
-        if: ${{ secrets.WINGET_TOKEN == '' }}
-        run: echo "WINGET_TOKEN secret not configured yet; skipping winget-pkgs PR."
+      - name: Check Winget token
+        id: winget-auth
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          if [[ -n "${WINGET_TOKEN}" ]]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+            echo "WINGET_TOKEN secret not configured yet; skipping winget-pkgs PR."
+          fi
 
       - name: Submit PR to winget-pkgs
-        if: ${{ secrets.WINGET_TOKEN != '' }}
+        if: steps.winget-auth.outputs.configured == 'true'
         uses: vedantmgoyal9/winget-releaser@v2
         with:
           identifier: SquadAir.SquadAir
           version: ${{ needs.prepare-version.outputs.version_num }}
+          release-tag: ${{ needs.prepare-version.outputs.version_tag }}
           installers-regex: '^SquadAir-Setup-windows-x86_64\.exe$'
           token: ${{ secrets.WINGET_TOKEN }}
 
