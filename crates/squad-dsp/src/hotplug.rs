@@ -118,15 +118,23 @@ pub(crate) fn select_device_with_meta(
     is_input: bool,
 ) -> (Option<cpal::Device>, Option<String>, bool) {
     if let Some(target) = preferred_name {
-        let devices = if is_input {
-            host.input_devices().ok()
+        if let Some(idx_str) = target.strip_prefix("@idx:") {
+            if let Ok(idx) = idx_str.parse::<usize>() {
+                if let Some(found) = host.devices().ok().and_then(|mut it| it.nth(idx)) {
+                    return (Some(found), Some(target.to_string()), false);
+                }
+            }
         } else {
-            host.output_devices().ok()
-        };
-        if let Some(mut iter) = devices {
-            if let Some(found) = iter.find(|d| d.name().map(|n| n == target).unwrap_or(false)) {
-                let name = found.name().ok().or_else(|| Some(target.to_string()));
-                return (Some(found), name, false);
+            let devices = if is_input {
+                host.input_devices().ok()
+            } else {
+                host.output_devices().ok()
+            };
+            if let Some(mut iter) = devices {
+                if let Some(found) = iter.find(|d| d.name().map(|n| n == target).unwrap_or(false)) {
+                    let name = found.name().ok().or_else(|| Some(target.to_string()));
+                    return (Some(found), name, false);
+                }
             }
         }
     }
@@ -153,18 +161,30 @@ where
     let mut all_names = Vec::new();
     let mut preferred_rate = None;
 
-    let devices = if is_input {
-        host.input_devices().ok()
-    } else {
-        host.output_devices().ok()
-    };
-    if let Some(iter) = devices {
-        for dev in iter {
-            if let Ok(name) = dev.name() {
+    if preferred_name.is_some_and(|p| p.starts_with("@idx:")) {
+        if let Ok(iter) = host.devices() {
+            for (idx, dev) in iter.enumerate() {
+                let name = format!("@idx:{idx}");
                 if preferred_name == Some(name.as_str()) {
                     preferred_rate = Some(negotiate_fn(&dev, is_input));
                 }
                 all_names.push(name);
+            }
+        }
+    } else {
+        let devices = if is_input {
+            host.input_devices().ok()
+        } else {
+            host.output_devices().ok()
+        };
+        if let Some(iter) = devices {
+            for dev in iter {
+                if let Ok(name) = dev.name() {
+                    if preferred_name == Some(name.as_str()) {
+                        preferred_rate = Some(negotiate_fn(&dev, is_input));
+                    }
+                    all_names.push(name);
+                }
             }
         }
     }

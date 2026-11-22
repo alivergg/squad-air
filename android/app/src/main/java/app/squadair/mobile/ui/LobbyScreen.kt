@@ -14,6 +14,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -177,6 +178,7 @@ fun LobbyScreen(
     if (settingsOpen) {
         SettingsSheet(
             profile = state.profile,
+            selfAvatarRgba = state.peerAvatarsRgba[state.profile.clientUuidHex],
             repository = repository,
             onDismiss = { settingsOpen = false },
         )
@@ -207,10 +209,15 @@ private fun LobbyTopBar(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
+                .statusBarsPadding()
                 .padding(horizontal = 16.dp, vertical = 14.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            RgbaAvatarImage(rgbaBytes = selfAvatarRgba, sizeDp = 42.dp)
+            RgbaAvatarImage(
+                rgbaBytes = selfAvatarRgba,
+                sizeDp = 42.dp,
+                modifier = Modifier.clickable(onClick = onOpenSettings),
+            )
             Spacer(modifier = Modifier.width(12.dp))
             Column(modifier = Modifier.weight(1f)) {
                 Text(
@@ -674,11 +681,64 @@ private fun LanRoomsTab(
         }
     }
 
+    var lanRoomName by remember { mutableStateOf("") }
+    var lanPassword by remember { mutableStateOf("") }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(vertical = 12.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp),
     ) {
+        item {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceCard),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "Host Local Wi-Fi Room",
+                        color = SquadAirTextPrimary,
+                        fontWeight = FontWeight.Medium,
+                        fontSize = 14.sp,
+                    )
+                    OutlinedTextField(
+                        value = lanRoomName,
+                        onValueChange = { lanRoomName = it },
+                        label = { Text("Room Name (optional)") },
+                        placeholder = { Text("${state.profile.nickname}'s LAN") },
+                        singleLine = true,
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    OutlinedTextField(
+                        value = lanPassword,
+                        onValueChange = { lanPassword = it },
+                        label = { Text("Password (optional)") },
+                        singleLine = true,
+                        visualTransformation = PasswordVisualTransformation(),
+                        modifier = Modifier.fillMaxWidth(),
+                    )
+                    Button(
+                        onClick = {
+                            repository.hostLanRoom(lanRoomName, lanPassword.ifBlank { null })
+                            lanPassword = ""
+                        },
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = SquadAirPrimary,
+                            contentColor = SquadAirOnPrimary,
+                        ),
+                        shape = RoundedCornerShape(12.dp),
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Default.Add, contentDescription = null)
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text("Create LAN Room", fontWeight = FontWeight.SemiBold)
+                    }
+                }
+            }
+        }
         item {
             Text(
                 text = "Local Wi-Fi Rooms (UDP 3479)",

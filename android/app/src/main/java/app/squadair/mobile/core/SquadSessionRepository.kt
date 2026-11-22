@@ -53,6 +53,7 @@ data class SquadUiState(
         vadThresholdDb = -45f,
         inputGain = 1.0f,
         streamVolume = 1.0f,
+        hasCustomAvatar = false,
     ),
     val friends: List<MobileFriendItem> = emptyList(),
     val savedChannels: List<MobileSavedChannel> = emptyList(),
@@ -106,9 +107,9 @@ class SquadSessionRepository private constructor(private val appContext: Context
                 )
             }
         },
-        onHardwareRouteSwitched = {
+        onHardwareRouteSwitched = { inputDev, outputDev ->
             if (initialized.get()) {
-                controller.notifyAndroidAudioRouteChanged()
+                controller.setAndroidAudioRouteDevices(inputDev, outputDev)
             }
         },
     )
@@ -170,6 +171,7 @@ class SquadSessionRepository private constructor(private val appContext: Context
     fun createAndJoinRoom() {
         runAction {
             clearRoomDrafts()
+            audioRouteController.activate()
             controller.createAndJoinRoom()
         }
     }
@@ -179,6 +181,7 @@ class SquadSessionRepository private constructor(private val appContext: Context
         if (trimmed.isEmpty()) return
         runAction {
             clearRoomDrafts()
+            audioRouteController.activate()
             controller.joinRoomByInvite(trimmed)
         }
     }
@@ -186,13 +189,23 @@ class SquadSessionRepository private constructor(private val appContext: Context
     fun joinRoomByShortCode(code6Digits: String) {
         runAction {
             clearRoomDrafts()
+            audioRouteController.activate()
             controller.joinRoomByShortCode(code6Digits)
+        }
+    }
+
+    fun hostLanRoom(roomName: String, password: String?) {
+        runAction {
+            clearRoomDrafts()
+            audioRouteController.activate()
+            controller.hostLanRoom(roomName, password)
         }
     }
 
     fun joinLanRoom(roomIdHex: String, password: String?) {
         runAction {
             _uiState.update { it.copy(lanAuthError = null) }
+            audioRouteController.activate()
             controller.joinLanRoom(roomIdHex, password)
         }
     }
@@ -278,6 +291,30 @@ class SquadSessionRepository private constructor(private val appContext: Context
         }
     }
 
+    fun setCustomAvatar(imageBytes: ByteArray) {
+        runAction {
+            val rgba = controller.setCustomAvatar(imageBytes)
+            _uiState.update { st ->
+                st.copy(
+                    profile = st.profile.copy(hasCustomAvatar = true),
+                    peerAvatarsRgba = st.peerAvatarsRgba + (st.profile.clientUuidHex to rgba),
+                )
+            }
+        }
+    }
+
+    fun clearCustomAvatar() {
+        runAction {
+            val rgba = controller.clearCustomAvatar()
+            _uiState.update { st ->
+                st.copy(
+                    profile = st.profile.copy(hasCustomAvatar = false),
+                    peerAvatarsRgba = st.peerAvatarsRgba + (st.profile.clientUuidHex to rgba),
+                )
+            }
+        }
+    }
+
     fun setRendezvousServer(server: String) {
         runAction {
             controller.setRendezvousServer(server)
@@ -309,6 +346,7 @@ class SquadSessionRepository private constructor(private val appContext: Context
         runAction {
             _uiState.update { it.copy(incomingCall = null) }
             clearRoomDrafts()
+            audioRouteController.activate()
             controller.acceptIncomingCall(inviteUri)
         }
     }
@@ -413,8 +451,14 @@ class SquadSessionRepository private constructor(private val appContext: Context
             try {
                 block()
             } catch (e: MobileCoreException) {
+                if (!_uiState.value.inRoom) {
+                    audioRouteController.deactivate()
+                }
                 _uiState.update { it.copy(bannerMessage = e.message) }
             } catch (e: Throwable) {
+                if (!_uiState.value.inRoom) {
+                    audioRouteController.deactivate()
+                }
                 _uiState.update { it.copy(bannerMessage = e.message ?: "Unexpected error") }
             }
         }
@@ -538,6 +582,9 @@ class SquadSessionRepository private constructor(private val appContext: Context
     }
 
     override fun onLanAuthFailed(message: String) {
+        if (!_uiState.value.inRoom) {
+            audioRouteController.deactivate()
+        }
         _uiState.update { it.copy(lanAuthError = message, bannerMessage = message) }
     }
 
@@ -680,6 +727,9 @@ class SquadSessionRepository private constructor(private val appContext: Context
     }
 
     override fun onError(message: String) {
+        if (!_uiState.value.inRoom) {
+            audioRouteController.deactivate()
+        }
         _uiState.update { it.copy(bannerMessage = message) }
     }
 

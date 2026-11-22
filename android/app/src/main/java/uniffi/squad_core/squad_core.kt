@@ -913,6 +913,14 @@ internal open class UniffiVTableCallbackInterfaceMobileEventListener(
 
 
 
+
+
+
+
+
+
+
+
 // A JNA Library to expose the extern-C FFI definitions.
 // This is an implementation detail which will be called internally by the public API.
 
@@ -945,6 +953,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_squad_core_fn_method_mobilecorecontroller_call_or_invite_friend(`ptr`: Pointer,`pubKeyHex`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_squad_core_fn_method_mobilecorecontroller_clear_custom_avatar(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_squad_core_fn_method_mobilecorecontroller_create_and_join_room(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_squad_core_fn_method_mobilecorecontroller_decline_incoming_call(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
@@ -963,6 +973,8 @@ internal interface UniffiLib : Library {
     ): RustBuffer.ByValue
     fun uniffi_squad_core_fn_method_mobilecorecontroller_get_saved_channels(`ptr`: Pointer,uniffi_out_err: UniffiRustCallStatus, 
     ): RustBuffer.ByValue
+    fun uniffi_squad_core_fn_method_mobilecorecontroller_host_lan_room(`ptr`: Pointer,`roomName`: RustBuffer.ByValue,`password`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
     fun uniffi_squad_core_fn_method_mobilecorecontroller_join_lan_room(`ptr`: Pointer,`roomIdHex`: RustBuffer.ByValue,`password`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_squad_core_fn_method_mobilecorecontroller_join_room_by_invite(`ptr`: Pointer,`inviteUri`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
@@ -989,6 +1001,10 @@ internal interface UniffiLib : Library {
     ): Unit
     fun uniffi_squad_core_fn_method_mobilecorecontroller_set_aec_enabled(`ptr`: Pointer,`enabled`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
+    fun uniffi_squad_core_fn_method_mobilecorecontroller_set_android_audio_route_devices(`ptr`: Pointer,`inputDevice`: RustBuffer.ByValue,`outputDevice`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): Unit
+    fun uniffi_squad_core_fn_method_mobilecorecontroller_set_custom_avatar(`ptr`: Pointer,`imageBytes`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+    ): RustBuffer.ByValue
     fun uniffi_squad_core_fn_method_mobilecorecontroller_set_deafened(`ptr`: Pointer,`deafened`: Byte,uniffi_out_err: UniffiRustCallStatus, 
     ): Unit
     fun uniffi_squad_core_fn_method_mobilecorecontroller_set_input_gain(`ptr`: Pointer,`gain`: Float,uniffi_out_err: UniffiRustCallStatus, 
@@ -1137,6 +1153,8 @@ internal interface UniffiLib : Library {
     ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_call_or_invite_friend(
     ): Short
+    fun uniffi_squad_core_checksum_method_mobilecorecontroller_clear_custom_avatar(
+    ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_create_and_join_room(
     ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_decline_incoming_call(
@@ -1154,6 +1172,8 @@ internal interface UniffiLib : Library {
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_get_profile_snapshot(
     ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_get_saved_channels(
+    ): Short
+    fun uniffi_squad_core_checksum_method_mobilecorecontroller_host_lan_room(
     ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_join_lan_room(
     ): Short
@@ -1180,6 +1200,10 @@ internal interface UniffiLib : Library {
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_send_inline_image(
     ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_set_aec_enabled(
+    ): Short
+    fun uniffi_squad_core_checksum_method_mobilecorecontroller_set_android_audio_route_devices(
+    ): Short
+    fun uniffi_squad_core_checksum_method_mobilecorecontroller_set_custom_avatar(
     ): Short
     fun uniffi_squad_core_checksum_method_mobilecorecontroller_set_deafened(
     ): Short
@@ -1267,6 +1291,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
     if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_call_or_invite_friend() != 41156.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_clear_custom_avatar() != 36347.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_create_and_join_room() != 46384.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -1292,6 +1319,9 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_get_saved_channels() != 64269.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_host_lan_room() != 38928.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_join_lan_room() != 46849.toShort()) {
@@ -1331,6 +1361,12 @@ private fun uniffiCheckApiChecksums(lib: UniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_set_aec_enabled() != 44352.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_set_android_audio_route_devices() != 3196.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_set_custom_avatar() != 54154.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_squad_core_checksum_method_mobilecorecontroller_set_deafened() != 56494.toShort()) {
@@ -1854,6 +1890,8 @@ public interface MobileCoreControllerInterface {
     
     fun `callOrInviteFriend`(`pubKeyHex`: kotlin.String)
     
+    fun `clearCustomAvatar`(): kotlin.ByteArray
+    
     fun `createAndJoinRoom`()
     
     fun `declineIncomingCall`()
@@ -1871,6 +1909,8 @@ public interface MobileCoreControllerInterface {
     fun `getProfileSnapshot`(): MobileProfileSnapshot
     
     fun `getSavedChannels`(): List<MobileSavedChannel>
+    
+    fun `hostLanRoom`(`roomName`: kotlin.String, `password`: kotlin.String?)
     
     fun `joinLanRoom`(`roomIdHex`: kotlin.String, `password`: kotlin.String?)
     
@@ -1897,6 +1937,10 @@ public interface MobileCoreControllerInterface {
     fun `sendInlineImage`(`filename`: kotlin.String, `bytes`: kotlin.ByteArray)
     
     fun `setAecEnabled`(`enabled`: kotlin.Boolean)
+    
+    fun `setAndroidAudioRouteDevices`(`inputDevice`: kotlin.String?, `outputDevice`: kotlin.String?)
+    
+    fun `setCustomAvatar`(`imageBytes`: kotlin.ByteArray): kotlin.ByteArray
     
     fun `setDeafened`(`deafened`: kotlin.Boolean)
     
@@ -2054,6 +2098,18 @@ open class MobileCoreController: Disposable, AutoCloseable, MobileCoreController
     
     
 
+    override fun `clearCustomAvatar`(): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_squad_core_fn_method_mobilecorecontroller_clear_custom_avatar(
+        it, _status)
+}
+    }
+    )
+    }
+    
+
     
     @Throws(MobileCoreException::class)override fun `createAndJoinRoom`()
         = 
@@ -2158,6 +2214,18 @@ open class MobileCoreController: Disposable, AutoCloseable, MobileCoreController
     }
     )
     }
+    
+
+    
+    @Throws(MobileCoreException::class)override fun `hostLanRoom`(`roomName`: kotlin.String, `password`: kotlin.String?)
+        = 
+    callWithPointer {
+    uniffiRustCallWithError(MobileCoreException) { _status ->
+    UniffiLib.INSTANCE.uniffi_squad_core_fn_method_mobilecorecontroller_host_lan_room(
+        it, FfiConverterString.lower(`roomName`),FfiConverterOptionalString.lower(`password`),_status)
+}
+    }
+    
     
 
     
@@ -2307,6 +2375,30 @@ open class MobileCoreController: Disposable, AutoCloseable, MobileCoreController
 }
     }
     
+    
+
+    override fun `setAndroidAudioRouteDevices`(`inputDevice`: kotlin.String?, `outputDevice`: kotlin.String?)
+        = 
+    callWithPointer {
+    uniffiRustCall() { _status ->
+    UniffiLib.INSTANCE.uniffi_squad_core_fn_method_mobilecorecontroller_set_android_audio_route_devices(
+        it, FfiConverterOptionalString.lower(`inputDevice`),FfiConverterOptionalString.lower(`outputDevice`),_status)
+}
+    }
+    
+    
+
+    
+    @Throws(MobileCoreException::class)override fun `setCustomAvatar`(`imageBytes`: kotlin.ByteArray): kotlin.ByteArray {
+            return FfiConverterByteArray.lift(
+    callWithPointer {
+    uniffiRustCallWithError(MobileCoreException) { _status ->
+    UniffiLib.INSTANCE.uniffi_squad_core_fn_method_mobilecorecontroller_set_custom_avatar(
+        it, FfiConverterByteArray.lower(`imageBytes`),_status)
+}
+    }
+    )
+    }
     
 
     override fun `setDeafened`(`deafened`: kotlin.Boolean)
@@ -2806,7 +2898,8 @@ data class MobileProfileSnapshot (
     var `nsMode`: kotlin.String, 
     var `vadThresholdDb`: kotlin.Float, 
     var `inputGain`: kotlin.Float, 
-    var `streamVolume`: kotlin.Float
+    var `streamVolume`: kotlin.Float, 
+    var `hasCustomAvatar`: kotlin.Boolean
 ) {
     
     companion object
@@ -2830,6 +2923,7 @@ public object FfiConverterTypeMobileProfileSnapshot: FfiConverterRustBuffer<Mobi
             FfiConverterFloat.read(buf),
             FfiConverterFloat.read(buf),
             FfiConverterFloat.read(buf),
+            FfiConverterBoolean.read(buf),
         )
     }
 
@@ -2845,7 +2939,8 @@ public object FfiConverterTypeMobileProfileSnapshot: FfiConverterRustBuffer<Mobi
             FfiConverterString.allocationSize(value.`nsMode`) +
             FfiConverterFloat.allocationSize(value.`vadThresholdDb`) +
             FfiConverterFloat.allocationSize(value.`inputGain`) +
-            FfiConverterFloat.allocationSize(value.`streamVolume`)
+            FfiConverterFloat.allocationSize(value.`streamVolume`) +
+            FfiConverterBoolean.allocationSize(value.`hasCustomAvatar`)
     )
 
     override fun write(value: MobileProfileSnapshot, buf: ByteBuffer) {
@@ -2861,6 +2956,7 @@ public object FfiConverterTypeMobileProfileSnapshot: FfiConverterRustBuffer<Mobi
             FfiConverterFloat.write(value.`vadThresholdDb`, buf)
             FfiConverterFloat.write(value.`inputGain`, buf)
             FfiConverterFloat.write(value.`streamVolume`, buf)
+            FfiConverterBoolean.write(value.`hasCustomAvatar`, buf)
     }
 }
 

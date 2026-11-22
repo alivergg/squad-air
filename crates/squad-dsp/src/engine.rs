@@ -245,6 +245,7 @@ impl AudioEngineHandle {
 
         let atomics_worker = Arc::clone(&atomics);
         let stats_worker = Arc::clone(&peer_stats);
+        let hotplug_thread_worker = Arc::clone(&hotplug_thread);
 
         thread::Builder::new()
             .name("squad-dsp-worker".into())
@@ -257,6 +258,7 @@ impl AudioEngineHandle {
                     atomics_worker,
                     stats_worker,
                     topology_snap,
+                    hotplug_thread_worker,
                 );
             })
             .context("failed to spawn squad-dsp-worker thread")?;
@@ -462,9 +464,6 @@ impl AudioEngineHandle {
         let prev = self.atomics.streams_active.swap(active, Ordering::AcqRel);
         if prev != active {
             let _ = self.cmd_tx.try_send(EngineCmd::SetStreamsActive(active));
-            if active {
-                self.unpark_hotplug_watcher();
-            }
         }
     }
 
@@ -534,12 +533,19 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
     };
 
     if let Some(ref cfg) = default_cfg {
-        if cfg.sample_rate().0 == SAMPLE_RATE && cfg.sample_format() == cpal::SampleFormat::F32 {
+        if cfg.sample_rate().0 == SAMPLE_RATE
+            && cfg.sample_format() == cpal::SampleFormat::F32
+            && (!is_input || cfg.channels() == 1)
+        {
             return (SAMPLE_RATE, (cfg.channels() as usize).max(1));
         }
     }
 
-    let preferred_channels = default_cfg.as_ref().map(|c| c.channels());
+    let preferred_channels = if is_input {
+        Some(1)
+    } else {
+        default_cfg.as_ref().map(|c| c.channels())
+    };
     let f32_48k_channels = if is_input {
         dev.supported_input_configs()
             .ok()
@@ -1096,6 +1102,7 @@ fn run_audio_worker(
     atomics: Arc<SharedAtomics>,
     peer_stats: Arc<DashMap<PeerId, PeerAudioStats>>,
     topology_snap: Arc<Mutex<ActiveTopologySnapshot>>,
+    hotplug_thread: Arc<Mutex<Option<thread::Thread>>>,
 ) {
     let host = cpal::default_host();
     let mut streams: Option<AudioStreams> = None;
@@ -1229,6 +1236,11 @@ fn run_audio_worker(
                 Some(&built),
             );
             streams = Some(built);
+            if let Ok(guard) = hotplug_thread.lock() {
+                if let Some(ref th) = *guard {
+                    th.unpark();
+                }
+            }
             if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
                 stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
             }

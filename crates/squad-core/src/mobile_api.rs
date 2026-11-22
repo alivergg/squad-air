@@ -1,6 +1,8 @@
 use crate::android_video::spawn_android_surface_render_loop;
 use crate::avatar_core::{
     decode_avatar_jpeg_to_circular_rgba, generate_friend_identicon_rgba, generate_identicon_rgba,
+    hash_to_hex, hex_to_hash, load_cached_avatar_jpeg, process_custom_avatar_image,
+    save_cached_avatar_jpeg,
 };
 use crate::config::AppConfig;
 use crate::crypto_identity::{
@@ -17,7 +19,10 @@ use crate::storage_paths::{init_storage_paths, StoragePaths};
 use squad_dsp::{
     AudioEngineConfig, AudioEngineHandle, MicActivationMode, NoiseSuppressionMode, SoundCue,
 };
-use squad_proto::{sanitize_display_str, ClientUuid, InviteLink, PeerId, MAX_NICKNAME_LEN};
+use squad_proto::{
+    sanitize_display_str, ClientUuid, InviteLink, PeerId, MAX_LAN_PASSWORD_LEN,
+    MAX_LAN_ROOM_NAME_LEN, MAX_NICKNAME_LEN,
+};
 use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -52,6 +57,7 @@ pub struct MobileProfileSnapshot {
     pub vad_threshold_db: f32,
     pub input_gain: f32,
     pub stream_volume: f32,
+    pub has_custom_avatar: bool,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -240,7 +246,7 @@ impl MobileCoreController {
             downloads_dir: PathBuf::from(downloads_dir),
         });
 
-        let config = AppConfig::load_or_create();
+        let mut config = AppConfig::load_or_create();
         let friends = load_friends();
 
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -292,6 +298,19 @@ impl MobileCoreController {
             Arc::clone(&video_notify),
             Arc::clone(&running),
         );
+
+        if let Some(ref hex_hash) = config.custom_avatar_hash {
+            let loaded = hex_to_hash(hex_hash)
+                .and_then(|hash| load_cached_avatar_jpeg(&hash).map(|jpeg| (hash, jpeg)));
+            if let Some((hash, jpeg)) = loaded {
+                let _ = mesh_tx.try_send(MeshCommand::SetLocalAvatar {
+                    avatar: Some((hash, jpeg)),
+                });
+            } else {
+                config.custom_avatar_hash = None;
+                let _ = config.save();
+            }
+        }
 
         let init_presence_cmd = MeshCommand::UpdatePresenceConfig {
             rendezvous_server: config.rendezvous_server.clone(),
@@ -351,6 +370,12 @@ impl MobileCoreController {
             vad_threshold_db: cfg.vad_threshold_db,
             input_gain: cfg.input_gain,
             stream_volume: cfg.stream_volume,
+            has_custom_avatar: cfg
+                .custom_avatar_hash
+                .as_deref()
+                .and_then(hex_to_hash)
+                .and_then(|h| load_cached_avatar_jpeg(&h))
+                .is_some(),
         }
     }
 
@@ -548,6 +573,39 @@ impl MobileCoreController {
 
     pub fn generate_short_code(&self) {
         self.send_mesh(MeshCommand::GenerateShortCode);
+    }
+
+    pub fn host_lan_room(
+        &self,
+        room_name: String,
+        password: Option<String>,
+    ) -> Result<(), MobileCoreError> {
+        let clean_pw = password
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty());
+        if clean_pw
+            .as_ref()
+            .is_some_and(|p| p.len() > MAX_LAN_PASSWORD_LEN)
+        {
+            return Err(MobileCoreError::InvalidArgument {
+                message: format!(
+                    "LAN room password exceeds maximum length of {MAX_LAN_PASSWORD_LEN} bytes"
+                ),
+            });
+        }
+        let clean_name = sanitize_display_str(room_name.trim(), MAX_LAN_ROOM_NAME_LEN);
+        let (nickname, client_uuid) = {
+            let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            (guard.config.nickname.clone(), guard.config.client_uuid())
+        };
+        self.audio_engine.set_streams_active(true);
+        self.send_mesh(MeshCommand::HostLanRoom {
+            room_name: clean_name,
+            password: clean_pw,
+            nickname,
+            client_uuid,
+        });
+        Ok(())
     }
 
     pub fn join_lan_room(
@@ -774,6 +832,15 @@ impl MobileCoreController {
         self.audio_engine.set_audio_devices(None, None);
     }
 
+    pub fn set_android_audio_route_devices(
+        &self,
+        input_device: Option<String>,
+        output_device: Option<String>,
+    ) {
+        self.audio_engine
+            .set_audio_devices(input_device, output_device);
+    }
+
     pub fn set_lan_ipv4_override(&self, ipv4_list: Vec<String>) {
         set_platform_lan_ipv4_override(parse_ipv4_list(&ipv4_list));
     }
@@ -815,6 +882,48 @@ impl MobileCoreController {
 
     pub fn get_identicon_rgba(&self, client_uuid_hex: String) -> Vec<u8> {
         let uuid = decode_hex_16(&client_uuid_hex).unwrap_or([0u8; 16]);
+        let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if uuid == guard.config.client_uuid() {
+            if let Some(jpeg) = guard
+                .config
+                .custom_avatar_hash
+                .as_deref()
+                .and_then(hex_to_hash)
+                .and_then(|h| load_cached_avatar_jpeg(&h))
+            {
+                if let Ok(rgba) = decode_avatar_jpeg_to_circular_rgba(&jpeg) {
+                    return rgba;
+                }
+            }
+        }
+        generate_identicon_rgba(&uuid)
+    }
+
+    pub fn set_custom_avatar(&self, image_bytes: Vec<u8>) -> Result<Vec<u8>, MobileCoreError> {
+        let (jpeg, hash, rgba) = process_custom_avatar_image(&image_bytes)
+            .map_err(|message| MobileCoreError::InvalidArgument { message })?;
+        let _ = save_cached_avatar_jpeg(&hash, &jpeg);
+        {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.config.custom_avatar_hash = Some(hash_to_hex(&hash));
+            guard.config.save().map_err(|e| MobileCoreError::Internal {
+                message: format!("Failed to save config: {e}"),
+            })?;
+        }
+        self.send_mesh(MeshCommand::SetLocalAvatar {
+            avatar: Some((hash, jpeg)),
+        });
+        Ok(rgba)
+    }
+
+    pub fn clear_custom_avatar(&self) -> Vec<u8> {
+        let uuid = {
+            let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            guard.config.custom_avatar_hash = None;
+            let _ = guard.config.save();
+            guard.config.client_uuid()
+        };
+        self.send_mesh(MeshCommand::SetLocalAvatar { avatar: None });
         generate_identicon_rgba(&uuid)
     }
 

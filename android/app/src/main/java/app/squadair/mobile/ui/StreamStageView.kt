@@ -13,8 +13,10 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -161,6 +163,7 @@ fun StreamStageView(
                     .fillMaxWidth()
                     .align(Alignment.TopCenter)
                     .background(Color.Black.copy(alpha = 0.55f))
+                    .then(if (isFullscreen) Modifier.statusBarsPadding() else Modifier)
                     .padding(horizontal = 10.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
@@ -248,6 +251,7 @@ fun StreamStageView(
                         .fillMaxWidth()
                         .align(Alignment.BottomCenter)
                         .background(Color.Black.copy(alpha = 0.55f))
+                        .then(if (isFullscreen) Modifier.navigationBarsPadding() else Modifier)
                         .padding(horizontal = 12.dp, vertical = 2.dp),
                 ) {
                     Row(

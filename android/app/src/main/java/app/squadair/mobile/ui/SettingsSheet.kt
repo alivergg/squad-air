@@ -1,53 +1,101 @@
 package app.squadair.mobile.ui
 
+import android.graphics.Bitmap
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.PickVisualMediaRequest
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.imePadding
+import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import app.squadair.mobile.core.SquadSessionRepository
+import app.squadair.mobile.ui.theme.RgbaAvatarImage
 import app.squadair.mobile.ui.theme.SquadAirOnPrimary
 import app.squadair.mobile.ui.theme.SquadAirPrimary
 import app.squadair.mobile.ui.theme.SquadAirSurfaceCard
 import app.squadair.mobile.ui.theme.SquadAirTextMuted
 import app.squadair.mobile.ui.theme.SquadAirTextPrimary
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import uniffi.squad_core.MobileProfileSnapshot
+import java.io.ByteArrayOutputStream
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun SettingsSheet(
     profile: MobileProfileSnapshot,
+    selfAvatarRgba: ByteArray?,
     repository: SquadSessionRepository,
     onDismiss: () -> Unit,
 ) {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var nickname by remember(profile.nickname) { mutableStateOf(profile.nickname) }
     var server by remember(profile.rendezvousServer) { mutableStateOf(profile.rendezvousServer) }
     var inputGain by remember(profile.inputGain) { mutableFloatStateOf(profile.inputGain) }
     var vadDb by remember(profile.vadThresholdDb) { mutableFloatStateOf(profile.vadThresholdDb) }
+
+    val avatarPicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.PickVisualMedia(),
+    ) { uri: Uri? ->
+        if (uri != null) {
+            scope.launch(Dispatchers.IO) {
+                val raw = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                    ?: return@launch
+                val decoded = decodeBoundedBitmap(raw, maxDim = 512) ?: return@launch
+                val maxSide = 512
+                val ratio = minOf(maxSide.toFloat() / decoded.width, maxSide.toFloat() / decoded.height, 1f)
+                val scaled = if (ratio < 1f) {
+                    Bitmap.createScaledBitmap(
+                        decoded,
+                        (decoded.width * ratio).toInt().coerceAtLeast(1),
+                        (decoded.height * ratio).toInt().coerceAtLeast(1),
+                        true,
+                    )
+                } else {
+                    decoded
+                }
+                val out = ByteArrayOutputStream()
+                if (scaled.compress(Bitmap.CompressFormat.PNG, 100, out)) {
+                    repository.setCustomAvatar(out.toByteArray())
+                }
+            }
+        }
+    }
 
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -57,6 +105,9 @@ fun SettingsSheet(
         Column(
             modifier = Modifier
                 .fillMaxWidth()
+                .verticalScroll(rememberScrollState())
+                .navigationBarsPadding()
+                .imePadding()
                 .padding(horizontal = 20.dp, vertical = 12.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
@@ -66,6 +117,28 @@ fun SettingsSheet(
                 fontSize = 18.sp,
                 fontWeight = FontWeight.SemiBold,
             )
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                RgbaAvatarImage(rgbaBytes = selfAvatarRgba, sizeDp = 56.dp)
+                FilledTonalButton(
+                    onClick = {
+                        avatarPicker.launch(
+                            PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly),
+                        )
+                    },
+                ) {
+                    Text("Change Avatar")
+                }
+                if (profile.hasCustomAvatar) {
+                    TextButton(onClick = { repository.clearCustomAvatar() }) {
+                        Text("Reset", color = SquadAirTextMuted)
+                    }
+                }
+            }
 
             OutlinedTextField(
                 value = nickname,

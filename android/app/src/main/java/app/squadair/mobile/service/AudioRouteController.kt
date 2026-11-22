@@ -20,13 +20,14 @@ enum class AudioRoute(val label: String) {
 class AudioRouteController(
     context: Context,
     private val onRouteChanged: (AudioRoute, List<AudioRoute>) -> Unit,
-    private val onHardwareRouteSwitched: () -> Unit,
+    private val onHardwareRouteSwitched: (String?, String?) -> Unit,
 ) {
     private val audioManager = context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val mainHandler = Handler(Looper.getMainLooper())
     private var focusRequest: AudioFocusRequest? = null
     private var active = false
     private var currentRoute: AudioRoute = AudioRoute.SPEAKER
+    private var lastAppliedSpecs: Pair<String?, String?>? = null
 
     private val deviceCallback = object : AudioDeviceCallback() {
         override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>?) {
@@ -81,6 +82,7 @@ class AudioRouteController(
     fun deactivate() {
         if (!active) return
         active = false
+        lastAppliedSpecs = null
         try {
             audioManager.unregisterAudioDeviceCallback(deviceCallback)
         } catch (_: Throwable) {
@@ -124,7 +126,11 @@ class AudioRouteController(
             applyRouteInternal(target, notifyRust = true)
         } else {
             onRouteChanged(currentRoute, available)
-            onHardwareRouteSwitched()
+            val specs = resolveDeviceSpecsForRoute(currentRoute)
+            if (specs != lastAppliedSpecs) {
+                lastAppliedSpecs = specs
+                onHardwareRouteSwitched(specs.first, specs.second)
+            }
         }
     }
 
@@ -158,6 +164,11 @@ class AudioRouteController(
                 } catch (_: Throwable) {
                 }
             }
+            @Suppress("DEPRECATION")
+            try {
+                audioManager.isSpeakerphoneOn = (resolved == AudioRoute.SPEAKER)
+            } catch (_: Throwable) {
+            }
         } else {
             @Suppress("DEPRECATION")
             when (resolved) {
@@ -183,10 +194,87 @@ class AudioRouteController(
             }
         }
 
+        val specs = resolveDeviceSpecsForRoute(resolved)
+        lastAppliedSpecs = specs
         onRouteChanged(resolved, available)
         if (notifyRust) {
-            onHardwareRouteSwitched()
+            onHardwareRouteSwitched(specs.first, specs.second)
         }
+    }
+
+    private fun resolveDeviceSpecsForRoute(route: AudioRoute): Pair<String?, String?> {
+        val all = audioManager.getDevices(AudioManager.GET_DEVICES_ALL)
+        val inIdx = when (route) {
+            AudioRoute.BLUETOOTH -> {
+                findIndexedDevice(all, isSource = true) {
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                        it.type == AudioDeviceInfo.TYPE_BLE_HEADSET
+                } ?: findBottomBuiltInMicIndex(all)
+            }
+            AudioRoute.WIRED_HEADSET -> {
+                findIndexedDevice(all, isSource = true) {
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                        it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+                } ?: findBottomBuiltInMicIndex(all)
+            }
+            AudioRoute.SPEAKER, AudioRoute.EARPIECE -> findBottomBuiltInMicIndex(all)
+        }
+        val outIdx = when (route) {
+            AudioRoute.SPEAKER -> findIndexedDevice(all, isSource = false) {
+                it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER
+            }
+            AudioRoute.EARPIECE -> findIndexedDevice(all, isSource = false) {
+                it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            }
+            AudioRoute.BLUETOOTH -> findIndexedDevice(all, isSource = false) {
+                it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
+                    it.type == AudioDeviceInfo.TYPE_BLE_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP
+            }
+            AudioRoute.WIRED_HEADSET -> findIndexedDevice(all, isSource = false) {
+                it.type == AudioDeviceInfo.TYPE_WIRED_HEADSET ||
+                    it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
+                    it.type == AudioDeviceInfo.TYPE_USB_HEADSET
+            }
+        }
+        return inIdx?.let { "@idx:$it" } to outIdx?.let { "@idx:$it" }
+    }
+
+    private fun findBottomBuiltInMicIndex(all: Array<AudioDeviceInfo>): Int? {
+        return findIndexedDevice(all, isSource = true) { dev ->
+            dev.type == AudioDeviceInfo.TYPE_BUILTIN_MIC &&
+                deviceAddress(dev).equals("bottom", ignoreCase = true)
+        } ?: findIndexedDevice(all, isSource = true) { dev ->
+            val addr = deviceAddress(dev)
+            dev.type == AudioDeviceInfo.TYPE_BUILTIN_MIC &&
+                !addr.equals("back", ignoreCase = true) &&
+                !addr.equals("top", ignoreCase = true)
+        } ?: findIndexedDevice(all, isSource = true) { dev ->
+            dev.type == AudioDeviceInfo.TYPE_BUILTIN_MIC
+        }
+    }
+
+    private fun deviceAddress(dev: AudioDeviceInfo): String {
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+            dev.address
+        } else {
+            ""
+        }
+    }
+
+    private inline fun findIndexedDevice(
+        all: Array<AudioDeviceInfo>,
+        isSource: Boolean,
+        predicate: (AudioDeviceInfo) -> Boolean,
+    ): Int? {
+        for (idx in all.indices) {
+            val dev = all[idx]
+            val matchesDir = if (isSource) dev.isSource else dev.isSink
+            if (matchesDir && predicate(dev)) {
+                return idx
+            }
+        }
+        return null
     }
 
     private fun computeAvailableRoutes(): List<AudioRoute> {
