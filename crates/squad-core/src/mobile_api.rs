@@ -265,12 +265,11 @@ impl MobileCoreController {
         };
 
         let _guard = runtime.enter();
-        let audio_engine =
-            AudioEngineHandle::start(audio_cfg, audio_out_tx).map_err(|e| {
-                MobileCoreError::AudioInitFailed {
-                    message: format!("Failed to start audio engine: {e}"),
-                }
-            })?;
+        let audio_engine = AudioEngineHandle::start(audio_cfg, audio_out_tx).map_err(|e| {
+            MobileCoreError::AudioInitFailed {
+                message: format!("Failed to start audio engine: {e}"),
+            }
+        })?;
         audio_engine.set_stream_gain(config.stream_volume);
 
         let video_frame_slot: Arc<Mutex<Option<DecodedVideoFrame>>> = Arc::new(Mutex::new(None));
@@ -363,12 +362,9 @@ impl MobileCoreController {
         }
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         guard.config.nickname = clean;
-        guard
-            .config
-            .save()
-            .map_err(|e| MobileCoreError::Internal {
-                message: format!("Failed to save config: {e}"),
-            })?;
+        guard.config.save().map_err(|e| MobileCoreError::Internal {
+            message: format!("Failed to save config: {e}"),
+        })?;
         self.send_presence_config_locked(&guard);
         Ok(())
     }
@@ -385,12 +381,9 @@ impl MobileCoreController {
         if crate::config::matching_rendezvous_preset(&trimmed).is_none() {
             guard.config.custom_rendezvous_server = trimmed;
         }
-        guard
-            .config
-            .save()
-            .map_err(|e| MobileCoreError::Internal {
-                message: format!("Failed to save config: {e}"),
-            })?;
+        guard.config.save().map_err(|e| MobileCoreError::Internal {
+            message: format!("Failed to save config: {e}"),
+        })?;
         self.send_presence_config_locked(&guard);
         Ok(())
     }
@@ -444,9 +437,10 @@ impl MobileCoreController {
     }
 
     pub fn remove_friend(&self, pub_key_hex: String) -> Result<(), MobileCoreError> {
-        let pub_key = decode_hex_32(&pub_key_hex).ok_or_else(|| MobileCoreError::InvalidArgument {
-            message: "Invalid friend public key hex".to_string(),
-        })?;
+        let pub_key =
+            decode_hex_32(&pub_key_hex).ok_or_else(|| MobileCoreError::InvalidArgument {
+                message: "Invalid friend public key hex".to_string(),
+            })?;
         let mut guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let before = guard.friends.len();
         guard.friends.retain(|f| f.pub_key != pub_key);
@@ -505,9 +499,10 @@ impl MobileCoreController {
     }
 
     pub fn join_room_by_invite(&self, invite_uri: String) -> Result<(), MobileCoreError> {
-        let invite = InviteLink::parse(&invite_uri).map_err(|e| MobileCoreError::InvalidArgument {
-            message: format!("Invalid invite link: {e}"),
-        })?;
+        let invite =
+            InviteLink::parse(&invite_uri).map_err(|e| MobileCoreError::InvalidArgument {
+                message: format!("Invalid invite link: {e}"),
+            })?;
         let (rendezvous_server, nickname, client_uuid, initial_volumes) = {
             let guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
             (

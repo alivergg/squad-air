@@ -3,6 +3,7 @@ use crate::crypto_identity::{
     spake2_joiner_open_invite, spake2_lan_host_seal_invite, spake2_lan_joiner_open_invite,
     spake2_lan_start_joiner, spake2_start_joiner,
 };
+use crate::mem::release_os_memory;
 use crate::net::lan::{
     bind_lan_broadcast_sender, bind_lan_discovery_listener, broadcast_lan_packet,
     start_embedded_rendezvous, DiscoveredLanRoom, EmbeddedRendezvousHandle,
@@ -12,7 +13,6 @@ use crate::net::transfer::{
     app_data_root_dir, BlobTransferState, ChatItemUi, SwarmChatManager, TransferCtx, TransferEvent,
 };
 use crate::net::PeerEndpoint;
-use crate::mem::release_os_memory;
 use rand::{rngs::OsRng, Rng};
 use spake2::{Ed25519Group, Spake2};
 use squad_dsp::{AudioEngineHandle, OutboundAudioFrame, SoundCue};

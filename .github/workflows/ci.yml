@@ -59,6 +59,9 @@ jobs:
       - name: Check workspace
         run: cargo check --workspace --all-targets --locked
 
+      - name: Check squad-core Android FFI layer
+        run: cargo check -p squad-core --no-default-features --features android-ffi --locked
+
       - name: Run Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 

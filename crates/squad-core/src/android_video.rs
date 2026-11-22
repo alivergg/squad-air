@@ -29,7 +29,7 @@ fn surface_state() -> &'static Mutex<SurfaceState> {
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeAttachSurface(
+pub extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeAttachSurface(
     env: JNIEnv,
     _class: JClass,
     surface: JObject,
@@ -66,7 +66,7 @@ pub unsafe extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_na
 }
 
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeDetachSurface(
+pub extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeDetachSurface(
     _env: JNIEnv,
     _class: JClass,
 ) {

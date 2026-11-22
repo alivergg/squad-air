@@ -8,7 +8,7 @@ static APP_CONTEXT_REF: OnceLock<GlobalRef> = OnceLock::new();
 static NDK_CONTEXT_ONCE: Once = Once::new();
 
 #[no_mangle]
-pub unsafe extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeInitContext(
+pub extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeInitContext(
     env: JNIEnv,
     _class: JClass,
     context: JObject,
@@ -32,10 +32,7 @@ pub unsafe extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_na
     NDK_CONTEXT_ONCE.call_once(|| {
         let vm_ptr = jvm.get_java_vm_pointer();
         unsafe {
-            ndk_context::initialize_android_context(
-                vm_ptr.cast(),
-                stored.as_obj().as_raw().cast(),
-            );
+            ndk_context::initialize_android_context(vm_ptr.cast(), stored.as_obj().as_raw().cast());
         }
         log::info!("Initialized ndk_context for SquadAir Rust core");
     });

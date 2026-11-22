@@ -1345,7 +1345,8 @@ impl SwarmChatManager {
                 if *blake3::hash(&mem).as_bytes() == meta.blake3_root {
                     blob.completed = true;
                     if meta.kind == BLOB_KIND_AVATAR {
-                        let _ = crate::avatar_core::save_cached_avatar_jpeg(&meta.blake3_root, &mem);
+                        let _ =
+                            crate::avatar_core::save_cached_avatar_jpeg(&meta.blake3_root, &mem);
                         let (target_uuid, full_hash) = self
                             .avatar_targets
                             .remove(&blob_id)
@@ -1656,6 +1657,12 @@ impl SwarmChatManager {
         for &(_, addr) in connected_peers {
             ctx.send_p2p(addr, &pkt).await;
         }
+    }
+}
+
+impl Default for SwarmChatManager {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
