@@ -12,6 +12,21 @@ crate-type = ["rlib", "cdylib"]
 [features]
 default = ["desktop-dsp"]
 desktop-dsp = ["squad-dsp/df3-onnx"]
+android-ffi = [
+    "dep:uniffi",
+    "dep:jni",
+    "dep:ndk",
+    "dep:ndk-sys",
+    "dep:ndk-context",
+    "dep:android_logger",
+    "dep:log",
+    "tracing/log",
+]
+
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+required-features = ["android-ffi"]
 
 [dependencies]
 squad-proto = { path = "../squad-proto" }
@@ -36,3 +51,10 @@ socket2 = "0.6"
 x25519-dalek.workspace = true
 spake2.workspace = true
 chacha20poly1305.workspace = true
+uniffi = { version = "0.28", features = ["cli", "tokio"], optional = true }
+jni = { version = "0.21", optional = true }
+ndk = { version = "0.9", optional = true }
+ndk-sys = { version = "0.6", features = ["nativewindow", "test"], optional = true }
+ndk-context = { version = "0.1", optional = true }
+android_logger = { version = "0.14", optional = true }
+log = { version = "0.4", optional = true }
