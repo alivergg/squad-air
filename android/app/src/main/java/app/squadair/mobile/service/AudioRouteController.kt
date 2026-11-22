@@ -66,7 +66,7 @@ class AudioRouteController(
             available.contains(AudioRoute.WIRED_HEADSET) -> AudioRoute.WIRED_HEADSET
             else -> AudioRoute.SPEAKER
         }
-        applyRouteInternal(initial, notifyRust = false)
+        applyRouteInternal(initial, notifyRust = true)
     }
 
     fun selectRoute(route: AudioRoute) {
@@ -190,12 +190,13 @@ class AudioRouteController(
     }
 
     private fun computeAvailableRoutes(): List<AudioRoute> {
-        val routes = mutableListOf(AudioRoute.SPEAKER, AudioRoute.EARPIECE)
+        val routes = mutableListOf(AudioRoute.SPEAKER)
         val devices = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
             audioManager.availableCommunicationDevices
         } else {
             audioManager.getDevices(AudioManager.GET_DEVICES_OUTPUTS).toList()
         }
+        val hasEarpiece = devices.any { it.type == AudioDeviceInfo.TYPE_BUILTIN_EARPIECE }
         val hasBluetooth = devices.any {
             it.type == AudioDeviceInfo.TYPE_BLUETOOTH_SCO ||
                 it.type == AudioDeviceInfo.TYPE_BLUETOOTH_A2DP ||
@@ -206,6 +207,7 @@ class AudioRouteController(
                 it.type == AudioDeviceInfo.TYPE_WIRED_HEADPHONES ||
                 it.type == AudioDeviceInfo.TYPE_USB_HEADSET
         }
+        if (hasEarpiece) routes.add(AudioRoute.EARPIECE)
         if (hasBluetooth) routes.add(AudioRoute.BLUETOOTH)
         if (hasWired) routes.add(AudioRoute.WIRED_HEADSET)
         return routes

@@ -22,10 +22,14 @@ unsafe impl Send for SurfaceState {}
 
 static SURFACE_STATE: OnceLock<Mutex<SurfaceState>> = OnceLock::new();
 static SURFACE_GEN: AtomicU64 = AtomicU64::new(0);
-static VIDEO_NOTIFY_HOOK: OnceLock<Arc<Notify>> = OnceLock::new();
+static VIDEO_NOTIFY_HOOK: OnceLock<Mutex<Option<Arc<Notify>>>> = OnceLock::new();
 
 fn surface_state() -> &'static Mutex<SurfaceState> {
     SURFACE_STATE.get_or_init(|| Mutex::new(SurfaceState::default()))
+}
+
+fn video_notify_hook() -> &'static Mutex<Option<Arc<Notify>>> {
+    VIDEO_NOTIFY_HOOK.get_or_init(|| Mutex::new(None))
 }
 
 #[no_mangle]
@@ -60,8 +64,10 @@ pub extern "system" fn Java_app_squadair_mobile_core_SquadNativeBridge_nativeAtt
     }
 
     SURFACE_GEN.fetch_add(1, Ordering::AcqRel);
-    if let Some(notify) = VIDEO_NOTIFY_HOOK.get() {
-        notify.notify_one();
+    if let Ok(guard) = video_notify_hook().lock() {
+        if let Some(ref notify) = *guard {
+            notify.notify_one();
+        }
     }
 }
 
@@ -90,7 +96,9 @@ pub fn spawn_android_surface_render_loop(
     video_notify: Arc<Notify>,
     running: Arc<AtomicBool>,
 ) {
-    let _ = VIDEO_NOTIFY_HOOK.set(Arc::clone(&video_notify));
+    if let Ok(mut guard) = video_notify_hook().lock() {
+        *guard = Some(Arc::clone(&video_notify));
+    }
     let _ = std::thread::Builder::new()
         .name("squad-android-video-render".to_string())
         .spawn(move || {

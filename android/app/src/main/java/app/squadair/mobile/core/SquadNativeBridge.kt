@@ -2,11 +2,14 @@ package app.squadair.mobile.core
 
 import android.content.Context
 import android.view.Surface
+import android.view.SurfaceHolder
 import java.util.concurrent.atomic.AtomicBoolean
 
 object SquadNativeBridge {
     private val librariesLoaded = AtomicBoolean(false)
     private val contextInitialized = AtomicBoolean(false)
+    private val surfaceLock = Any()
+    private var activeHolder: SurfaceHolder? = null
 
     private fun ensureLibrariesLoaded() {
         if (librariesLoaded.compareAndSet(false, true)) {
@@ -22,6 +25,22 @@ object SquadNativeBridge {
         ensureLibrariesLoaded()
         if (contextInitialized.compareAndSet(false, true)) {
             nativeInitContext(context.applicationContext)
+        }
+    }
+
+    fun attachSurface(holder: SurfaceHolder) {
+        synchronized(surfaceLock) {
+            activeHolder = holder
+            nativeAttachSurface(holder.surface)
+        }
+    }
+
+    fun detachSurface(holder: SurfaceHolder) {
+        synchronized(surfaceLock) {
+            if (activeHolder === holder) {
+                activeHolder = null
+                nativeDetachSurface()
+            }
         }
     }
 

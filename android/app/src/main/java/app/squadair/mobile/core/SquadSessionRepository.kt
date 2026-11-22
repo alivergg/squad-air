@@ -441,12 +441,14 @@ class SquadSessionRepository private constructor(private val appContext: Context
         audioRouteController.deactivate()
         VoiceCallForegroundService.stop(appContext)
         _uiState.update {
+            val selfUuid = it.profile.clientUuidHex
             it.copy(
                 inRoom = false,
                 localPeerId = 0u,
                 activeInviteUri = "",
                 isLanLocked = false,
                 peers = emptyList(),
+                peerAvatarsRgba = it.peerAvatarsRgba.filterKeys { k -> k == selfUuid },
                 watchedPeerId = null,
                 chatMessages = emptyList(),
                 unreadChatCount = 0,
@@ -545,7 +547,8 @@ class SquadSessionRepository private constructor(private val appContext: Context
 
     override fun onPeersUpdated(peers: List<MobilePeerSnapshot>) {
         _uiState.update { st ->
-            val updatedAvatars = st.peerAvatarsRgba.toMutableMap()
+            val activeKeys = peers.mapTo(mutableSetOf(st.profile.clientUuidHex)) { it.clientUuidHex }
+            val updatedAvatars = st.peerAvatarsRgba.filterKeys { it in activeKeys }.toMutableMap()
             for (p in peers) {
                 if (!updatedAvatars.containsKey(p.clientUuidHex)) {
                     updatedAvatars[p.clientUuidHex] = controller.getIdenticonRgba(p.clientUuidHex)

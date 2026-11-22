@@ -107,7 +107,7 @@ fun ChatSheet(
             scope.launch(Dispatchers.IO) {
                 val name = queryDisplayName(context.contentResolver, uri) ?: "shared_file.bin"
                 val stagingDir = File(context.cacheDir, "outbound_files").apply { mkdirs() }
-                val safeName = name.replace(Regex("[^A-Za-z0-9._-]"), "_")
+                val safeName = sanitizeStagingFilename(name)
                 val dest = File(stagingDir, safeName)
                 context.contentResolver.openInputStream(uri)?.use { input ->
                     FileOutputStream(dest).use { output ->
@@ -245,7 +245,7 @@ private fun ChatMessageCard(
                 is MobileChatContent.InlineImage -> {
                     val bitmap = remember(content.bytes) {
                         content.bytes?.let { raw ->
-                            BitmapFactory.decodeByteArray(raw, 0, raw.size)?.asImageBitmap()
+                            decodeBoundedBitmap(raw, maxDim = 2048)?.asImageBitmap()
                         }
                     }
                     if (bitmap != null) {
@@ -364,13 +364,46 @@ private fun queryDisplayName(resolver: android.content.ContentResolver, uri: Uri
     return null
 }
 
+private fun sanitizeStagingFilename(raw: String): String {
+    val cleaned = raw
+        .substringAfterLast('/')
+        .substringAfterLast('\\')
+        .replace(Regex("[^A-Za-z0-9._-]"), "_")
+        .trimStart('.')
+        .take(128)
+    return if (cleaned.isEmpty() || cleaned == "." || cleaned == "..") {
+        "shared_file.bin"
+    } else {
+        cleaned
+    }
+}
+
+private fun decodeBoundedBitmap(raw: ByteArray, maxDim: Int): Bitmap? {
+    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+    BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+    val w = bounds.outWidth
+    val h = bounds.outHeight
+    if (w <= 0 || h <= 0 || w > 4096 || h > 4096) {
+        return null
+    }
+    var sampleSize = 1
+    while ((w / sampleSize) > maxDim || (h / sampleSize) > maxDim) {
+        sampleSize *= 2
+    }
+    val opts = BitmapFactory.Options().apply {
+        inSampleSize = sampleSize
+        inPreferredConfig = Bitmap.Config.ARGB_8888
+    }
+    return BitmapFactory.decodeByteArray(raw, 0, raw.size, opts)
+}
+
 private fun compressImageForInline(stream: java.io.InputStream?): ByteArray? {
     stream ?: return null
     val raw = stream.use { it.readBytes() }
     if (raw.isNotEmpty() && raw.size < 190 * 1024) {
         return raw
     }
-    val decoded = BitmapFactory.decodeByteArray(raw, 0, raw.size) ?: return null
+    val decoded = decodeBoundedBitmap(raw, maxDim = 960) ?: return null
     val maxSide = 960
     val ratio = minOf(maxSide.toFloat() / decoded.width, maxSide.toFloat() / decoded.height, 1f)
     val scaled = if (ratio < 1f) {

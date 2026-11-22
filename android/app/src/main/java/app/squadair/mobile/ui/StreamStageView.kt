@@ -30,7 +30,6 @@ import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -70,10 +69,11 @@ fun StreamStageView(
     var scale by remember { mutableFloatStateOf(1f) }
     var offset by remember { mutableStateOf(Offset.Zero) }
 
-    DisposableEffect(Unit) {
-        onDispose {
-            SquadNativeBridge.nativeDetachSurface()
-        }
+    val info = peer?.streamInfo
+    val streamAspect = if (info != null && info.width > 0u && info.height > 0u) {
+        info.width.toFloat() / info.height.toFloat()
+    } else {
+        16f / 9f
     }
 
     val containerModifier = if (isFullscreen || isPipMode) {
@@ -83,11 +83,12 @@ fun StreamStageView(
     } else {
         modifier
             .fillMaxWidth()
-            .aspectRatio(16f / 9f)
+            .aspectRatio(streamAspect)
             .background(Color.Black)
     }
 
     Box(
+        contentAlignment = Alignment.Center,
         modifier = containerModifier
             .clipToBounds()
             .pointerInput(isPipMode) {
@@ -125,7 +126,7 @@ fun StreamStageView(
                     holder.addCallback(
                         object : SurfaceHolder.Callback {
                             override fun surfaceCreated(holder: SurfaceHolder) {
-                                SquadNativeBridge.nativeAttachSurface(holder.surface)
+                                SquadNativeBridge.attachSurface(holder)
                             }
 
                             override fun surfaceChanged(
@@ -134,18 +135,18 @@ fun StreamStageView(
                                 width: Int,
                                 height: Int,
                             ) {
-                                SquadNativeBridge.nativeAttachSurface(holder.surface)
+                                SquadNativeBridge.attachSurface(holder)
                             }
 
                             override fun surfaceDestroyed(holder: SurfaceHolder) {
-                                SquadNativeBridge.nativeDetachSurface()
+                                SquadNativeBridge.detachSurface(holder)
                             }
                         },
                     )
                 }
             },
             modifier = Modifier
-                .fillMaxSize()
+                .aspectRatio(streamAspect)
                 .graphicsLayer(
                     scaleX = scale,
                     scaleY = scale,
