@@ -1,0 +1,8 @@
+<resources>
+    <style name="Theme.SquadAir" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/squad_bg</item>
+        <item name="android:statusBarColor">@color/squad_bg</item>
+        <item name="android:navigationBarColor">@color/squad_bg</item>
+    </style>
+    <color name="squad_bg">#0E141B</color>
+</resources>
