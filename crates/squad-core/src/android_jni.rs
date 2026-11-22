@@ -4,6 +4,10 @@ use jni::JNIEnv;
 use log::LevelFilter;
 use std::sync::{Once, OnceLock};
 
+#[cfg(target_os = "android")]
+#[link(name = "c++_shared")]
+extern "C" {}
+
 static APP_CONTEXT_REF: OnceLock<GlobalRef> = OnceLock::new();
 static NDK_CONTEXT_ONCE: Once = Once::new();
 

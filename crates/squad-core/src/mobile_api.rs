@@ -28,6 +28,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::{mpsc, Notify};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
+#[uniffi(flat_error)]
 pub enum MobileCoreError {
     #[error("{message}")]
     InvalidArgument { message: String },

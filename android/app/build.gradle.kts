@@ -144,6 +144,18 @@ android {
     }
 }
 
+fun runBuildCmd(workDir: File, extraEnv: Map<String, String>, vararg cmd: String) {
+    val pb = ProcessBuilder(*cmd)
+        .directory(workDir)
+        .inheritIO()
+    pb.environment().putAll(extraEnv)
+    val proc = pb.start()
+    val code = proc.waitFor()
+    if (code != 0) {
+        throw GradleException("Command failed with exit code $code: ${cmd.joinToString(" ")}")
+    }
+}
+
 val buildRustNative = tasks.register("buildRustNative") {
     group = "rust"
     description = "Compiles libsquad_core.so for arm64-v8a, copies libc++_shared.so, and generates UniFFI bindings"
@@ -156,35 +168,46 @@ val buildRustNative = tasks.register("buildRustNative") {
         val arm64OutDir = File(jniOutDir, "arm64-v8a")
         arm64OutDir.mkdirs()
 
+        val targetDir = rootDir.parentFile.resolve("target")
+        targetDir.mkdirs()
+        val toolchainWrapper = targetDir.resolve("android-arm64-toolchain.cmake")
+        toolchainWrapper.writeText(
+            """
+            set(ANDROID_ABI "arm64-v8a" CACHE STRING "")
+            set(ANDROID_PLATFORM "android-26" CACHE STRING "")
+            set(ANDROID_STL "c++_shared" CACHE STRING "")
+            include("${ndkHome.replace("\\", "/")}/build/cmake/android.toolchain.cmake")
+            """.trimIndent() + "\n"
+        )
+
         val cargoEnv = mapOf(
-            "CMAKE_TOOLCHAIN_FILE" to "$ndkHome/build/cmake/android.toolchain.cmake",
+            "CMAKE_TOOLCHAIN_FILE" to toolchainWrapper.absolutePath,
             "ANDROID_ABI" to "arm64-v8a",
             "ANDROID_PLATFORM" to "android-26",
             "OPUS_STATIC" to "1",
+            "CARGO_PROFILE_RELEASE_STRIP" to "debuginfo",
         )
 
-        exec {
-            workingDir = repoRoot
-            environment(cargoEnv)
-            commandLine(
-                "cargo",
-                "ndk",
-                "-t",
-                "arm64-v8a",
-                "-p",
-                "26",
-                "-o",
-                jniOutDir.absolutePath,
-                "build",
-                "--release",
-                "--locked",
-                "-p",
-                "squad-core",
-                "--no-default-features",
-                "--features",
-                "android-ffi",
-            )
-        }
+        runBuildCmd(
+            repoRoot,
+            cargoEnv,
+            "cargo",
+            "ndk",
+            "-t",
+            "arm64-v8a",
+            "--platform",
+            "26",
+            "-o",
+            jniOutDir.absolutePath,
+            "build",
+            "--release",
+            "--locked",
+            "-p",
+            "squad-core",
+            "--no-default-features",
+            "--features",
+            "android-ffi",
+        )
 
         val hostTags = listOf("linux-x86_64", "darwin-arm64", "darwin-x86_64")
         val libcxx = hostTags
@@ -196,29 +219,28 @@ val buildRustNative = tasks.register("buildRustNative") {
         libcxx.copyTo(File(arm64OutDir, "libc++_shared.so"), overwrite = true)
 
         val builtSo = File(repoRoot, "target/aarch64-linux-android/release/libsquad_core.so")
-        exec {
-            workingDir = repoRoot
-            commandLine(
-                "cargo",
-                "run",
-                "--locked",
-                "-p",
-                "squad-core",
-                "--no-default-features",
-                "--features",
-                "android-ffi",
-                "--bin",
-                "uniffi-bindgen",
-                "--",
-                "generate",
-                "--library",
-                builtSo.absolutePath,
-                "--language",
-                "kotlin",
-                "--out-dir",
-                file("src/main/java").absolutePath,
-            )
-        }
+        runBuildCmd(
+            repoRoot,
+            emptyMap(),
+            "cargo",
+            "run",
+            "--locked",
+            "-p",
+            "squad-core",
+            "--no-default-features",
+            "--features",
+            "android-ffi",
+            "--bin",
+            "uniffi-bindgen",
+            "--",
+            "generate",
+            "--library",
+            builtSo.absolutePath,
+            "--language",
+            "kotlin",
+            "--out-dir",
+            file("src/main/java").absolutePath,
+        )
     }
 }
 

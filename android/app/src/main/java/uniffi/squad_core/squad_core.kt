@@ -3178,38 +3178,18 @@ public object FfiConverterTypeMobileChatContent : FfiConverterRustBuffer<MobileC
 
 
 
-sealed class MobileCoreException: kotlin.Exception() {
-    
-    class InvalidArgument(
+sealed class MobileCoreException(message: String): kotlin.Exception(message) {
         
-        val `message`: kotlin.String
-        ) : MobileCoreException() {
-        override val message
-            get() = "message=${ `message` }"
-    }
-    
-    class AudioInitFailed(
+        class InvalidArgument(message: String) : MobileCoreException(message)
         
-        val `message`: kotlin.String
-        ) : MobileCoreException() {
-        override val message
-            get() = "message=${ `message` }"
-    }
-    
-    class Internal(
+        class AudioInitFailed(message: String) : MobileCoreException(message)
         
-        val `message`: kotlin.String
-        ) : MobileCoreException() {
-        override val message
-            get() = "message=${ `message` }"
-    }
-    
+        class Internal(message: String) : MobileCoreException(message)
+        
 
     companion object ErrorHandler : UniffiRustCallStatusErrorHandler<MobileCoreException> {
         override fun lift(error_buf: RustBuffer.ByValue): MobileCoreException = FfiConverterTypeMobileCoreError.lift(error_buf)
     }
-
-    
 }
 
 /**
@@ -3218,56 +3198,31 @@ sealed class MobileCoreException: kotlin.Exception() {
 public object FfiConverterTypeMobileCoreError : FfiConverterRustBuffer<MobileCoreException> {
     override fun read(buf: ByteBuffer): MobileCoreException {
         
-
-        return when(buf.getInt()) {
-            1 -> MobileCoreException.InvalidArgument(
-                FfiConverterString.read(buf),
-                )
-            2 -> MobileCoreException.AudioInitFailed(
-                FfiConverterString.read(buf),
-                )
-            3 -> MobileCoreException.Internal(
-                FfiConverterString.read(buf),
-                )
+            return when(buf.getInt()) {
+            1 -> MobileCoreException.InvalidArgument(FfiConverterString.read(buf))
+            2 -> MobileCoreException.AudioInitFailed(FfiConverterString.read(buf))
+            3 -> MobileCoreException.Internal(FfiConverterString.read(buf))
             else -> throw RuntimeException("invalid error enum value, something is very wrong!!")
         }
+        
     }
 
     override fun allocationSize(value: MobileCoreException): ULong {
-        return when(value) {
-            is MobileCoreException.InvalidArgument -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`message`)
-            )
-            is MobileCoreException.AudioInitFailed -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`message`)
-            )
-            is MobileCoreException.Internal -> (
-                // Add the size for the Int that specifies the variant plus the size needed for all fields
-                4UL
-                + FfiConverterString.allocationSize(value.`message`)
-            )
-        }
+        return 4UL
     }
 
     override fun write(value: MobileCoreException, buf: ByteBuffer) {
         when(value) {
             is MobileCoreException.InvalidArgument -> {
                 buf.putInt(1)
-                FfiConverterString.write(value.`message`, buf)
                 Unit
             }
             is MobileCoreException.AudioInitFailed -> {
                 buf.putInt(2)
-                FfiConverterString.write(value.`message`, buf)
                 Unit
             }
             is MobileCoreException.Internal -> {
                 buf.putInt(3)
-                FfiConverterString.write(value.`message`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

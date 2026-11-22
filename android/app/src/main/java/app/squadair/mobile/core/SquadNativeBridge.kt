@@ -13,10 +13,7 @@ object SquadNativeBridge {
 
     private fun ensureLibrariesLoaded() {
         if (librariesLoaded.compareAndSet(false, true)) {
-            try {
-                System.loadLibrary("c++_shared")
-            } catch (_: UnsatisfiedLinkError) {
-            }
+            System.loadLibrary("c++_shared")
             System.loadLibrary("squad_core")
         }
     }
