@@ -6020,9 +6020,13 @@ mod tests {
 
         let mesh_deadline = Instant::now() + Duration::from_secs(6);
         let (mut a_ok, mut b_ok, mut c_ok) = (false, false, false);
+        let mut a_knows_bob = false;
         while Instant::now() < mesh_deadline && !(a_ok && b_ok && c_ok) {
             while let Ok(ev) = rx_a.try_recv() {
                 if let MeshEvent::PeersUpdated(peers) = ev {
+                    if peers.iter().any(|p| p.pub_key == Some(pk_b)) {
+                        a_knows_bob = true;
+                    }
                     if peers
                         .iter()
                         .filter(|p| p.status == PeerConnStatus::Connected)
@@ -6097,7 +6101,6 @@ mod tests {
 
         // 4. Alice must now know Bob & Charlie's pub_keys in the room and reject re-inviting Bob.
         let id_deadline = Instant::now() + Duration::from_secs(3);
-        let mut a_knows_bob = false;
         while Instant::now() < id_deadline && !a_knows_bob {
             while let Ok(ev) = rx_a.try_recv() {
                 if let MeshEvent::PeersUpdated(peers) = ev {
