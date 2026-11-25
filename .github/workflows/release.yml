@@ -235,14 +235,27 @@ jobs:
           distribution: temurin
           java-version: "17"
 
-      - name: Set up Android SDK & NDK r26d
-        uses: android-actions/setup-android@v3
-
-      - name: Install Android platform 34, build-tools, and NDK r26d
+      - name: Set up Android SDK 34, build-tools, and NDK r26d
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
-          echo "ANDROID_NDK_HOME=${ANDROID_HOME}/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
+          SDKMANAGER=""
+          for candidate in \
+            "${SDK_ROOT}/cmdline-tools/latest/bin/sdkmanager" \
+            "${SDK_ROOT}/cmdline-tools/"*"/bin/sdkmanager"; do
+            if [[ -x "$candidate" ]]; then
+              SDKMANAGER="$candidate"
+            fi
+          done
+          if [[ -z "$SDKMANAGER" ]]; then
+            echo "Error: sdkmanager not found under ${SDK_ROOT}" >&2
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --sdk_root="$SDK_ROOT" --licenses >/dev/null || true
+          "$SDKMANAGER" --sdk_root="$SDK_ROOT" "platforms;android-34" "build-tools;34.0.0" "ndk;26.3.11579264"
+          echo "ANDROID_HOME=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=${SDK_ROOT}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_HOME=${SDK_ROOT}/ndk/26.3.11579264" >> "$GITHUB_ENV"
+          echo "${SDK_ROOT}/platform-tools" >> "$GITHUB_PATH"
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4

@@ -6,7 +6,7 @@ use ringbuf::{
 use std::ffi::{c_char, c_void};
 use std::sync::{
     atomic::{AtomicBool, AtomicU32, Ordering},
-    mpsc, Arc,
+    mpsc, Arc, Mutex, OnceLock,
 };
 use std::thread::{self, JoinHandle};
 use tracing::{info, warn};
@@ -111,7 +111,6 @@ struct WaveFormatEx {
 #[link(name = "kernel32")]
 extern "system" {
     fn LoadLibraryW(lp_lib_file_name: *const u16) -> *mut c_void;
-    fn FreeLibrary(h_lib_module: *mut c_void) -> i32;
     fn GetProcAddress(h_module: *mut c_void, lp_proc_name: *const c_char) -> *mut c_void;
     fn GetCurrentProcessId() -> u32;
     fn CreateEventW(
@@ -221,28 +220,36 @@ unsafe fn com_release(obj: *mut c_void) {
     }
 }
 
+struct ActivationState {
+    ready_event: usize,
+    result: Mutex<Option<(i32, usize)>>,
+}
+
+impl Drop for ActivationState {
+    fn drop(&mut self) {
+        if let Ok(mut guard) = self.result.lock() {
+            if let Some((_, ptr_addr)) = guard.take() {
+                if ptr_addr != 0 {
+                    unsafe {
+                        com_release(ptr_addr as *mut c_void);
+                    }
+                }
+            }
+        }
+        if self.ready_event != 0 {
+            unsafe {
+                CloseHandle(self.ready_event as *mut c_void);
+            }
+            self.ready_event = 0;
+        }
+    }
+}
+
 #[repr(C)]
 struct CompletionHandler {
     vtbl: *const CompletionHandlerVtbl,
     ref_count: AtomicU32,
-    ready_event: *mut c_void,
-    activate_hr: i32,
-    audio_client: *mut c_void,
-}
-
-impl Drop for CompletionHandler {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.audio_client.is_null() {
-                com_release(self.audio_client);
-                self.audio_client = std::ptr::null_mut();
-            }
-            if !self.ready_event.is_null() {
-                CloseHandle(self.ready_event);
-                self.ready_event = std::ptr::null_mut();
-            }
-        }
-    }
+    state: Arc<ActivationState>,
 }
 
 static COMPLETION_HANDLER_VTBL: CompletionHandlerVtbl = CompletionHandlerVtbl {
@@ -297,26 +304,73 @@ unsafe extern "system" fn handler_activate_completed(
     this: *mut c_void,
     operation: *mut c_void,
 ) -> i32 {
-    let me = &mut *(this as *mut CompletionHandler);
+    let me = &*(this as *const CompletionHandler);
+    let mut final_hr: i32 = -1;
+    let mut audio_client: *mut c_void = std::ptr::null_mut();
     if !operation.is_null() {
         let mut hr: i32 = -1;
-        let mut client: *mut c_void = std::ptr::null_mut();
+        let mut raw_iface: *mut c_void = std::ptr::null_mut();
         let call_hr = (com_vtbl::<AsyncOpVtbl>(operation).get_activate_result)(
             operation,
             &mut hr,
-            &mut client,
+            &mut raw_iface,
         );
-        if call_hr >= 0 {
-            me.activate_hr = hr;
-            me.audio_client = client;
+        if call_hr >= 0 && hr >= 0 && !raw_iface.is_null() {
+            let mut client: *mut c_void = std::ptr::null_mut();
+            let qi_hr = (com_vtbl::<UnknownVtbl>(raw_iface).query_interface)(
+                raw_iface,
+                &IID_IAUDIOCLIENT,
+                &mut client,
+            );
+            com_release(raw_iface);
+            if qi_hr >= 0 && !client.is_null() {
+                final_hr = hr;
+                audio_client = client;
+            } else {
+                final_hr = if qi_hr < 0 { qi_hr } else { -1 };
+            }
         } else {
-            me.activate_hr = call_hr;
+            if !raw_iface.is_null() {
+                com_release(raw_iface);
+            }
+            final_hr = if call_hr < 0 { call_hr } else { hr };
         }
     }
-    if !me.ready_event.is_null() {
-        SetEvent(me.ready_event);
+    if let Ok(mut guard) = me.state.result.lock() {
+        if let Some((_, old_addr)) = guard.replace((final_hr, audio_client as usize)) {
+            if old_addr != 0 {
+                com_release(old_addr as *mut c_void);
+            }
+        }
+    } else if !audio_client.is_null() {
+        com_release(audio_client);
+    }
+    if me.state.ready_event != 0 {
+        SetEvent(me.state.ready_event as *mut c_void);
     }
     S_OK
+}
+
+fn mmdevapi_activate_fn() -> Result<ActivateAudioInterfaceAsyncFn, String> {
+    static PROC: OnceLock<Result<usize, String>> = OnceLock::new();
+    let res = PROC.get_or_init(|| unsafe {
+        let mmdevapi_name: Vec<u16> = "mmdevapi.dll\0".encode_utf16().collect();
+        let mmdevapi = LoadLibraryW(mmdevapi_name.as_ptr());
+        if mmdevapi.is_null() {
+            return Err("LoadLibraryW(mmdevapi.dll) failed".into());
+        }
+        let proc_ptr = GetProcAddress(mmdevapi, c"ActivateAudioInterfaceAsync".as_ptr());
+        if proc_ptr.is_null() {
+            return Err("Missing ActivateAudioInterfaceAsync".into());
+        }
+        Ok(proc_ptr as usize)
+    });
+    match res {
+        Ok(addr) => Ok(unsafe {
+            std::mem::transmute::<*mut c_void, ActivateAudioInterfaceAsyncFn>(*addr as *mut c_void)
+        }),
+        Err(msg) => Err(msg.clone()),
+    }
 }
 
 pub(crate) struct WinProcessLoopback {
@@ -426,44 +480,34 @@ fn run_process_loopback_thread(
         let co_hr = CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED);
         let need_co_uninit = co_hr >= 0;
 
-        let mmdevapi_name: Vec<u16> = "mmdevapi.dll\0".encode_utf16().collect();
-        let mmdevapi = LoadLibraryW(mmdevapi_name.as_ptr());
-        if mmdevapi.is_null() {
-            let _ = ready_tx.send(Err("LoadLibraryW(mmdevapi.dll) failed".into()));
-            if need_co_uninit {
-                CoUninitialize();
+        let activate_async = match mmdevapi_activate_fn() {
+            Ok(f) => f,
+            Err(err) => {
+                let _ = ready_tx.send(Err(err));
+                if need_co_uninit {
+                    CoUninitialize();
+                }
+                return;
             }
-            return;
-        }
-
-        let proc_ptr = GetProcAddress(mmdevapi, c"ActivateAudioInterfaceAsync".as_ptr());
-        if proc_ptr.is_null() {
-            let _ = ready_tx.send(Err("Missing ActivateAudioInterfaceAsync".into()));
-            FreeLibrary(mmdevapi);
-            if need_co_uninit {
-                CoUninitialize();
-            }
-            return;
-        }
-        let activate_async: ActivateAudioInterfaceAsyncFn =
-            std::mem::transmute::<*mut c_void, ActivateAudioInterfaceAsyncFn>(proc_ptr);
+        };
 
         let ready_event = CreateEventW(std::ptr::null(), 1, 0, std::ptr::null());
         if ready_event.is_null() {
             let _ = ready_tx.send(Err("CreateEventW(ready) failed".into()));
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
             return;
         }
 
+        let state = Arc::new(ActivationState {
+            ready_event: ready_event as usize,
+            result: Mutex::new(None),
+        });
         let handler_ptr = Box::into_raw(Box::new(CompletionHandler {
             vtbl: &COMPLETION_HANDLER_VTBL,
             ref_count: AtomicU32::new(1),
-            ready_event,
-            activate_hr: -1,
-            audio_client: std::ptr::null_mut(),
+            state: Arc::clone(&state),
         }));
 
         let mut act_params = AudioClientActivationParams {
@@ -498,7 +542,6 @@ fn run_process_loopback_thread(
             )));
             com_release(async_op);
             handler_release(handler_ptr as *mut c_void);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -507,20 +550,20 @@ fn run_process_loopback_thread(
 
         let wait_res = WaitForSingleObject(ready_event, 3000);
         com_release(async_op);
+        handler_release(handler_ptr as *mut c_void);
         if wait_res != WAIT_OBJECT_0 {
             let _ = ready_tx.send(Err("ActivateAudioInterfaceAsync timed out".into()));
-            handler_release(handler_ptr as *mut c_void);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
             return;
         }
 
-        let activate_hr = (*handler_ptr).activate_hr;
-        let audio_client = (*handler_ptr).audio_client;
-        (*handler_ptr).audio_client = std::ptr::null_mut();
-        handler_release(handler_ptr as *mut c_void);
+        let (activate_hr, audio_client_addr) = match state.result.lock() {
+            Ok(mut guard) => guard.take().unwrap_or((-1, 0)),
+            Err(_) => (-1, 0),
+        };
+        let audio_client = audio_client_addr as *mut c_void;
 
         if activate_hr < 0 || audio_client.is_null() {
             let _ = ready_tx.send(Err(format!(
@@ -528,7 +571,6 @@ fn run_process_loopback_thread(
                 activate_hr as u32
             )));
             com_release(audio_client);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -559,7 +601,6 @@ fn run_process_loopback_thread(
                 init_hr as u32
             )));
             com_release(audio_client);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -570,7 +611,6 @@ fn run_process_loopback_thread(
         if audio_event.is_null() {
             let _ = ready_tx.send(Err("CreateEventW(audio) failed".into()));
             com_release(audio_client);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -586,7 +626,6 @@ fn run_process_loopback_thread(
             )));
             CloseHandle(audio_event);
             com_release(audio_client);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -606,7 +645,6 @@ fn run_process_loopback_thread(
             )));
             CloseHandle(audio_event);
             com_release(audio_client);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -622,7 +660,6 @@ fn run_process_loopback_thread(
             com_release(capture_client);
             CloseHandle(audio_event);
             com_release(audio_client);
-            FreeLibrary(mmdevapi);
             if need_co_uninit {
                 CoUninitialize();
             }
@@ -696,7 +733,6 @@ fn run_process_loopback_thread(
         com_release(capture_client);
         CloseHandle(audio_event);
         com_release(audio_client);
-        FreeLibrary(mmdevapi);
         if need_co_uninit {
             CoUninitialize();
         }
