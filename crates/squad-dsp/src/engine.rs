@@ -1103,6 +1103,10 @@ fn build_loopback_stream(
 
     #[cfg(target_os = "windows")]
     {
+        if host.default_output_device().is_none() {
+            let _ = output_device_name;
+            return None;
+        }
         if let Some(proc_lb) = crate::win_loopback::start_windows_process_loopback() {
             return Some(LoopbackStream {
                 _handle: LoopbackHandle::WinProcess(proc_lb.handle),

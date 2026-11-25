@@ -66,7 +66,7 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=1
 
   cross-platform:
     name: ${{ matrix.os }} (check, test)
@@ -89,4 +89,4 @@ jobs:
         run: cargo check --workspace --all-targets --locked
 
       - name: Run workspace tests
-        run: cargo test --workspace --locked
+        run: cargo test --workspace --locked -- --test-threads=1
