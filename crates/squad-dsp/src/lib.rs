@@ -1,12 +1,18 @@
 pub mod aec;
+#[cfg(target_os = "android")]
+mod android_audio;
 pub mod codec;
 pub mod cues;
 pub mod denoise;
 pub mod engine;
 mod hotplug;
 pub mod jitter;
+#[cfg(target_os = "macos")]
+mod macos_loopback;
 pub mod mixer;
 pub mod resampler;
+#[cfg(target_os = "windows")]
+mod win_loopback;
 
 pub use aec::EchoCanceller;
 pub use codec::{OpusCodecError, OpusDecoder10ms, OpusEncoder10ms};

@@ -19,13 +19,18 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.material3.Surface
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.squadair.mobile.core.BatterySurvivalHelper
 import app.squadair.mobile.core.SquadSessionRepository
+import app.squadair.mobile.service.IncomingCallNotificationManager
+import app.squadair.mobile.ui.BatteryOptimizationDialog
 import app.squadair.mobile.ui.IncomingCallDialog
 import app.squadair.mobile.ui.LobbyScreen
 import app.squadair.mobile.ui.RoomScreen
@@ -35,10 +40,13 @@ import app.squadair.mobile.ui.theme.SquadAirTheme
 
 class MainActivity : ComponentActivity() {
     private lateinit var repository: SquadSessionRepository
+    private var showBatteryOnboarding by mutableStateOf(false)
 
     private val permissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
-    ) { /* Permissions state is checked dynamically before audio/notification actions */ }
+    ) {
+        maybeTriggerBatteryOnboarding()
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -96,6 +104,12 @@ class MainActivity : ComponentActivity() {
                             onDecline = { repository.declineIncomingCall() },
                         )
                     }
+
+                    if (showBatteryOnboarding) {
+                        BatteryOptimizationDialog(
+                            onDismiss = { showBatteryOnboarding = false },
+                        )
+                    }
                 }
             }
         }
@@ -105,6 +119,13 @@ class MainActivity : ComponentActivity() {
         super.onNewIntent(intent)
         setIntent(intent)
         handleIncomingIntent(intent)
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus) {
+            repository.onUiVisibilityPossiblyChanged()
+        }
     }
 
     override fun onUserLeaveHint() {
@@ -127,9 +148,32 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun handleIncomingIntent(intent: Intent?) {
-        val data = intent?.data ?: return
+        if (intent == null) return
+        when (intent.action) {
+            IncomingCallNotificationManager.ACTION_ACCEPT_INCOMING_CALL -> {
+                val inviteUri = intent.getStringExtra(IncomingCallNotificationManager.EXTRA_INVITE_URI)
+                intent.action = null
+                intent.removeExtra(IncomingCallNotificationManager.EXTRA_INVITE_URI)
+                if (!inviteUri.isNullOrBlank()) {
+                    repository.acceptIncomingCall(inviteUri)
+                }
+                return
+            }
+            IncomingCallNotificationManager.ACTION_SHOW_INCOMING_CALL -> {
+                intent.action = null
+                return
+            }
+        }
+        val data = intent.data ?: return
         if (data.scheme == "squad" || data.scheme == "voice") {
             repository.joinRoomByInvite(data.toString())
+        }
+    }
+
+    private fun maybeTriggerBatteryOnboarding() {
+        if (BatterySurvivalHelper.shouldPromptOnboarding(this)) {
+            BatterySurvivalHelper.markOnboardingShown(this)
+            showBatteryOnboarding = true
         }
     }
 
@@ -156,6 +200,8 @@ class MainActivity : ComponentActivity() {
         }
         if (missing.isNotEmpty()) {
             permissionLauncher.launch(missing.toTypedArray())
+        } else {
+            maybeTriggerBatteryOnboarding()
         }
     }
 }

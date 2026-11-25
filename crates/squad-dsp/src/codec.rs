@@ -21,7 +21,15 @@ pub struct OpusEncoder10ms {
 
 impl OpusEncoder10ms {
     pub fn new(bitrate_bps: i32) -> Result<Self, OpusCodecError> {
-        let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
+        Self::with_application(bitrate_bps, Application::Voip)
+    }
+
+    pub fn new_audio(bitrate_bps: i32) -> Result<Self, OpusCodecError> {
+        Self::with_application(bitrate_bps, Application::Audio)
+    }
+
+    fn with_application(bitrate_bps: i32, app: Application) -> Result<Self, OpusCodecError> {
+        let mut encoder = Encoder::new(SampleRate::Hz48000, Channels::Mono, app)?;
         encoder.set_bitrate(Bitrate::BitsPerSecond(bitrate_bps.clamp(12_000, 128_000)))?;
         encoder.set_inband_fec(true)?;
         encoder.set_packet_loss_perc(5)?;
@@ -140,5 +148,38 @@ mod tests {
             *sample = (2.0 * std::f32::consts::PI * 440.0 * t).sin() * 0.4;
         }
         assert!(encoder.encode_speech_frame(&pcm).is_ok());
+    }
+
+    #[test]
+    fn test_opus_audio_encoder_for_screen_share() {
+        let mut encoder = OpusEncoder10ms::new_audio(96_000).unwrap();
+        let mut decoder = OpusDecoder10ms::new().unwrap();
+
+        let mut total_energy_out = 0.0f64;
+        for frame_idx in 0..20 {
+            let mut pcm = [0.0f32; FRAME_SAMPLES];
+            for (i, sample) in pcm.iter_mut().enumerate() {
+                let sample_num = frame_idx * FRAME_SAMPLES + i;
+                let t = sample_num as f32 / 48_000.0;
+                *sample = 0.25 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.15 * (2.0 * std::f32::consts::PI * 5_000.0 * t).sin()
+                    + 0.10 * (2.0 * std::f32::consts::PI * 12_000.0 * t).sin();
+            }
+            let pkt = encoder.encode_speech_frame(&pcm).unwrap();
+            assert!(!pkt.is_empty());
+            assert!(pkt.len() <= MAX_OPUS_PACKET_BYTES);
+
+            let mut decoded = [0.0f32; FRAME_SAMPLES];
+            decoder.decode_frame(&pkt, &mut decoded).unwrap();
+            for &s in &decoded {
+                assert!(s.is_finite());
+                total_energy_out += f64::from(s) * f64::from(s);
+            }
+        }
+        let rms = (total_energy_out / (20 * FRAME_SAMPLES) as f64).sqrt();
+        assert!(
+            rms > 0.10,
+            "Expected full-band screen-share audio RMS > 0.10, got {rms}"
+        );
     }
 }

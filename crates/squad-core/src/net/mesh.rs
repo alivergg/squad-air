@@ -216,6 +216,8 @@ pub enum MeshCommand {
     },
     #[cfg(test)]
     TestGetSessionInfo(mpsc::Sender<Option<(SocketAddr, SocketAddr, RoomId, bool)>>),
+    #[cfg(test)]
+    TestGetStreamAudioRxCount(mpsc::Sender<u64>),
     Shutdown,
 }
 
@@ -381,10 +383,17 @@ struct ActiveSession {
     stream_subscribers: HashSet<PeerId>,
     next_video_frame_id: Arc<AtomicU32>,
     watched_peer_id: Option<PeerId>,
+    watching_awaiting_idr: bool,
     sent_decoder_error_to: Option<PeerId>,
     video_reassembler: FrameReassembler,
     hevc_decode_supported: bool,
     last_pli_sent: Instant,
+    last_stream_announce_at: Instant,
+    stream_stop_announce_remaining: u8,
+    last_watch_retry_sent: Instant,
+    last_pli_handled: Instant,
+    #[cfg(test)]
+    stream_audio_rx_count: u64,
     is_lan_room: bool,
     lan_room_name: String,
     embedded_rv: Option<EmbeddedRendezvousHandle>,
@@ -987,6 +996,7 @@ pub fn spawn_mesh_worker(
                                 sess.video_tx_queue.clear();
                                 sess.stream_subscribers.clear();
                                 sess.local_preview_enabled = false;
+                                sess.stream_stop_announce_remaining = 0;
                                 audio_engine.set_share_stream_audio(config.share_audio);
                                 sess.local_stream_config = Some(config.clone());
                                 if sess.local_peer_id != 0 {
@@ -999,6 +1009,7 @@ pub fn spawn_mesh_worker(
                                         Some(&config),
                                     )
                                     .await;
+                                    sess.last_stream_announce_at = Instant::now();
                                 }
                                 let _ = evt_tx
                                     .send(MeshEvent::LocalStreamStatus {
@@ -1020,6 +1031,7 @@ pub fn spawn_mesh_worker(
                                 sess.local_preview_enabled = false;
                                 sess.local_stream_config = None;
                                 sess.stream_subscribers.clear();
+                                sess.stream_stop_announce_remaining = 2;
                                 if sess.local_peer_id != 0 {
                                     broadcast_stream_announce(
                                         &socket,
@@ -1043,6 +1055,7 @@ pub fn spawn_mesh_worker(
                             if let Some(sess) = session.as_mut() {
                                 if enabled && sess.local_stream_config.is_some() {
                                     if let Some(prev_pid) = sess.watched_peer_id.take() {
+                                        sess.watching_awaiting_idr = false;
                                         send_stream_subscribe(
                                             &socket,
                                             sess,
@@ -1108,6 +1121,7 @@ pub fn spawn_mesh_worker(
                                     }
                                 }
                                 sess.watched_peer_id = peer_id;
+                                sess.watching_awaiting_idr = peer_id.is_some();
                                 sess.sent_decoder_error_to = None;
                                 sess.video_reassembler.reset();
                                 decode_handle.reset();
@@ -1120,6 +1134,7 @@ pub fn spawn_mesh_worker(
                                         .is_some_and(|p| p.status == PeerConnStatus::Relayed);
                                     if relay_only {
                                         sess.watched_peer_id = None;
+                                        sess.watching_awaiting_idr = false;
                                         let _ = evt_tx
                                             .send(MeshEvent::Error(
                                                 "Screen share requires Direct P2P or Peer-Mesh Relay (disabled over server relay)".to_string(),
@@ -1162,7 +1177,9 @@ pub fn spawn_mesh_worker(
                                         target_pid,
                                     )
                                     .await;
-                                    sess.last_pli_sent = Instant::now();
+                                    let now = Instant::now();
+                                    sess.last_watch_retry_sent = now;
+                                    sess.last_pli_sent = now;
                                 }
                             } else {
                                 audio_engine.clear_stream_audio();
@@ -1173,6 +1190,7 @@ pub fn spawn_mesh_worker(
                             if in_tray {
                                 if let Some(sess) = session.as_mut() {
                                     if let Some(prev_pid) = sess.watched_peer_id.take() {
+                                        sess.watching_awaiting_idr = false;
                                         send_stream_subscribe(
                                             &socket,
                                             sess,
@@ -1443,6 +1461,14 @@ pub fn spawn_mesh_worker(
                                 )
                             });
                             let _ = reply_tx.try_send(info);
+                        }
+                        #[cfg(test)]
+                        MeshCommand::TestGetStreamAudioRxCount(reply_tx) => {
+                            let count = session
+                                .as_ref()
+                                .map(|s| s.stream_audio_rx_count)
+                                .unwrap_or(0);
+                            let _ = reply_tx.try_send(count);
                         }
                         MeshCommand::Shutdown => {
                             stop_capture_worker(&mut capture_worker);
@@ -2351,6 +2377,63 @@ pub fn spawn_mesh_worker(
                             )
                             .await;
                         }
+                        if let Some(cfg) = sess.local_stream_config.clone() {
+                            if sess
+                                .peers
+                                .get(&peer_id)
+                                .is_some_and(|p| p.status == PeerConnStatus::MeshRelayed)
+                            {
+                                if let Some(ep) = peer_endpoint(sess, peer_id) {
+                                    send_stream_announce_to_endpoint(
+                                        &socket,
+                                        ep,
+                                        sess,
+                                        &mut seal_buf,
+                                        &mut relay_buf,
+                                        true,
+                                        Some(&cfg),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    }
+
+                    if let Some(target_pid) = sess.watched_peer_id {
+                        let can_stream = sess.peers.get(&target_pid).is_some_and(|p| {
+                            matches!(
+                                p.status,
+                                PeerConnStatus::Connected | PeerConnStatus::MeshRelayed
+                            )
+                        });
+                        if can_stream
+                            && sess.watching_awaiting_idr
+                            && now.duration_since(sess.last_watch_retry_sent)
+                                >= Duration::from_millis(400)
+                        {
+                            sess.last_watch_retry_sent = now;
+                            send_stream_subscribe(
+                                &socket,
+                                sess,
+                                &mut seal_buf,
+                                &mut relay_buf,
+                                target_pid,
+                                true,
+                            )
+                            .await;
+                            if now.duration_since(sess.last_pli_sent) >= Duration::from_millis(120)
+                            {
+                                send_stream_pli(
+                                    &socket,
+                                    sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                    target_pid,
+                                )
+                                .await;
+                                sess.last_pli_sent = now;
+                            }
+                        }
                     }
                 }
 
@@ -2406,7 +2489,8 @@ pub fn spawn_mesh_worker(
                     let route_changes = reconcile_mesh_routes(&socket, sess, &mut seal_buf, &mut relay_buf, now).await;
                     went_stale.extend(route_changes);
 
-                    for pid in ping_peers {
+                    for pid in &ping_peers {
+                        let pid = *pid;
                         sess.control_seq = sess.control_seq.wrapping_add(1);
                         let hdr = P2pHeader {
                             msg_type: P2pMsgType::Ping,
@@ -2420,6 +2504,42 @@ pub fn spawn_mesh_worker(
                         }
                         if sess.peers.get(&pid).is_some_and(|p| p.pub_key.is_none()) {
                             send_identity_announce_to_peer(&socket, sess, pid, &mut seal_buf, &mut relay_buf).await;
+                        }
+                    }
+
+                    if let Some(cfg) = sess.local_stream_config.clone() {
+                        if now.duration_since(sess.last_stream_announce_at) >= Duration::from_secs(1) {
+                            sess.last_stream_announce_at = now;
+                            for &pid in &ping_peers {
+                                if let Some(ep) = peer_endpoint(sess, pid) {
+                                    send_stream_announce_to_endpoint(
+                                        &socket,
+                                        ep,
+                                        sess,
+                                        &mut seal_buf,
+                                        &mut relay_buf,
+                                        true,
+                                        Some(&cfg),
+                                    )
+                                    .await;
+                                }
+                            }
+                        }
+                    } else if sess.stream_stop_announce_remaining > 0 {
+                        sess.stream_stop_announce_remaining -= 1;
+                        for &pid in &ping_peers {
+                            if let Some(ep) = peer_endpoint(sess, pid) {
+                                send_stream_announce_to_endpoint(
+                                    &socket,
+                                    ep,
+                                    sess,
+                                    &mut seal_buf,
+                                    &mut relay_buf,
+                                    false,
+                                    None,
+                                )
+                                .await;
+                            }
                         }
                     }
 
@@ -2699,6 +2819,7 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                 }
                 if sess.watched_peer_id == Some(id) {
                     sess.watched_peer_id = None;
+                    sess.watching_awaiting_idr = false;
                     sess.sent_decoder_error_to = None;
                     sess.video_reassembler.reset();
                     io.decode_handle.reset();
@@ -2742,6 +2863,9 @@ async fn handle_signaling_rx(datagram: &[u8], sess: &mut ActiveSession, io: &mut
                 .await;
             }
             if sub_changed {
+                if sess.stream_subscribers.is_empty() {
+                    sess.video_tx_queue.clear();
+                }
                 reconcile_capture_worker(
                     sess,
                     io.capture_worker,
@@ -2886,14 +3010,14 @@ async fn handle_p2p_rx(
     }
 
     if matches!(relay_source, Some(RelaySource::Server))
-        && (!header.msg_type.is_server_relay_allowed()
-            || matches!(header.msg_type, P2pMsgType::StreamAnnounce))
+        && !header.msg_type.is_server_relay_allowed()
     {
         return;
     }
 
     let now = Instant::now();
     let mut reachability_dirty = false;
+    let mut upgraded_to_video_route = false;
     let (sender_uuid, sender_nickname, first_connect) = {
         let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) else {
             return;
@@ -2931,6 +3055,7 @@ async fn handle_p2p_rx(
                         peer.record.peer_id, peer.record.nickname, src_addr
                     );
                     reachability_dirty = true;
+                    upgraded_to_video_route = true;
                 }
                 peer.status = PeerConnStatus::Connected;
                 peer.active_addr = Some(src_addr);
@@ -2945,6 +3070,9 @@ async fn handle_p2p_rx(
                             "Peer-Mesh relay path active with peer #{} ({}) via teammate #{}",
                             peer.record.peer_id, peer.record.nickname, b_pid
                         );
+                    }
+                    if peer.status != PeerConnStatus::MeshRelayed {
+                        upgraded_to_video_route = true;
                     }
                     peer.status = PeerConnStatus::MeshRelayed;
                     peer.mesh_relay_peer = Some(b_pid);
@@ -3029,6 +3157,48 @@ async fn handle_p2p_rx(
             )
             .await;
         }
+    }
+
+    if !first_connect && upgraded_to_video_route {
+        if let Some(cfg) = sess.local_stream_config.clone() {
+            if let Some(ep) = peer_endpoint(sess, header.sender_peer_id) {
+                send_stream_announce_to_endpoint(
+                    socket,
+                    ep,
+                    sess,
+                    io.seal_buf,
+                    io.relay_buf,
+                    true,
+                    Some(&cfg),
+                )
+                .await;
+            }
+        }
+    }
+
+    if upgraded_to_video_route
+        && sess.watched_peer_id == Some(header.sender_peer_id)
+        && sess.watching_awaiting_idr
+    {
+        sess.last_watch_retry_sent = now;
+        send_stream_subscribe(
+            socket,
+            sess,
+            io.seal_buf,
+            io.relay_buf,
+            header.sender_peer_id,
+            true,
+        )
+        .await;
+        send_stream_pli(
+            socket,
+            sess,
+            io.seal_buf,
+            io.relay_buf,
+            header.sender_peer_id,
+        )
+        .await;
+        sess.last_pli_sent = now;
     }
 
     match payload {
@@ -3209,9 +3379,13 @@ async fn handle_p2p_rx(
             } else {
                 None
             };
-            if let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) {
+            let stream_changed = if let Some(peer) = sess.peers.get_mut(&header.sender_peer_id) {
+                let changed = peer.stream_info != stream_opt;
                 peer.stream_info = stream_opt.clone();
-            }
+                changed
+            } else {
+                false
+            };
             if is_streaming
                 && sess.watched_peer_id == Some(header.sender_peer_id)
                 && parsed_codec == VideoCodec::H265
@@ -3232,29 +3406,34 @@ async fn handle_p2p_rx(
             }
             if !is_streaming && sess.watched_peer_id == Some(header.sender_peer_id) {
                 sess.watched_peer_id = None;
+                sess.watching_awaiting_idr = false;
                 sess.sent_decoder_error_to = None;
                 sess.video_reassembler.reset();
                 io.decode_handle.reset();
                 io.audio_engine.clear_stream_audio();
                 clear_video_slot(io.video_frame_slot);
             }
-            let _ = io
-                .evt_tx
-                .send(MeshEvent::RemoteStreamUpdated {
-                    peer_id: header.sender_peer_id,
-                    stream: stream_opt,
-                })
-                .await;
+            if stream_changed {
+                let _ = io
+                    .evt_tx
+                    .send(MeshEvent::RemoteStreamUpdated {
+                        peer_id: header.sender_peer_id,
+                        stream: stream_opt,
+                    })
+                    .await;
+            }
         }
         P2pPayload::StreamSubscribe { subscribe } => {
             if sess.local_stream_config.is_some() {
-                let mut force_idr = false;
-                if subscribe {
-                    sess.stream_subscribers.insert(header.sender_peer_id);
-                    force_idr = true;
+                let changed = if subscribe {
+                    sess.stream_subscribers.insert(header.sender_peer_id)
                 } else {
-                    sess.stream_subscribers.remove(&header.sender_peer_id);
+                    sess.stream_subscribers.remove(&header.sender_peer_id)
+                };
+                if !subscribe && sess.stream_subscribers.is_empty() {
+                    sess.video_tx_queue.clear();
                 }
+                let force_idr = subscribe && changed;
                 reconcile_capture_worker(
                     sess,
                     io.capture_worker,
@@ -3263,18 +3442,23 @@ async fn handle_p2p_rx(
                     io.video_notify,
                     force_idr,
                 );
-                let _ = io
-                    .evt_tx
-                    .send(MeshEvent::LocalStreamStatus {
-                        is_sharing: true,
-                        subscriber_count: sess.stream_subscribers.len(),
-                    })
-                    .await;
+                if changed {
+                    let _ = io
+                        .evt_tx
+                        .send(MeshEvent::LocalStreamStatus {
+                            is_sharing: true,
+                            subscriber_count: sess.stream_subscribers.len(),
+                        })
+                        .await;
+                }
             }
         }
         P2pPayload::StreamPli => {
             if let Some(worker) = io.capture_worker.as_ref() {
-                worker.force_idr.store(true, Ordering::Release);
+                if now.duration_since(sess.last_pli_handled) >= Duration::from_millis(200) {
+                    sess.last_pli_handled = now;
+                    worker.force_idr.store(true, Ordering::Release);
+                }
             }
         }
         P2pPayload::VideoFrameFrag {
@@ -3288,6 +3472,9 @@ async fn handle_p2p_rx(
                 let (frame_opt, need_pli) = sess
                     .video_reassembler
                     .push_fragment(frame_id, frag_idx, frag_count, flags, data);
+                if need_pli {
+                    sess.watching_awaiting_idr = true;
+                }
                 if need_pli && now.duration_since(sess.last_pli_sent) > Duration::from_millis(120) {
                     send_stream_pli(
                         socket,
@@ -3300,6 +3487,7 @@ async fn handle_p2p_rx(
                     sess.last_pli_sent = now;
                 }
                 if let Some(reassembled) = frame_opt {
+                    sess.watching_awaiting_idr = false;
                     let generation = io.decode_handle.generation.load(Ordering::Acquire);
                     let job = DecodeJob::Frame {
                         streamer_peer_id: header.sender_peer_id,
@@ -3310,6 +3498,7 @@ async fn handle_p2p_rx(
                         Ok(()) => {}
                         Err(std::sync::mpsc::TrySendError::Full(_)) => {
                             sess.video_reassembler.reset();
+                            sess.watching_awaiting_idr = true;
                             if now.duration_since(sess.last_pli_sent) > Duration::from_millis(120) {
                                 send_stream_pli(
                                     socket,
@@ -3364,6 +3553,10 @@ async fn handle_p2p_rx(
         }
         P2pPayload::StreamAudioOpus { opus_data } => {
             if sess.watched_peer_id == Some(header.sender_peer_id) {
+                #[cfg(test)]
+                {
+                    sess.stream_audio_rx_count = sess.stream_audio_rx_count.saturating_add(1);
+                }
                 io.audio_engine.push_remote_stream_opus(
                     header.sender_peer_id,
                     header.seq_num,
@@ -3596,6 +3789,26 @@ async fn reconcile_mesh_routes(
         ) {
             send_sealed_to_peer(socket, sess, pid, P2pMsgType::PunchSyn, seal_buf, relay_buf).await;
         }
+        if let Some(cfg) = sess.local_stream_config.clone() {
+            if let Some(ep) = peer_endpoint(sess, pid) {
+                send_stream_announce_to_endpoint(
+                    socket,
+                    ep,
+                    sess,
+                    seal_buf,
+                    relay_buf,
+                    true,
+                    Some(&cfg),
+                )
+                .await;
+            }
+        }
+        if sess.watched_peer_id == Some(pid) && sess.watching_awaiting_idr {
+            sess.last_watch_retry_sent = now;
+            send_stream_subscribe(socket, sess, seal_buf, relay_buf, pid, true).await;
+            send_stream_pli(socket, sess, seal_buf, relay_buf, pid).await;
+            sess.last_pli_sent = now;
+        }
     }
 
     degraded
@@ -3629,6 +3842,7 @@ async fn enforce_video_route_policy(
             }
             if sess.watched_peer_id == Some(pid) {
                 sess.watched_peer_id = None;
+                sess.watching_awaiting_idr = false;
                 sess.sent_decoder_error_to = None;
                 sess.video_reassembler.reset();
                 decode_handle.reset();
@@ -3640,6 +3854,9 @@ async fn enforce_video_route_policy(
     }
 
     if sub_changed {
+        if sess.stream_subscribers.is_empty() {
+            sess.video_tx_queue.clear();
+        }
         reconcile_capture_worker(
             sess,
             capture_worker,
@@ -4360,10 +4577,17 @@ async fn init_session(
         stream_subscribers: HashSet::new(),
         next_video_frame_id: Arc::new(AtomicU32::new(1)),
         watched_peer_id: None,
+        watching_awaiting_idr: false,
         sent_decoder_error_to: None,
         video_reassembler: FrameReassembler::new(),
         hevc_decode_supported,
         last_pli_sent: Instant::now() - Duration::from_secs(5),
+        last_stream_announce_at: Instant::now() - Duration::from_secs(5),
+        stream_stop_announce_remaining: 0,
+        last_watch_retry_sent: Instant::now() - Duration::from_secs(5),
+        last_pli_handled: Instant::now() - Duration::from_secs(5),
+        #[cfg(test)]
+        stream_audio_rx_count: 0,
         is_lan_room,
         lan_room_name,
         embedded_rv,
@@ -5278,10 +5502,16 @@ mod tests {
                 stream_subscribers: HashSet::new(),
                 next_video_frame_id: Arc::new(AtomicU32::new(1)),
                 watched_peer_id: None,
+                watching_awaiting_idr: false,
                 sent_decoder_error_to: None,
                 video_reassembler: FrameReassembler::new(),
                 hevc_decode_supported: false,
                 last_pli_sent: now,
+                last_stream_announce_at: now - Duration::from_secs(5),
+                stream_stop_announce_remaining: 0,
+                last_watch_retry_sent: now - Duration::from_secs(5),
+                last_pli_handled: now - Duration::from_secs(5),
+                stream_audio_rx_count: 0,
                 is_lan_room: false,
                 lan_room_name: String::new(),
                 embedded_rv: None,
@@ -6505,5 +6735,1108 @@ mod tests {
         if let Ok(addr) = empty {
             assert_eq!(addr.port(), 3478);
         }
+    }
+
+    #[tokio::test]
+    async fn test_stream_audio_opus_p2p_delivery_to_subscriber() {
+        let rv = start_embedded_rendezvous().await.unwrap();
+        let rv_addr = format!("127.0.0.1:{}", rv.port);
+        let invite = InviteLink::generate();
+
+        let (out_tx_a, out_rx_a) = mpsc::channel(64);
+        let aud_a =
+            AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_a.clone()).unwrap();
+        let slot_a = Arc::new(Mutex::new(None));
+        let (tx_a, mut rx_a) = spawn_mesh_worker(
+            aud_a.clone(),
+            out_rx_a,
+            slot_a,
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+
+        let (out_tx_b, out_rx_b) = mpsc::channel(64);
+        let aud_b = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_b).unwrap();
+        let slot_b = Arc::new(Mutex::new(None));
+        let (tx_b, mut rx_b) = spawn_mesh_worker(
+            aud_b.clone(),
+            out_rx_b,
+            slot_b,
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+
+        for (tx, nick, uuid) in [
+            (&tx_a, "StreamerA", [0xA1; 16]),
+            (&tx_b, "ViewerB", [0xB2; 16]),
+        ] {
+            tx.send(MeshCommand::JoinRoom {
+                rendezvous_server: rv_addr.clone(),
+                invite: invite.clone(),
+                nickname: nick.to_string(),
+                client_uuid: uuid,
+                initial_volumes: HashMap::new(),
+                is_lan_room: false,
+                room_name: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut peer_a_id = None;
+        let mut b_connected = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && !(peer_a_id.is_some() && b_connected) {
+            while rx_a.try_recv().is_ok() {}
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if let Some(p) = peers.iter().find(|p| p.client_uuid == [0xA1; 16]) {
+                        peer_a_id = Some(p.peer_id);
+                        if p.status == PeerConnStatus::Connected {
+                            b_connected = true;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid_a = peer_a_id.expect("Viewer B must see Streamer A");
+        assert!(b_connected, "A and B must be Connected");
+
+        let cfg = StreamConfig {
+            target: squad_video::CaptureTarget::Monitor {
+                id: 999_999,
+                name: "Synthetic Monitor".to_string(),
+                width: 320,
+                height: 240,
+                is_primary: true,
+            },
+            resolution: squad_video::StreamResolution::Native,
+            fps: squad_video::StreamFps::Fps30,
+            bitrate_bps: 300_000,
+            codec: VideoCodec::H264,
+            share_audio: true,
+        };
+        tx_a.send(MeshCommand::StartScreenShare { config: cfg })
+            .await
+            .unwrap();
+        tx_b.send(MeshCommand::WatchPeerStream {
+            peer_id: Some(pid_a),
+        })
+        .await
+        .unwrap();
+
+        let sub_deadline = Instant::now() + Duration::from_secs(4);
+        let mut a_has_sub = false;
+        while Instant::now() < sub_deadline && !a_has_sub {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::LocalStreamStatus {
+                    is_sharing: true,
+                    subscriber_count,
+                } = ev
+                {
+                    if subscriber_count >= 1 {
+                        a_has_sub = true;
+                    }
+                }
+            }
+            while rx_b.try_recv().is_ok() {}
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(a_has_sub, "Streamer A must register Viewer B as subscriber");
+
+        let mut opus_enc = squad_dsp::OpusEncoder10ms::new_audio(96_000).unwrap();
+        let mut pcm = [0.0f32; squad_dsp::FRAME_SAMPLES];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * 440.0 * (i as f32 / 48_000.0)).sin() * 0.4;
+        }
+        let pkt = opus_enc.encode_speech_frame(&pcm).unwrap();
+        for seq in 1..=5u64 {
+            out_tx_a
+                .send(OutboundAudioFrame::StreamOpus {
+                    seq_num: seq,
+                    opus_bytes: bytes::Bytes::from(pkt.clone()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let rx_deadline = Instant::now() + Duration::from_secs(3);
+        let mut got_audio = 0u64;
+        while Instant::now() < rx_deadline && got_audio == 0 {
+            let (qtx, mut qrx) = mpsc::channel(1);
+            tx_b.send(MeshCommand::TestGetStreamAudioRxCount(qtx))
+                .await
+                .unwrap();
+            if let Ok(Some(c)) = tokio::time::timeout(Duration::from_millis(200), qrx.recv()).await
+            {
+                got_audio = c;
+            }
+            if got_audio == 0 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+        assert!(
+            got_audio >= 1,
+            "Viewer B must receive StreamAudioOpus packets from Streamer A, got {got_audio}"
+        );
+
+        let _ = tx_a.send(MeshCommand::Shutdown).await;
+        let _ = tx_b.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        rv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_late_joiner_direct_receives_active_stream_idr_and_audio_without_restart() {
+        let rv = start_embedded_rendezvous().await.unwrap();
+        let rv_addr = format!("127.0.0.1:{}", rv.port);
+        let invite = InviteLink::generate();
+
+        let (out_tx_a, out_rx_a) = mpsc::channel(64);
+        let aud_a =
+            AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_a.clone()).unwrap();
+        let slot_a = Arc::new(Mutex::new(None));
+        let (tx_a, mut rx_a) = spawn_mesh_worker(
+            aud_a.clone(),
+            out_rx_a,
+            slot_a,
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+
+        let (out_tx_b, out_rx_b) = mpsc::channel(64);
+        let aud_b = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_b).unwrap();
+        let slot_b = Arc::new(Mutex::new(None));
+        let (tx_b, mut rx_b) = spawn_mesh_worker(
+            aud_b.clone(),
+            out_rx_b,
+            slot_b.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+
+        for (tx, nick, uuid) in [(&tx_a, "Alice", [0xA1; 16]), (&tx_b, "Bravo", [0xB2; 16])] {
+            tx.send(MeshCommand::JoinRoom {
+                rendezvous_server: rv_addr.clone(),
+                invite: invite.clone(),
+                nickname: nick.to_string(),
+                client_uuid: uuid,
+                initial_volumes: HashMap::new(),
+                is_lan_room: false,
+                room_name: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let mut pid_a_on_b = None;
+        let mut b_connected = false;
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline && !(pid_a_on_b.is_some() && b_connected) {
+            while rx_a.try_recv().is_ok() {}
+            while let Ok(ev) = rx_b.try_recv() {
+                if let MeshEvent::PeersUpdated(peers) = ev {
+                    if let Some(p) = peers.iter().find(|p| p.client_uuid == [0xA1; 16]) {
+                        pid_a_on_b = Some(p.peer_id);
+                        if p.status == PeerConnStatus::Connected {
+                            b_connected = true;
+                        }
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let pid_a = pid_a_on_b.expect("Bravo must see Alice");
+        assert!(b_connected, "Alice and Bravo must connect first");
+
+        let cfg = StreamConfig {
+            target: squad_video::CaptureTarget::Monitor {
+                id: 999_999,
+                name: "Synthetic Monitor".to_string(),
+                width: 320,
+                height: 240,
+                is_primary: true,
+            },
+            resolution: squad_video::StreamResolution::Native,
+            fps: squad_video::StreamFps::Fps30,
+            bitrate_bps: 300_000,
+            codec: VideoCodec::H264,
+            share_audio: true,
+        };
+        tx_a.send(MeshCommand::StartScreenShare { config: cfg })
+            .await
+            .unwrap();
+
+        // Bravo watches Alice so Alice's capture_worker is already running with 1 subscriber.
+        tx_b.send(MeshCommand::WatchPeerStream {
+            peer_id: Some(pid_a),
+        })
+        .await
+        .unwrap();
+
+        let b_vid_deadline = Instant::now() + Duration::from_secs(6);
+        let mut b_got_frame = false;
+        while Instant::now() < b_vid_deadline && !b_got_frame {
+            while rx_a.try_recv().is_ok() {}
+            while rx_b.try_recv().is_ok() {}
+            if let Ok(guard) = slot_b.lock() {
+                if guard.as_ref().is_some_and(|f| f.streamer_peer_id == pid_a) {
+                    b_got_frame = true;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            b_got_frame,
+            "Bravo must receive active stream frames before Charlie joins"
+        );
+
+        // Late joiner Charlie joins AFTER stream is already active (Alice does NOT restart sharing).
+        let (out_tx_c, out_rx_c) = mpsc::channel(64);
+        let aud_c = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_c).unwrap();
+        let slot_c = Arc::new(Mutex::new(None));
+        let (tx_c, mut rx_c) = spawn_mesh_worker(
+            aud_c.clone(),
+            out_rx_c,
+            slot_c.clone(),
+            Arc::new(Notify::new()),
+            Arc::new(Notify::new()),
+        );
+        tx_c.send(MeshCommand::JoinRoom {
+            rendezvous_server: rv_addr.clone(),
+            invite: invite.clone(),
+            nickname: "Charlie".to_string(),
+            client_uuid: [0xC3; 16],
+            initial_volumes: HashMap::new(),
+            is_lan_room: false,
+            room_name: None,
+        })
+        .await
+        .unwrap();
+
+        let mut c_sees_stream = false;
+        let mut c_connected_to_a = false;
+        let mut pid_a_on_c = None;
+        let c_join_deadline = Instant::now() + Duration::from_secs(8);
+        while Instant::now() < c_join_deadline && !(c_sees_stream && c_connected_to_a) {
+            while rx_a.try_recv().is_ok() {}
+            while rx_b.try_recv().is_ok() {}
+            while let Ok(ev) = rx_c.try_recv() {
+                match ev {
+                    MeshEvent::PeersUpdated(peers) => {
+                        if let Some(p) = peers.iter().find(|p| p.client_uuid == [0xA1; 16]) {
+                            pid_a_on_c = Some(p.peer_id);
+                            if p.status == PeerConnStatus::Connected {
+                                c_connected_to_a = true;
+                            }
+                            if p.stream_info.is_some() {
+                                c_sees_stream = true;
+                            }
+                        }
+                    }
+                    MeshEvent::RemoteStreamUpdated { peer_id, stream }
+                        if Some(peer_id) == pid_a_on_c && stream.is_some() =>
+                    {
+                        c_sees_stream = true;
+                    }
+                    _ => {}
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            c_sees_stream && c_connected_to_a,
+            "Late joiner Charlie must discover Alice's active stream without restart"
+        );
+
+        let a_pid_c = pid_a_on_c.unwrap();
+        tx_c.send(MeshCommand::WatchPeerStream {
+            peer_id: Some(a_pid_c),
+        })
+        .await
+        .unwrap();
+
+        let mut a_two_subs = false;
+        let mut c_got_frame = false;
+        let c_vid_deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < c_vid_deadline && !(a_two_subs && c_got_frame) {
+            while let Ok(ev) = rx_a.try_recv() {
+                if let MeshEvent::LocalStreamStatus {
+                    is_sharing: true,
+                    subscriber_count: 2,
+                } = ev
+                {
+                    a_two_subs = true;
+                }
+            }
+            while rx_b.try_recv().is_ok() {}
+            while rx_c.try_recv().is_ok() {}
+            if let Ok(guard) = slot_c.lock() {
+                if let Some(ref f) = *guard {
+                    if f.streamer_peer_id == a_pid_c && f.width == 320 && f.height == 240 {
+                        c_got_frame = true;
+                    }
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+        assert!(
+            c_got_frame,
+            "Late joiner Charlie must receive decoded IDR video frame without restarting share (a_two_subs={a_two_subs})"
+        );
+
+        let mut opus_enc = squad_dsp::OpusEncoder10ms::new_audio(96_000).unwrap();
+        let mut pcm = [0.0f32; squad_dsp::FRAME_SAMPLES];
+        for (i, s) in pcm.iter_mut().enumerate() {
+            *s = (2.0 * std::f32::consts::PI * 520.0 * (i as f32 / 48_000.0)).sin() * 0.4;
+        }
+        let pkt = opus_enc.encode_speech_frame(&pcm).unwrap();
+        for seq in 1..=5u64 {
+            out_tx_a
+                .send(OutboundAudioFrame::StreamOpus {
+                    seq_num: seq,
+                    opus_bytes: bytes::Bytes::from(pkt.clone()),
+                })
+                .await
+                .unwrap();
+        }
+
+        let c_aud_deadline = Instant::now() + Duration::from_secs(3);
+        let mut c_aud_rx = 0u64;
+        while Instant::now() < c_aud_deadline && c_aud_rx == 0 {
+            let (qtx, mut qrx) = mpsc::channel(1);
+            tx_c.send(MeshCommand::TestGetStreamAudioRxCount(qtx))
+                .await
+                .unwrap();
+            if let Ok(Some(c)) = tokio::time::timeout(Duration::from_millis(200), qrx.recv()).await
+            {
+                c_aud_rx = c;
+            }
+            if c_aud_rx == 0 {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+            }
+        }
+        assert!(
+            c_aud_rx >= 1,
+            "Late joiner Charlie must also receive StreamAudioOpus frames, got {c_aud_rx}"
+        );
+
+        let _ = tx_a.send(MeshCommand::Shutdown).await;
+        let _ = tx_b.send(MeshCommand::Shutdown).await;
+        let _ = tx_c.send(MeshCommand::Shutdown).await;
+        aud_a.shutdown();
+        aud_b.shutdown();
+        aud_c.shutdown();
+        rv.stop().await;
+    }
+
+    #[tokio::test]
+    async fn test_late_joiner_relayed_and_mesh_upgraded_receives_stream_without_restart() {
+        let rv_sock = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let rv_addr = rv_sock.local_addr().unwrap();
+        let (rv_shutdown_tx, rv_shutdown_rx) = tokio::sync::watch::channel(false);
+        let rv_task = tokio::spawn(async move {
+            let _ = squad_rendezvous::run_server_with_config(
+                rv_sock,
+                squad_rendezvous::RendezvousConfig { enable_relay: true },
+                rv_shutdown_rx,
+            )
+            .await;
+        });
+
+        let sock_a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let sock_c = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr_a = sock_a.local_addr().unwrap();
+        let addr_b = sock_b.local_addr().unwrap();
+        let addr_c = sock_c.local_addr().unwrap();
+
+        let invite = InviteLink::generate();
+        let (out_tx_a, _out_rx_a) = mpsc::channel(16);
+        let (out_tx_b, _out_rx_b) = mpsc::channel(16);
+        let (out_tx_c, _out_rx_c) = mpsc::channel(16);
+        let aud_a = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_a).unwrap();
+        let aud_b = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_b).unwrap();
+        let aud_c = AudioEngineHandle::start(AudioEngineConfig::default(), out_tx_c).unwrap();
+
+        let mk_sess = |uuid_b: u8, local_pid: PeerId, nick: &str| {
+            let cipher = RoomCipher::from_secret(&invite.secret);
+            let now = Instant::now();
+            ActiveSession {
+                rendezvous_addr: rv_addr,
+                invite: invite.clone(),
+                cipher,
+                room_prefix: invite.room_prefix(),
+                local_uuid: [uuid_b; 16],
+                local_pub_key: [0u8; 32],
+                nickname: nick.to_string(),
+                local_peer_id: local_pid,
+                lan_addrs: Vec::new(),
+                peers: HashMap::new(),
+                control_seq: 1,
+                video_seq: 1,
+                video_tx_queue: VideoTxQueue::default(),
+                transfer: SwarmChatManager::new(),
+                local_encoder_backend: "test".to_string(),
+                local_stream_config: None,
+                local_preview_enabled: false,
+                stream_subscribers: HashSet::new(),
+                next_video_frame_id: Arc::new(AtomicU32::new(1)),
+                watched_peer_id: None,
+                watching_awaiting_idr: false,
+                sent_decoder_error_to: None,
+                video_reassembler: FrameReassembler::new(),
+                hevc_decode_supported: false,
+                last_pli_sent: now - Duration::from_secs(5),
+                last_stream_announce_at: now - Duration::from_secs(5),
+                stream_stop_announce_remaining: 0,
+                last_watch_retry_sent: now - Duration::from_secs(5),
+                last_pli_handled: now - Duration::from_secs(5),
+                stream_audio_rx_count: 0,
+                is_lan_room: false,
+                lan_room_name: String::new(),
+                embedded_rv: None,
+                last_rv_rx: now,
+                migrating_until: None,
+                migration_claimed_at: None,
+                last_mesh_reachability_sent: now - MESH_REACHABILITY_INTERVAL,
+                last_advertised_direct_peers: Vec::new(),
+                active_short_code: None,
+                last_spake2_reply_times: Vec::new(),
+                local_udp_port: 0,
+                lan_room_password: None,
+                lan_auth_buckets: HashMap::new(),
+                lan_auth_global_times: Vec::new(),
+            }
+        };
+
+        let mk_peer = |pid: PeerId,
+                       uuid_b: u8,
+                       nick: &str,
+                       status: PeerConnStatus,
+                       addr: Option<SocketAddr>,
+                       announced: bool| {
+            let now = Instant::now();
+            RemotePeerState {
+                record: PeerRecord {
+                    peer_id: pid,
+                    client_uuid: [uuid_b; 16],
+                    public_addr: addr.unwrap_or_else(|| "127.0.0.1:1".parse().unwrap()),
+                    lan_addrs: Vec::new(),
+                    nickname: nick.to_string(),
+                },
+                pub_key: None,
+                status,
+                active_addr: addr,
+                mesh_relay_peer: None,
+                reported_direct_peers: HashSet::new(),
+                reachability_updated_at: None,
+                punch_started_at: now,
+                last_direct_probe: now,
+                last_rx: now,
+                rtt_ms: 10,
+                has_announced_once: announced,
+                stream_info: None,
+                replay_control: squad_proto::ReplayWindow::new(),
+                replay_voice: squad_proto::ReplayWindow::new(),
+                replay_dtx: squad_proto::ReplayWindow::new(),
+                replay_stream_audio: squad_proto::ReplayWindow::new(),
+                replay_video: squad_proto::LargeReplayWindow::new(),
+            }
+        };
+
+        let mut sess_a = mk_sess(0xA1, 1, "Alice");
+        let mut sess_b = mk_sess(0xB2, 2, "Bravo");
+        let mut sess_c = mk_sess(0xC3, 3, "Charlie");
+
+        let cfg = StreamConfig {
+            target: squad_video::CaptureTarget::Monitor {
+                id: 999_999,
+                name: "Synthetic Monitor".to_string(),
+                width: 320,
+                height: 240,
+                is_primary: true,
+            },
+            resolution: squad_video::StreamResolution::Native,
+            fps: squad_video::StreamFps::Fps30,
+            bitrate_bps: 300_000,
+            codec: VideoCodec::H264,
+            share_audio: true,
+        };
+        sess_a.local_stream_config = Some(cfg.clone());
+        sess_a.stream_subscribers.insert(2);
+
+        sess_a.peers.insert(
+            2,
+            mk_peer(
+                2,
+                0xB2,
+                "Bravo",
+                PeerConnStatus::Connected,
+                Some(addr_b),
+                true,
+            ),
+        );
+        sess_a.peers.insert(
+            3,
+            mk_peer(3, 0xC3, "Charlie", PeerConnStatus::Relayed, None, true),
+        );
+
+        sess_b.peers.insert(
+            1,
+            mk_peer(
+                1,
+                0xA1,
+                "Alice",
+                PeerConnStatus::Connected,
+                Some(addr_a),
+                true,
+            ),
+        );
+        sess_b.peers.insert(
+            3,
+            mk_peer(
+                3,
+                0xC3,
+                "Charlie",
+                PeerConnStatus::Connected,
+                Some(addr_c),
+                true,
+            ),
+        );
+
+        sess_c.peers.insert(
+            1,
+            mk_peer(1, 0xA1, "Alice", PeerConnStatus::Relayed, None, true),
+        );
+        sess_c.peers.insert(
+            2,
+            mk_peer(
+                2,
+                0xB2,
+                "Bravo",
+                PeerConnStatus::Connected,
+                Some(addr_b),
+                true,
+            ),
+        );
+
+        let (tr_tx_a, _tr_rx_a) = mpsc::channel(16);
+        let (tr_tx_b, _tr_rx_b) = mpsc::channel(16);
+        let (tr_tx_c, _tr_rx_c) = mpsc::channel(16);
+        let (raw_evt_a, mut evt_rx_a) = mpsc::channel(32);
+        let (raw_evt_b, _evt_rx_b) = mpsc::channel(32);
+        let (raw_evt_c, mut evt_rx_c) = mpsc::channel(32);
+        let evt_a = NotifyingEventTx {
+            tx: raw_evt_a,
+            notify: Arc::new(Notify::new()),
+        };
+        let evt_b = NotifyingEventTx {
+            tx: raw_evt_b,
+            notify: Arc::new(Notify::new()),
+        };
+        let evt_c = NotifyingEventTx {
+            tx: raw_evt_c,
+            notify: Arc::new(Notify::new()),
+        };
+        let (vtx_a, mut vrx_a) = mpsc::channel(8);
+        let (vtx_b, _vrx_b) = mpsc::channel(4);
+        let (vtx_c, _vrx_c) = mpsc::channel(4);
+        let (dtx_a, _drx_a) = std::sync::mpsc::sync_channel(4);
+        let (dtx_b, _drx_b) = std::sync::mpsc::sync_channel(4);
+        let (dtx_c, drx_c) = std::sync::mpsc::sync_channel(4);
+        let dec_a = VideoDecodeHandle {
+            tx: dtx_a,
+            generation: Arc::new(AtomicU64::new(0)),
+            shrink_pending: Arc::new(AtomicBool::new(false)),
+        };
+        let dec_b = VideoDecodeHandle {
+            tx: dtx_b,
+            generation: Arc::new(AtomicU64::new(0)),
+            shrink_pending: Arc::new(AtomicBool::new(false)),
+        };
+        let dec_c = VideoDecodeHandle {
+            tx: dtx_c,
+            generation: Arc::new(AtomicU64::new(0)),
+            shrink_pending: Arc::new(AtomicBool::new(false)),
+        };
+        let slot_a = Arc::new(Mutex::new(None));
+        let slot_b = Arc::new(Mutex::new(None));
+        let slot_c = Arc::new(Mutex::new(None));
+        let vnot_a = Arc::new(Notify::new());
+        let vnot_b = Arc::new(Notify::new());
+        let vnot_c = Arc::new(Notify::new());
+        let mut cap_a = None;
+        let mut cap_b = None;
+        let mut cap_c = None;
+
+        reconcile_capture_worker(&sess_a, &mut cap_a, &vtx_a, &slot_a, &vnot_a, false);
+        // Wait for initial IDR for B and drain it so force_idr is cleared before C joins.
+        let _ = tokio::time::timeout(Duration::from_secs(2), vrx_a.recv()).await;
+        while vrx_a.try_recv().is_ok() {}
+
+        // Register A (peer 1), B (peer 2), C (peer 3) in order so rv_sock peer IDs match 1, 2, 3.
+        let mut tmp_buf = vec![0u8; MAX_RELAY_UDP_PAYLOAD + 64];
+        for (sock, uuid, nick) in [
+            (&sock_a, sess_a.local_uuid, "Alice"),
+            (&sock_b, sess_b.local_uuid, "Bravo"),
+            (&sock_c, sess_c.local_uuid, "Charlie"),
+        ] {
+            let reg = SignalingPacket::C2sRegister {
+                room_id: invite.room_id,
+                client_uuid: uuid,
+                nickname: nick.to_string(),
+                lan_addrs: Vec::new(),
+            }
+            .encode()
+            .unwrap();
+            sock.send_to(&reg, rv_addr).await.unwrap();
+            let _ =
+                tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut tmp_buf)).await;
+        }
+        // Drain any S2cRoomState broadcasts sent to earlier peers.
+        for sock in [&sock_a, &sock_b, &sock_c] {
+            while let Ok(Ok(_)) =
+                tokio::time::timeout(Duration::from_millis(25), sock.recv_from(&mut tmp_buf)).await
+            {
+            }
+        }
+
+        // Phase A: StreamAnnounce over RelaySource::Server must NOT be dropped.
+        let mut seal_buf = Vec::new();
+        let mut relay_buf = Vec::new();
+        let ep_c_relayed = peer_endpoint(&sess_a, 3).unwrap();
+        assert!(matches!(ep_c_relayed, PeerEndpoint::Relay { .. }));
+        send_stream_announce_to_endpoint(
+            &sock_a,
+            ep_c_relayed,
+            &mut sess_a,
+            &mut seal_buf,
+            &mut relay_buf,
+            true,
+            Some(&cfg),
+        )
+        .await;
+
+        let (len_srv, from_srv) =
+            tokio::time::timeout(Duration::from_secs(1), sock_c.recv_from(&mut tmp_buf))
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(from_srv, rv_addr);
+        assert!(is_relay_datagram(&tmp_buf[..len_srv]));
+        let (room_id, sender_pid, _) = parse_relay_header(&tmp_buf[..len_srv]).unwrap();
+        assert_eq!(room_id, invite.room_id);
+        assert_eq!(sender_pid, 1);
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_c = MeshRxCtx {
+                socket: &sock_c,
+                audio_engine: &aud_c,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_c,
+                evt_tx: &evt_c,
+                capture_worker: &mut cap_c,
+                video_out_tx: &vtx_c,
+                video_frame_slot: &slot_c,
+                video_notify: &vnot_c,
+                decode_handle: &dec_c,
+                lan_tx_sock: None,
+            };
+            handle_p2p_rx(
+                &sock_c,
+                &mut tmp_buf[RELAY_HEADER_LEN..len_srv],
+                from_srv,
+                Some(RelaySource::Server),
+                Some(1),
+                &mut sess_c,
+                &mut ctx_c,
+            )
+            .await;
+        }
+        assert!(
+            sess_c.peers.get(&1).unwrap().stream_info.is_some(),
+            "StreamAnnounce over RelaySource::Server must populate peer.stream_info"
+        );
+        let mut saw_remote_update = false;
+        while let Ok(ev) = evt_rx_c.try_recv() {
+            if matches!(
+                ev,
+                MeshEvent::RemoteStreamUpdated {
+                    peer_id: 1,
+                    stream: Some(_)
+                }
+            ) {
+                saw_remote_update = true;
+            }
+        }
+        assert!(saw_remote_update);
+
+        // Phase B: Reset Charlie's stream_info (simulating missed server relay while A already had has_announced_once = true)
+        // and verify Relayed -> MeshRelayed upgrade via Bravo triggers automatic re-announce, Subscribe+PLI, IDR, and Audio.
+        sess_c.peers.get_mut(&1).unwrap().stream_info = None;
+        broadcast_mesh_reachability_if_needed(
+            &sock_b,
+            &mut sess_b,
+            &mut seal_buf,
+            &mut relay_buf,
+            false,
+        )
+        .await;
+
+        for (sock, sess, aud, tr_tx, evt_tx, cap, vtx, slot, vnot, dec) in [
+            (
+                &sock_a,
+                &mut sess_a,
+                &aud_a,
+                &tr_tx_a,
+                &evt_a,
+                &mut cap_a,
+                &vtx_a,
+                &slot_a,
+                &vnot_a,
+                &dec_a,
+            ),
+            (
+                &sock_c,
+                &mut sess_c,
+                &aud_c,
+                &tr_tx_c,
+                &evt_c,
+                &mut cap_c,
+                &vtx_c,
+                &slot_c,
+                &vnot_c,
+                &dec_c,
+            ),
+        ] {
+            let (len, from) =
+                tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut tmp_buf))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx = MeshRxCtx {
+                socket: sock,
+                audio_engine: aud,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx,
+                evt_tx,
+                capture_worker: cap,
+                video_out_tx: vtx,
+                video_frame_slot: slot,
+                video_notify: vnot,
+                decode_handle: dec,
+                lan_tx_sock: None,
+            };
+            handle_p2p_rx(sock, &mut tmp_buf[..len], from, None, None, sess, &mut ctx).await;
+        }
+        assert_eq!(
+            sess_a.peers.get(&3).unwrap().status,
+            PeerConnStatus::MeshRelayed
+        );
+        assert_eq!(
+            sess_c.peers.get(&1).unwrap().status,
+            PeerConnStatus::MeshRelayed
+        );
+
+        // Drain Bravo relay (forwards A's automatic re-announced StreamAnnounce to C).
+        while let Ok(Ok((len_b, from_b))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_b.recv_from(&mut tmp_buf)).await
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_b = MeshRxCtx {
+                socket: &sock_b,
+                audio_engine: &aud_b,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_b,
+                evt_tx: &evt_b,
+                capture_worker: &mut cap_b,
+                video_out_tx: &vtx_b,
+                video_frame_slot: &slot_b,
+                video_notify: &vnot_b,
+                decode_handle: &dec_b,
+                lan_tx_sock: None,
+            };
+            handle_peer_relay_datagram(
+                &sock_b,
+                &mut tmp_buf[..len_b],
+                from_b,
+                &mut sess_b,
+                &mut ctx_b,
+            )
+            .await;
+        }
+        while let Ok(Ok((len_c, from_c))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_c.recv_from(&mut tmp_buf)).await
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_c = MeshRxCtx {
+                socket: &sock_c,
+                audio_engine: &aud_c,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_c,
+                evt_tx: &evt_c,
+                capture_worker: &mut cap_c,
+                video_out_tx: &vtx_c,
+                video_frame_slot: &slot_c,
+                video_notify: &vnot_c,
+                decode_handle: &dec_c,
+                lan_tx_sock: None,
+            };
+            if is_peer_relay_datagram(&tmp_buf[..len_c]) {
+                handle_peer_relay_datagram(
+                    &sock_c,
+                    &mut tmp_buf[..len_c],
+                    from_c,
+                    &mut sess_c,
+                    &mut ctx_c,
+                )
+                .await;
+            }
+        }
+        assert!(
+            sess_c.peers.get(&1).unwrap().stream_info.is_some(),
+            "Relayed -> MeshRelayed promotion must trigger automatic StreamAnnounce to Charlie"
+        );
+
+        // Charlie subscribes + requests PLI over MeshRelayed via Bravo.
+        sess_c.watched_peer_id = Some(1);
+        sess_c.watching_awaiting_idr = true;
+        send_stream_subscribe(&sock_c, &mut sess_c, &mut seal_buf, &mut relay_buf, 1, true).await;
+        send_stream_pli(&sock_c, &mut sess_c, &mut seal_buf, &mut relay_buf, 1).await;
+
+        while let Ok(Ok((len_b, from_b))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_b.recv_from(&mut tmp_buf)).await
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_b = MeshRxCtx {
+                socket: &sock_b,
+                audio_engine: &aud_b,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_b,
+                evt_tx: &evt_b,
+                capture_worker: &mut cap_b,
+                video_out_tx: &vtx_b,
+                video_frame_slot: &slot_b,
+                video_notify: &vnot_b,
+                decode_handle: &dec_b,
+                lan_tx_sock: None,
+            };
+            handle_peer_relay_datagram(
+                &sock_b,
+                &mut tmp_buf[..len_b],
+                from_b,
+                &mut sess_b,
+                &mut ctx_b,
+            )
+            .await;
+        }
+        while let Ok(Ok((len_a, from_a))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_a.recv_from(&mut tmp_buf)).await
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_a = MeshRxCtx {
+                socket: &sock_a,
+                audio_engine: &aud_a,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_a,
+                evt_tx: &evt_a,
+                capture_worker: &mut cap_a,
+                video_out_tx: &vtx_a,
+                video_frame_slot: &slot_a,
+                video_notify: &vnot_a,
+                decode_handle: &dec_a,
+                lan_tx_sock: None,
+            };
+            if is_peer_relay_datagram(&tmp_buf[..len_a]) {
+                handle_peer_relay_datagram(
+                    &sock_a,
+                    &mut tmp_buf[..len_a],
+                    from_a,
+                    &mut sess_a,
+                    &mut ctx_a,
+                )
+                .await;
+            }
+        }
+
+        assert!(sess_a.stream_subscribers.contains(&3));
+        let mut saw_two_subs = false;
+        while let Ok(ev) = evt_rx_a.try_recv() {
+            if matches!(
+                ev,
+                MeshEvent::LocalStreamStatus {
+                    is_sharing: true,
+                    subscriber_count: 2
+                }
+            ) {
+                saw_two_subs = true;
+            }
+        }
+        assert!(saw_two_subs);
+        let mut saw_new_idr = cap_a
+            .as_ref()
+            .is_some_and(|w| w.force_idr.load(Ordering::Acquire));
+        let idr_deadline = Instant::now() + Duration::from_secs(2);
+        while !saw_new_idr && Instant::now() < idr_deadline {
+            while let Ok(frags) = vrx_a.try_recv() {
+                if frags
+                    .iter()
+                    .any(|p| (p.flags & squad_proto::VIDEO_FLAG_KEYFRAME) != 0)
+                {
+                    saw_new_idr = true;
+                }
+            }
+            if !saw_new_idr {
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        }
+        assert!(
+            saw_new_idr,
+            "Adding late-joiner subscriber C to active share must trigger force_idr / new IDR keyframe"
+        );
+
+        // Send IDR VideoFrameFrag + StreamAudioOpus from A -> B -> C over MeshRelayed.
+        let vid_hdr = P2pHeader {
+            msg_type: P2pMsgType::VideoFrameFrag,
+            room_prefix: sess_a.room_prefix,
+            sender_peer_id: 1,
+            seq_num: 10,
+        };
+        let vid_payload = P2pPayload::VideoFrameFrag {
+            frame_id: 7,
+            frag_idx: 0,
+            frag_count: 1,
+            flags: squad_proto::VIDEO_FLAG_KEYFRAME,
+            data: vec![0x7E; 64],
+        };
+        sess_a
+            .cipher
+            .seal_packet(&vid_hdr, &vid_payload, &mut seal_buf)
+            .unwrap();
+        send_sealed_to_peer(
+            &sock_a,
+            &sess_a,
+            3,
+            P2pMsgType::VideoFrameFrag,
+            &seal_buf,
+            &mut relay_buf,
+        )
+        .await;
+
+        let aud_hdr = P2pHeader {
+            msg_type: P2pMsgType::StreamAudioOpus,
+            room_prefix: sess_a.room_prefix,
+            sender_peer_id: 1,
+            seq_num: 1,
+        };
+        let aud_payload = P2pPayload::StreamAudioOpus {
+            opus_data: vec![0xAA; 24],
+        };
+        sess_a
+            .cipher
+            .seal_packet(&aud_hdr, &aud_payload, &mut seal_buf)
+            .unwrap();
+        send_sealed_to_peer(
+            &sock_a,
+            &sess_a,
+            3,
+            P2pMsgType::StreamAudioOpus,
+            &seal_buf,
+            &mut relay_buf,
+        )
+        .await;
+
+        while let Ok(Ok((len_b, from_b))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_b.recv_from(&mut tmp_buf)).await
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_b = MeshRxCtx {
+                socket: &sock_b,
+                audio_engine: &aud_b,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_b,
+                evt_tx: &evt_b,
+                capture_worker: &mut cap_b,
+                video_out_tx: &vtx_b,
+                video_frame_slot: &slot_b,
+                video_notify: &vnot_b,
+                decode_handle: &dec_b,
+                lan_tx_sock: None,
+            };
+            handle_peer_relay_datagram(
+                &sock_b,
+                &mut tmp_buf[..len_b],
+                from_b,
+                &mut sess_b,
+                &mut ctx_b,
+            )
+            .await;
+        }
+        while let Ok(Ok((len_c, from_c))) =
+            tokio::time::timeout(Duration::from_millis(50), sock_c.recv_from(&mut tmp_buf)).await
+        {
+            let mut sb = Vec::new();
+            let mut rb = Vec::new();
+            let mut ctx_c = MeshRxCtx {
+                socket: &sock_c,
+                audio_engine: &aud_c,
+                seal_buf: &mut sb,
+                relay_buf: &mut rb,
+                tr_tx: &tr_tx_c,
+                evt_tx: &evt_c,
+                capture_worker: &mut cap_c,
+                video_out_tx: &vtx_c,
+                video_frame_slot: &slot_c,
+                video_notify: &vnot_c,
+                decode_handle: &dec_c,
+                lan_tx_sock: None,
+            };
+            if is_peer_relay_datagram(&tmp_buf[..len_c]) {
+                handle_peer_relay_datagram(
+                    &sock_c,
+                    &mut tmp_buf[..len_c],
+                    from_c,
+                    &mut sess_c,
+                    &mut ctx_c,
+                )
+                .await;
+            }
+        }
+
+        let got_idr = matches!(
+            drx_c.try_recv(),
+            Ok(DecodeJob::Frame {
+                streamer_peer_id: 1,
+                ..
+            })
+        );
+        assert!(got_idr, "Charlie must reassemble IDR frame via MeshRelayed");
+        assert!(!sess_c.watching_awaiting_idr);
+        assert_eq!(sess_c.stream_audio_rx_count, 1);
+
+        stop_capture_worker(&mut cap_a);
+        aud_a.shutdown();
+        aud_b.shutdown();
+        aud_c.shutdown();
+        let _ = rv_shutdown_tx.send(true);
+        let _ = rv_task.await;
     }
 }

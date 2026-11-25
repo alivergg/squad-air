@@ -4,7 +4,8 @@ use crate::config::{
 };
 use crate::hotkeys::{is_macos_accessibility_trusted, is_macos_input_monitoring_trusted};
 use crate::ui::{
-    components::{avatar_circle, mic_sensitivity_meter},
+    components::{avatar_circle, mic_sensitivity_meter, with_tooltip},
+    icons::{icon, IconKind},
     theme::{
         m3_menu_style, m3_pick_list_style, m3_slider_style, m3_text_input_style, pill_chip_button,
         pill_danger_button, pill_primary_button, pill_tonal_button, surface_card_style,
@@ -16,7 +17,7 @@ use iced::{
     alignment::Vertical,
     widget::{
         button, column, container, horizontal_space, pick_list, row, scrollable, slider, text,
-        text_input,
+        text_input, tooltip::Position,
     },
     Element, Length,
 };
@@ -163,10 +164,14 @@ pub fn view_settings(app: &SquadApp) -> Element<'_, Message> {
             row![
                 text("Audio Hardware Devices").size(16),
                 horizontal_space(),
-                button(text("Refresh Devices").size(12))
-                    .padding([6, 14])
-                    .style(pill_tonal_button)
-                    .on_press(Message::RefreshAudioDevices),
+                with_tooltip(
+                    button(icon(IconKind::Refresh, 16.0))
+                        .padding([6, 9])
+                        .style(pill_tonal_button)
+                        .on_press(Message::RefreshAudioDevices),
+                    "Refresh audio devices",
+                    Position::Left,
+                ),
             ]
             .align_y(Vertical::Center),
             row![
@@ -651,16 +656,21 @@ fn hotkey_recorder_slot<'a>(
         })
         .on_press(Message::StartRecordingHotkey(slot));
 
-    let clear_btn = if is_recording {
+    let clear_btn: Element<'a, Message> = if is_recording {
         button(text("Cancel").size(12))
             .padding([10, 12])
             .style(pill_tonal_button)
             .on_press(Message::CancelRecordingHotkey)
+            .into()
     } else {
-        button(text("×").size(13))
-            .padding([10, 12])
-            .style(pill_tonal_button)
-            .on_press(Message::ClearHotkey(slot))
+        with_tooltip(
+            button(icon(IconKind::Close, 15.0))
+                .padding([10, 11])
+                .style(pill_tonal_button)
+                .on_press(Message::ClearHotkey(slot)),
+            "Clear shortcut",
+            Position::Top,
+        )
     };
 
     column![

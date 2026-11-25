@@ -1,10 +1,11 @@
 use crate::ui::{
-    components::avatar_circle,
+    components::{avatar_circle, with_tooltip},
+    icons::{icon, icon_check_animated, IconKind},
     theme::{
-        canvas_panel_style, channel_nav_button, m3_text_input_style, pill_danger_button,
-        pill_primary_button, pill_success_button, pill_tonal_button, sidebar_panel_style,
-        surface_card_style, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
-        M3_WARNING,
+        canvas_panel_style, channel_nav_button, copy_flash_button_style, m3_text_input_style,
+        pill_danger_button, pill_primary_button, pill_success_button, pill_tonal_button,
+        sidebar_panel_style, surface_card_style, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT,
+        M3_PRIMARY, M3_SUCCESS, M3_WARNING,
     },
     Message, SquadApp,
 };
@@ -12,10 +13,11 @@ use iced::{
     alignment::{Horizontal, Vertical},
     widget::{
         button, column, container, horizontal_space, row, scrollable, text, text_input,
-        vertical_space,
+        tooltip::Position, vertical_space,
     },
     Element, Length,
 };
+use std::time::Instant;
 
 pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     let mut channel_list = column![].spacing(6).width(Length::Fill);
@@ -50,10 +52,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                 .padding([7, 10])
                 .style(channel_nav_button(false))
                 .on_press(Message::JoinSavedChannel(uri_join)),
-                button(text("×").size(13))
-                    .padding([8, 10])
-                    .style(pill_danger_button)
-                    .on_press(Message::RemoveSavedChannel(uri_del)),
+                with_tooltip(
+                    button(icon(IconKind::Delete, 15.0))
+                        .padding([8, 9])
+                        .style(pill_danger_button)
+                        .on_press(Message::RemoveSavedChannel(uri_del)),
+                    "Remove saved room",
+                    Position::Top,
+                ),
             ]
             .spacing(6)
             .align_y(Vertical::Center);
@@ -74,10 +80,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             ]
             .spacing(2)
             .width(Length::Fill),
-            button(text("Settings").size(12))
-                .padding([8, 12])
-                .style(pill_tonal_button)
-                .on_press(Message::OpenSettings),
+            with_tooltip(
+                button(icon(IconKind::Settings, 18.0))
+                    .padding([8, 10])
+                    .style(pill_tonal_button)
+                    .on_press(Message::OpenSettings),
+                "Settings",
+                Position::Top,
+            ),
         ]
         .spacing(10)
         .align_y(Vertical::Center),
@@ -98,17 +108,22 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     #[cfg(not(feature = "managed_updates"))]
     if let Some(ref info) = app.available_update {
         sidebar_head = sidebar_head.push(
-            container(
+            container(with_tooltip(
                 button(
-                    text(format!("Update Available ({})", info.tag_name))
-                        .size(12)
-                        .align_x(Horizontal::Center),
+                    row![
+                        icon(IconKind::Download, 15.0),
+                        text(format!("Update Available ({})", info.tag_name)).size(12),
+                    ]
+                    .spacing(6)
+                    .align_y(Vertical::Center),
                 )
                 .width(Length::Fill)
                 .padding([8, 12])
                 .style(pill_primary_button)
                 .on_press(Message::OpenUpdateModal),
-            )
+                "View update details",
+                Position::Right,
+            ))
             .padding([8, 0]),
         );
     }
@@ -130,12 +145,17 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     .style(sidebar_panel_style);
 
     let mut join_code_btn = button(
-        text(if app.short_code_joining {
-            "Connecting..."
-        } else {
-            "Join Code"
-        })
-        .size(13),
+        row![
+            icon(IconKind::Key, 15.0),
+            text(if app.short_code_joining {
+                "Connecting..."
+            } else {
+                "Join Code"
+            })
+            .size(13),
+        ]
+        .spacing(6)
+        .align_y(Vertical::Center),
     )
     .padding([11, 18])
     .style(pill_primary_button);
@@ -172,11 +192,6 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
     } else {
         "Host Locked LAN Room"
     };
-    let host_eye_label = if app.lan_host_password_visible {
-        "Hide"
-    } else {
-        "Show"
-    };
 
     let create_card = container(
         column![
@@ -188,9 +203,12 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             .color(M3_ON_SURFACE_VARIANT),
             vertical_space().height(4),
             button(
-                text("Create Room & Copy Invite")
-                    .size(14)
-                    .align_x(Horizontal::Center)
+                row![
+                    icon(IconKind::Add, 16.0),
+                    text("Create Room & Copy Invite").size(14),
+                ]
+                .spacing(8)
+                .align_y(Vertical::Center),
             )
             .width(Length::Fill)
             .padding([12, 20])
@@ -212,10 +230,25 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                     .padding(10)
                     .size(13)
                     .style(m3_text_input_style),
-                button(text(host_eye_label).size(12))
-                    .padding([10, 12])
+                with_tooltip(
+                    button(icon(
+                        if app.lan_host_password_visible {
+                            IconKind::VisibilityOff
+                        } else {
+                            IconKind::Visibility
+                        },
+                        16.0,
+                    ))
+                    .padding([10, 11])
                     .style(pill_tonal_button)
                     .on_press(Message::ToggleLanHostPasswordVisible),
+                    if app.lan_host_password_visible {
+                        "Hide password"
+                    } else {
+                        "Show password"
+                    },
+                    Position::Top,
+                ),
             ]
             .spacing(8)
             .align_y(Vertical::Center),
@@ -245,10 +278,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                     .padding(11)
                     .size(13)
                     .style(m3_text_input_style),
-                button(text("Paste").size(13))
-                    .padding([11, 14])
-                    .style(pill_tonal_button)
-                    .on_press(Message::PasteInviteFromClipboard),
+                with_tooltip(
+                    button(icon(IconKind::ContentPaste, 16.0))
+                        .padding([11, 12])
+                        .style(pill_tonal_button)
+                        .on_press(Message::PasteInviteFromClipboard),
+                    "Paste invite link",
+                    Position::Top,
+                ),
                 button(text("Join Now").size(13))
                     .padding([11, 20])
                     .style(pill_primary_button)
@@ -263,10 +300,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                     .padding(10)
                     .size(13)
                     .style(m3_text_input_style),
-                button(text("Save Room").size(13))
-                    .padding([10, 18])
-                    .style(pill_tonal_button)
-                    .on_press(Message::SaveChannelFromInput),
+                with_tooltip(
+                    button(icon(IconKind::Bookmark, 16.0))
+                        .padding([10, 12])
+                        .style(pill_tonal_button)
+                        .on_press(Message::SaveChannelFromInput),
+                    "Save room to sidebar",
+                    Position::Top,
+                ),
             ]
             .spacing(10)
             .align_y(Vertical::Center),
@@ -413,16 +454,22 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                 None => ("Offline", M3_ON_SURFACE_VARIANT),
             };
 
-            let mut call_btn = button(text("Call").size(12))
-                .padding([7, 12])
-                .style(if online {
-                    pill_success_button
-                } else {
-                    pill_tonal_button
-                });
+            let mut call_btn =
+                button(icon(IconKind::Call, 16.0))
+                    .padding([7, 10])
+                    .style(if online {
+                        pill_success_button
+                    } else {
+                        pill_tonal_button
+                    });
             if online {
                 call_btn = call_btn.on_press(Message::CallFriend(friend.pub_key));
             }
+            let call_tip = if online {
+                format!("Call {display_name}")
+            } else {
+                format!("{display_name} is offline")
+            };
 
             let friend_row = container(
                 row![
@@ -440,11 +487,15 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
                     ]
                     .spacing(2)
                     .width(Length::Fill),
-                    call_btn,
-                    button(text("×").size(13))
-                        .padding([7, 10])
-                        .style(pill_danger_button)
-                        .on_press(Message::RemoveFriend(friend.pub_key)),
+                    with_tooltip(call_btn, call_tip, Position::Top),
+                    with_tooltip(
+                        button(icon(IconKind::Delete, 16.0))
+                            .padding([7, 9])
+                            .style(pill_danger_button)
+                            .on_press(Message::RemoveFriend(friend.pub_key)),
+                        "Remove friend",
+                        Position::Top,
+                    ),
                 ]
                 .spacing(8)
                 .align_y(Vertical::Center),
@@ -457,10 +508,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         }
     }
 
-    let copy_id_label = if app.friend_id_copied_flash {
-        "Copied ID!"
-    } else {
-        "Copy My ID"
+    let friend_id_progress = app.copy_flash.friend_id_progress_at(Instant::now());
+    let (copy_id_icon, copy_id_tip): (Element<'_, Message>, &'static str) = match friend_id_progress
+    {
+        Some(p) => (
+            icon_check_animated(16.0, p.check_draw, p.pop_pulse),
+            "Copied!",
+        ),
+        None => (icon(IconKind::ContentCopy, 16.0), "Copy my Friend ID"),
     };
     let friends_header = row![
         column![
@@ -475,10 +530,14 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
         ]
         .spacing(2),
         horizontal_space(),
-        button(text("+ Add").size(12))
-            .padding([8, 12])
-            .style(pill_primary_button)
-            .on_press(Message::OpenAddFriendModal),
+        with_tooltip(
+            button(icon(IconKind::PersonAdd, 16.0))
+                .padding([8, 10])
+                .style(pill_primary_button)
+                .on_press(Message::OpenAddFriendModal),
+            "Add friend",
+            Position::Left,
+        ),
     ]
     .align_y(Vertical::Center);
 
@@ -492,14 +551,17 @@ pub fn view_lobby(app: &SquadApp) -> Element<'_, Message> {
             ]
             .spacing(2)
             .width(Length::Fill),
-            button(text(copy_id_label).size(12))
-                .padding([8, 12])
-                .style(if app.friend_id_copied_flash {
-                    pill_success_button
-                } else {
-                    pill_tonal_button
-                })
-                .on_press(Message::CopyMyFriendId),
+            with_tooltip(
+                button(copy_id_icon)
+                    .padding([8, 10])
+                    .style(copy_flash_button_style(
+                        pill_tonal_button,
+                        friend_id_progress,
+                    ))
+                    .on_press(Message::CopyMyFriendId),
+                copy_id_tip,
+                Position::Top,
+            ),
         ]
         .spacing(8)
         .align_y(Vertical::Center),

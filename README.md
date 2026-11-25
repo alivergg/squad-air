@@ -17,7 +17,7 @@
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/ci.yml?branch=main&label=CI&style=flat-square" alt="CI" /></a>
   <a href=".github/workflows/release.yml"><img src="https://img.shields.io/github/actions/workflow/status/alivergg/squad-air/release.yml?branch=main&label=Release&style=flat-square" alt="Release" /></a>
   <a href="Cargo.toml"><img src="https://img.shields.io/badge/Rust-2021%20(Pure%20Native)-orange?style=flat-square&logo=rust" alt="Rust 2021" /></a>
-  <a href="#quick-start--self-hosting"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20(Apple%20Silicon)%20%7C%20Linux-blue?style=flat-square" alt="Platforms" /></a>
+  <a href="#quick-start--self-hosting"><img src="https://img.shields.io/badge/Platform-Windows%20%7C%20macOS%20(Apple%20Silicon)%20%7C%20Linux%20%7C%20Android%20(arm64)-blue?style=flat-square" alt="Platforms" /></a>
   <img src="https://img.shields.io/badge/E2EE-ChaCha20--Poly1305%20%2B%20SPAKE2%20%2B%20X25519-brightgreen?style=flat-square" alt="E2EE" />
   <img src="https://img.shields.io/badge/Audio-10ms%20Opus%20%2B%20AEC3%20%2B%20RNNoise%2FDF3-purple?style=flat-square" alt="Audio DSP" />
   <img src="https://img.shields.io/badge/Video-1080p60%20%2B%20DXGI%20%2F%20VideoToolbox%20%2B%20wgpu-cyan?style=flat-square" alt="Screen Share" />
@@ -199,6 +199,7 @@ flowchart LR
 | **macOS (`arm64`)** | [**Direct Installer (`.pkg`)**](https://github.com/alivergg/squad-air/releases/latest) | `SquadAir-Installer-macos-arm64.pkg` | Automatic + in-app updater |
 | **Linux (`x86_64`)** | [**Snap Store**](https://snapcraft.io/squad-air) | `sudo snap install squad-air` | Automatic (`latest/stable`) |
 | **Linux (`x86_64`)** | [**`.deb` / `.rpm` / Arch / `.tar.gz`**](https://github.com/alivergg/squad-air/releases/latest) | Native distro packages + `PKGBUILD` | Automatic GitHub Release assets |
+| **Android (`arm64-v8a`)** | [**Direct APK (`.apk`)**](https://github.com/alivergg/squad-air/releases/latest) | `SquadAir-android-arm64.apk` (Android 8.0+, `~14 MB`) | Automatic GitHub Release asset + in-app updater |
 
 - **Windows (`x86_64`):**
   - **Microsoft Store (`$1.99`):** Install from the [Microsoft Store](https://apps.microsoft.com/detail/9PH8NXTQMC73) for a Microsoft-signed MSIX package, zero SmartScreen prompts, automatic Store updates, and to support ongoing development.
@@ -242,6 +243,16 @@ flowchart LR
     Or build from the release `PKGBUILD` with `makepkg -si` (`squad-air-bin` packaging files live in [`packaging/aur/squad-air-bin`](packaging/aur/squad-air-bin); AUR push automation is ready once `aur.archlinux.org` reopens new account registration).
   - **Flatpak Manifests:** Validated manifests for `app.squadair.SquadAir` live in [`packaging/flatpak`](packaging/flatpak).
   - **Portable Binary (`.tar.gz`):** Extract `squad-client-linux-x86_64.tar.gz` and run `./squad-client`.
+- **Android (`arm64-v8a`, Android 8.0+):**
+  - **Direct APK Sideload (`~14 MB`):** Download [`SquadAir-android-arm64.apk`](https://github.com/alivergg/squad-air/releases/latest) on your device, open the file, and allow **Install unknown apps** when prompted by Android (preserves local identity and settings across upgrades; verified via `SHA256SUMS.txt`).
+  - **Install via ADB (from desktop):**
+    ```bash
+    adb install -r SquadAir-android-arm64.apk
+    ```
+  - **Android Permissions & Background Checklist:**
+    - **Microphone:** Required for P2P voice calls.
+    - **Notifications (`Android 13+`):** Required for the active call foreground service notification and background incoming call alerts.
+    - **Battery Optimization (Recommended):** Allow unrestricted background usage if prompted on first launch (especially on Samsung/Xiaomi devices) to prevent the OS from suspending background calls or friend invites.
 
 ---
 
@@ -298,6 +309,9 @@ Place an exported ONNX model at `assets/models/deepfilternet3.onnx` or `<config_
 
 # Linux packages (.deb, .rpm, Arch .pkg.tar.zst + PKGBUILD, .tar.gz):
 ./scripts/package_linux.sh 1.0
+
+# Android arm64-v8a APK (requires Android SDK 34, NDK r26d, JDK 17, cargo-ndk, aarch64-linux-android):
+./scripts/build_android_apk.sh
 ```
 
 ---
@@ -306,7 +320,7 @@ Place an exported ONNX model at `assets/models/deepfilternet3.onnx` or `<config_
 
 - **Linux Wayland PipeWire Portal Capture:** Native `xdg-desktop-portal` + PipeWire screen & window capture on Wayland compositors alongside existing macOS & Windows capture.
 - **Linux Hardware Video Encode (VA-API / NVENC):** Zero-copy DMA-BUF hardware H.264/HEVC encoding on Linux GPUs.
-- **Mobile Companion Client (iOS & Android):** Lightweight P2P voice & 6-digit code join client sharing the same `squad-proto` + `squad-dsp` Rust core.
+- **iOS Companion Client:** Bring the mobile P2P voice, `X25519` friends, 6-digit code join, and stream viewer client (already available on Android `arm64-v8a` via `SquadAir-android-arm64.apk`) to iOS using the same `squad-proto` + `squad-dsp` Rust core.
 
 ---
 

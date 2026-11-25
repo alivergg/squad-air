@@ -2,11 +2,55 @@ use crate::ui::Message;
 use iced::window::raw_window_handle::RawWindowHandle;
 use iced::{window, Task};
 
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_POPUP: u32 = 0x8000_0000;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_CLIPSIBLINGS: u32 = 0x0400_0000;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_STRIP_STYLE_MASK: u32 = 0x00CF_0000;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_STRIP_EXSTYLE_MASK: u32 = 0x0006_0301;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_EX_TOPMOST: u32 = 0x0000_0008;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_EX_TRANSPARENT: u32 = 0x0000_0020;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_EX_LAYERED: u32 = 0x0008_0000;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+#[cfg(any(target_os = "windows", test))]
+pub(crate) const WIN32_REQUIRED_EX_STYLES: u32 = WIN32_WS_EX_LAYERED
+    | WIN32_WS_EX_TRANSPARENT
+    | WIN32_WS_EX_TOPMOST
+    | WIN32_WS_EX_NOACTIVATE
+    | WIN32_WS_EX_TOOLWINDOW;
+
+pub(crate) fn should_use_iced_mouse_passthrough(is_windows: bool) -> bool {
+    !is_windows
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn sanitize_overlay_style(raw_style: u32) -> u32 {
+    (raw_style & !WIN32_STRIP_STYLE_MASK) | WIN32_WS_POPUP | WIN32_WS_CLIPSIBLINGS
+}
+
+#[cfg(any(target_os = "windows", test))]
+pub(crate) fn sanitize_overlay_ex_style(raw_ex_style: u32) -> u32 {
+    (raw_ex_style & !WIN32_STRIP_EXSTYLE_MASK) | WIN32_REQUIRED_EX_STYLES
+}
+
 pub fn configure_overlay_window(id: window::Id, opacity: f32) -> Task<Message> {
-    window::enable_mouse_passthrough(id).chain(window::run_with_handle(id, move |handle| {
+    let apply_task = window::run_with_handle(id, move |handle| {
         apply_raw_overlay_flags(handle.as_raw(), opacity);
         Message::OverlayConfigured
-    }))
+    });
+    if should_use_iced_mouse_passthrough(cfg!(target_os = "windows")) {
+        window::enable_mouse_passthrough(id).chain(apply_task)
+    } else {
+        apply_task
+    }
 }
 
 pub fn set_overlay_opacity(id: window::Id, opacity: f32) -> Task<Message> {
@@ -150,36 +194,43 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle, _opacity: f32) {
 
     const GWL_STYLE: i32 = -16;
     const GWL_EXSTYLE: i32 = -20;
-    const WS_POPUP: isize = 0x8000_0000u32 as isize;
-    const WS_VISIBLE: isize = 0x1000_0000;
-    const WS_CLIPSIBLINGS: isize = 0x0400_0000;
-    const STRIP_STYLE_MASK: isize = 0x00CF_0000;
-    const STRIP_EXSTYLE_MASK: isize = 0x0006_0301;
-    const WS_EX_TOPMOST: isize = 0x0000_0008;
-    const WS_EX_TRANSPARENT: isize = 0x0000_0020;
-    const WS_EX_TOOLWINDOW: isize = 0x0000_0080;
-    const WS_EX_LAYERED: isize = 0x0008_0000;
-    const WS_EX_NOACTIVATE: isize = 0x0800_0000;
     const HWND_TOPMOST: isize = -1;
     const SWP_NOSIZE: u32 = 0x0001;
     const SWP_NOMOVE: u32 = 0x0002;
     const SWP_NOACTIVATE: u32 = 0x0010;
     const SWP_FRAMECHANGED: u32 = 0x0020;
+    const SW_SHOWNOACTIVATE: i32 = 4;
+    const HTTRANSPARENT: isize = -1;
 
-    const DWMWA_NCRENDERING_POLICY: u32 = 2;
-    const DWMNCRP_DISABLED: u32 = 1;
+    const WM_STYLECHANGING: u32 = 0x007C;
+    const WM_NCDESTROY: u32 = 0x0082;
+    const WM_NCCALCSIZE: u32 = 0x0083;
+    const WM_NCHITTEST: u32 = 0x0084;
+    const WM_NCPAINT: u32 = 0x0085;
+    const WM_NCACTIVATE: u32 = 0x0086;
+
     const DWMWA_WINDOW_CORNER_PREFERENCE: u32 = 33;
     const DWMWCP_DONOTROUND: u32 = 1;
     const DWMWA_BORDER_COLOR: u32 = 34;
     const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    const OVERLAY_SUBCLASS_ID: usize = 0x51A0_0001;
 
     #[repr(C)]
-    struct Margins {
-        cx_left_width: i32,
-        cx_right_width: i32,
-        cy_top_height: i32,
-        cy_bottom_height: i32,
+    struct StyleStruct {
+        _style_old: u32,
+        style_new: u32,
     }
+
+    type SubclassProc = Option<
+        unsafe extern "system" fn(
+            hwnd: isize,
+            u_msg: u32,
+            w_param: usize,
+            l_param: isize,
+            u_id_subclass: usize,
+            dw_ref_data: usize,
+        ) -> isize,
+    >;
 
     #[link(name = "user32")]
     extern "system" {
@@ -194,11 +245,27 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle, _opacity: f32) {
             cy: i32,
             u_flags: u32,
         ) -> i32;
+        fn ShowWindow(hwnd: isize, n_cmd_show: i32) -> i32;
+    }
+
+    #[link(name = "comctl32")]
+    extern "system" {
+        fn SetWindowSubclass(
+            hwnd: isize,
+            pfn_subclass: SubclassProc,
+            u_id_subclass: usize,
+            dw_ref_data: usize,
+        ) -> i32;
+        fn RemoveWindowSubclass(
+            hwnd: isize,
+            pfn_subclass: SubclassProc,
+            u_id_subclass: usize,
+        ) -> i32;
+        fn DefSubclassProc(hwnd: isize, u_msg: u32, w_param: usize, l_param: isize) -> isize;
     }
 
     #[link(name = "dwmapi")]
     extern "system" {
-        fn DwmExtendFrameIntoClientArea(hwnd: isize, p_mar_inset: *const Margins) -> i32;
         fn DwmSetWindowAttribute(
             hwnd: isize,
             dw_attribute: u32,
@@ -207,39 +274,56 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle, _opacity: f32) {
         ) -> i32;
     }
 
+    unsafe extern "system" fn overlay_subclass_proc(
+        hwnd: isize,
+        u_msg: u32,
+        w_param: usize,
+        l_param: isize,
+        u_id_subclass: usize,
+        _dw_ref_data: usize,
+    ) -> isize {
+        match u_msg {
+            WM_NCCALCSIZE => 0,
+            WM_NCACTIVATE => 1,
+            WM_NCPAINT => 0,
+            WM_NCHITTEST => HTTRANSPARENT,
+            WM_STYLECHANGING if l_param != 0 => {
+                let ss = &mut *(l_param as *mut StyleStruct);
+                let index = w_param as i32;
+                if index == GWL_STYLE {
+                    ss.style_new = sanitize_overlay_style(ss.style_new);
+                    0
+                } else if index == GWL_EXSTYLE {
+                    ss.style_new = sanitize_overlay_ex_style(ss.style_new);
+                    0
+                } else {
+                    DefSubclassProc(hwnd, u_msg, w_param, l_param)
+                }
+            }
+            WM_NCDESTROY => {
+                let _ = RemoveWindowSubclass(hwnd, Some(overlay_subclass_proc), u_id_subclass);
+                DefSubclassProc(hwnd, u_msg, w_param, l_param)
+            }
+            _ => DefSubclassProc(hwnd, u_msg, w_param, l_param),
+        }
+    }
+
     let RawWindowHandle::Win32(handle) = raw else {
         return;
     };
     let hwnd = handle.hwnd.get();
 
     unsafe {
-        let style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-        let desired_style = (style & !STRIP_STYLE_MASK) | WS_POPUP | WS_VISIBLE | WS_CLIPSIBLINGS;
-        SetWindowLongPtrW(hwnd, GWL_STYLE, desired_style);
+        let _ = SetWindowSubclass(hwnd, Some(overlay_subclass_proc), OVERLAY_SUBCLASS_ID, 0);
 
-        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-        let desired_ex_style = (ex_style & !STRIP_EXSTYLE_MASK)
-            | WS_EX_LAYERED
-            | WS_EX_TRANSPARENT
-            | WS_EX_TOPMOST
-            | WS_EX_NOACTIVATE
-            | WS_EX_TOOLWINDOW;
-        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, desired_ex_style);
+        let style = GetWindowLongPtrW(hwnd, GWL_STYLE) as u32;
+        SetWindowLongPtrW(hwnd, GWL_STYLE, sanitize_overlay_style(style) as isize);
 
-        let margins = Margins {
-            cx_left_width: 0,
-            cx_right_width: 0,
-            cy_top_height: 0,
-            cy_bottom_height: 0,
-        };
-        let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
-
-        let nc_policy = DWMNCRP_DISABLED;
-        let _ = DwmSetWindowAttribute(
+        let ex_style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE) as u32;
+        SetWindowLongPtrW(
             hwnd,
-            DWMWA_NCRENDERING_POLICY,
-            (&nc_policy as *const u32).cast::<c_void>(),
-            size_of::<u32>() as u32,
+            GWL_EXSTYLE,
+            sanitize_overlay_ex_style(ex_style) as isize,
         );
 
         let corner_pref = DWMWCP_DONOTROUND;
@@ -267,8 +351,48 @@ fn apply_raw_overlay_flags(raw: RawWindowHandle, _opacity: f32) {
             0,
             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         );
+        ShowWindow(hwnd, SW_SHOWNOACTIVATE);
     }
 }
 
 #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 fn apply_raw_overlay_flags(_raw: RawWindowHandle, _opacity: f32) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sanitize_overlay_style_strips_caption_and_enforces_popup() {
+        let with_caption_hidden = 0x00CF_0000;
+        let sanitized_hidden = sanitize_overlay_style(with_caption_hidden);
+        assert_eq!(sanitized_hidden & WIN32_STRIP_STYLE_MASK, 0);
+        assert_ne!(sanitized_hidden & WIN32_WS_POPUP, 0);
+        assert_ne!(sanitized_hidden & WIN32_WS_CLIPSIBLINGS, 0);
+        assert_eq!(sanitized_hidden & 0x1000_0000, 0);
+
+        let with_visible = 0x10CF_0000;
+        let sanitized_visible = sanitize_overlay_style(with_visible);
+        assert_eq!(sanitized_visible & WIN32_STRIP_STYLE_MASK, 0);
+        assert_ne!(sanitized_visible & WIN32_WS_POPUP, 0);
+        assert_ne!(sanitized_visible & WIN32_WS_CLIPSIBLINGS, 0);
+        assert_ne!(sanitized_visible & 0x1000_0000, 0);
+    }
+
+    #[test]
+    fn sanitize_overlay_ex_style_strips_edges_and_enforces_overlay_flags() {
+        let dirty = WIN32_STRIP_EXSTYLE_MASK;
+        let sanitized = sanitize_overlay_ex_style(dirty);
+        assert_eq!(sanitized & WIN32_STRIP_EXSTYLE_MASK, 0);
+        assert_eq!(
+            sanitized & WIN32_REQUIRED_EX_STYLES,
+            WIN32_REQUIRED_EX_STYLES
+        );
+    }
+
+    #[test]
+    fn windows_skips_iced_mouse_passthrough() {
+        assert!(!should_use_iced_mouse_passthrough(true));
+        assert!(should_use_iced_mouse_passthrough(false));
+    }
+}

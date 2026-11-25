@@ -163,9 +163,13 @@ pub fn pill_primary_button(_theme: &Theme, status: button::Status) -> button::St
         button::Status::Disabled => M3_SURFACE_HIGHEST,
         button::Status::Active => M3_PRIMARY,
     };
+    let fg = match status {
+        button::Status::Disabled => M3_ON_SURFACE_VARIANT,
+        _ => M3_ON_PRIMARY,
+    };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: M3_ON_PRIMARY,
+        text_color: fg,
         border: Border {
             radius: 10.0.into(),
             ..Default::default()
@@ -180,9 +184,13 @@ pub fn pill_tonal_button(_theme: &Theme, status: button::Status) -> button::Styl
         button::Status::Disabled => M3_SURFACE_CONTAINER,
         button::Status::Active => M3_SECONDARY_CONTAINER,
     };
+    let fg = match status {
+        button::Status::Disabled => M3_ON_SURFACE_VARIANT.scale_alpha(0.45),
+        _ => M3_ON_SECONDARY_CONTAINER,
+    };
     button::Style {
         background: Some(Background::Color(bg)),
-        text_color: M3_ON_SECONDARY_CONTAINER,
+        text_color: fg,
         border: Border {
             radius: 10.0.into(),
             ..Default::default()
@@ -346,5 +354,69 @@ pub fn m3_menu_style(_theme: &Theme) -> menu::Style {
         text_color: M3_ON_SURFACE,
         selected_text_color: M3_ON_PRIMARY,
         selected_background: Background::Color(M3_PRIMARY),
+    }
+}
+
+pub fn tooltip_box_style(_theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(M3_SURFACE_HIGHEST)),
+        text_color: Some(M3_ON_SURFACE),
+        border: Border {
+            color: M3_OUTLINE_VARIANT,
+            width: 1.0,
+            radius: 8.0.into(),
+        },
+        shadow: Shadow {
+            color: Color::from_rgba(0.0, 0.0, 0.0, 0.45),
+            offset: Vector::new(0.0, 3.0),
+            blur_radius: 10.0,
+        },
+    }
+}
+
+fn lerp_color(a: Color, b: Color, t: f32) -> Color {
+    let t = t.clamp(0.0, 1.0);
+    Color {
+        r: a.r + (b.r - a.r) * t,
+        g: a.g + (b.g - a.g) * t,
+        b: a.b + (b.b - a.b) * t,
+        a: a.a + (b.a - a.a) * t,
+    }
+}
+
+pub fn copy_flash_button_style(
+    base_fn: fn(&Theme, button::Status) -> button::Style,
+    progress: Option<crate::ui::copy_flash::CopyFlashProgress>,
+) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme: &Theme, status: button::Status| {
+        let base = base_fn(theme, status);
+        let Some(p) = progress else {
+            return base;
+        };
+        let success = pill_success_button(theme, status);
+        let base_bg = match base.background {
+            Some(Background::Color(c)) => c,
+            _ => M3_SECONDARY_CONTAINER,
+        };
+        let success_bg = match success.background {
+            Some(Background::Color(c)) => c,
+            _ => M3_SUCCESS,
+        };
+        let bg = lerp_color(base_bg, success_bg, p.intensity);
+        let fg = lerp_color(base.text_color, success.text_color, p.intensity);
+        let mut border = base.border;
+        if p.pop_pulse > 0.0 {
+            border.color = Color {
+                a: p.pop_pulse * 0.85,
+                ..M3_ON_PRIMARY
+            };
+            border.width = 1.0 + 0.8 * p.pop_pulse;
+        }
+        button::Style {
+            background: Some(Background::Color(bg)),
+            text_color: fg,
+            border,
+            shadow: base.shadow,
+        }
     }
 }

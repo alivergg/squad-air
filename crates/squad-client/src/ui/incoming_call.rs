@@ -1,17 +1,22 @@
 use crate::crypto_identity::format_friend_code;
 use crate::net::{DiscoveredLanRoom, IncomingFriendCallUi};
-use crate::ui::components::avatar_circle;
+use crate::ui::components::{avatar_circle, with_tooltip};
+use crate::ui::icons::{icon, icon_check_animated, IconKind};
 use crate::ui::theme::{
-    canvas_panel_style, m3_text_input_style, pill_danger_button, pill_primary_button,
-    pill_success_button, pill_tonal_button, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT,
-    M3_OUTLINE, M3_PRIMARY, M3_SUCCESS, M3_SURFACE_CONTAINER, M3_WARNING,
+    canvas_panel_style, copy_flash_button_style, m3_text_input_style, pill_danger_button,
+    pill_primary_button, pill_success_button, pill_tonal_button, M3_ERROR, M3_ON_SURFACE,
+    M3_ON_SURFACE_VARIANT, M3_OUTLINE, M3_PRIMARY, M3_SUCCESS, M3_SURFACE_CONTAINER, M3_WARNING,
 };
 use crate::ui::{Message, SquadApp};
 use iced::{
     alignment::{Horizontal, Vertical},
-    widget::{button, column, container, horizontal_space, row, scrollable, text, text_input},
+    widget::{
+        button, column, container, horizontal_space, row, scrollable, text, text_input,
+        tooltip::Position,
+    },
     Background, Border, Color, Element, Length, Shadow, Theme, Vector,
 };
+use std::time::Instant;
 
 fn backdrop_style(_theme: &Theme) -> container::Style {
     container::Style {
@@ -58,16 +63,40 @@ pub fn view_incoming_call_modal<'a>(
     };
 
     let actions = row![
-        button(text("Decline").size(13).align_x(Horizontal::Center))
+        with_tooltip(
+            button(
+                container(
+                    row![icon(IconKind::CallEnd, 16.0), text("Decline").size(13)]
+                        .spacing(6)
+                        .align_y(Vertical::Center)
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            )
             .width(Length::Fill)
             .padding([12, 18])
             .style(pill_danger_button)
             .on_press(Message::DeclineIncomingCall),
-        button(text("Accept & Join").size(13).align_x(Horizontal::Center))
+            "Decline call",
+            Position::Top,
+        ),
+        with_tooltip(
+            button(
+                container(
+                    row![icon(IconKind::Call, 16.0), text("Accept & Join").size(13)]
+                        .spacing(6)
+                        .align_y(Vertical::Center)
+                )
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+            )
             .width(Length::Fill)
             .padding([12, 18])
             .style(pill_success_button)
             .on_press(Message::AcceptIncomingCall),
+            "Accept and join room",
+            Position::Top,
+        ),
     ]
     .spacing(12)
     .width(Length::Fill);
@@ -110,10 +139,13 @@ pub fn view_add_friend_modal(app: &SquadApp) -> Element<'_, Message> {
     } else {
         my_code
     };
-    let copy_label = if app.friend_id_copied_flash {
-        "Copied!"
-    } else {
-        "Copy My ID"
+    let friend_id_progress = app.copy_flash.friend_id_progress_at(Instant::now());
+    let (copy_icon, copy_tip): (Element<'_, Message>, &'static str) = match friend_id_progress {
+        Some(p) => (
+            icon_check_animated(16.0, p.check_draw, p.pop_pulse),
+            "Copied!",
+        ),
+        None => (icon(IconKind::ContentCopy, 16.0), "Copy my Friend ID"),
     };
 
     let mut content = column![
@@ -132,14 +164,17 @@ pub fn view_add_friend_modal(app: &SquadApp) -> Element<'_, Message> {
                 ]
                 .spacing(2)
                 .width(Length::Fill),
-                button(text(copy_label).size(12))
-                    .padding([8, 12])
-                    .style(if app.friend_id_copied_flash {
-                        pill_success_button
-                    } else {
-                        pill_tonal_button
-                    })
-                    .on_press(Message::CopyMyFriendId),
+                with_tooltip(
+                    button(copy_icon)
+                        .padding([8, 10])
+                        .style(copy_flash_button_style(
+                            pill_tonal_button,
+                            friend_id_progress,
+                        ))
+                        .on_press(Message::CopyMyFriendId),
+                    copy_tip,
+                    Position::Top,
+                ),
             ]
             .spacing(10)
             .align_y(Vertical::Center),
@@ -338,12 +373,6 @@ pub fn view_lan_password_modal<'a>(
     app: &'a SquadApp,
     room: &'a DiscoveredLanRoom,
 ) -> Element<'a, Message> {
-    let eye_label = if app.lan_join_password_visible {
-        "Hide"
-    } else {
-        "Show"
-    };
-
     let mut unlock_btn = button(
         text(if app.lan_join_in_progress {
             "Unlocking..."
@@ -385,10 +414,25 @@ pub fn view_lan_password_modal<'a>(
                     .padding(11)
                     .size(13)
                     .style(m3_text_input_style),
-                button(text(eye_label).size(12))
-                    .padding([11, 14])
+                with_tooltip(
+                    button(icon(
+                        if app.lan_join_password_visible {
+                            IconKind::VisibilityOff
+                        } else {
+                            IconKind::Visibility
+                        },
+                        16.0,
+                    ))
+                    .padding([11, 12])
                     .style(pill_tonal_button)
                     .on_press(Message::ToggleLanJoinPasswordVisible),
+                    if app.lan_join_password_visible {
+                        "Hide password"
+                    } else {
+                        "Show password"
+                    },
+                    Position::Top,
+                ),
             ]
             .spacing(8)
             .align_y(Vertical::Center),

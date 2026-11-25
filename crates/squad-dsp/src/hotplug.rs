@@ -40,6 +40,37 @@ pub(crate) fn should_rebuild_endpoint(
     active_stream_ok: bool,
     observed: &ObservedTopologySide,
 ) -> bool {
+    should_rebuild_endpoint_for_platform(
+        preferred_name,
+        active,
+        active_stream_ok,
+        observed,
+        cfg!(target_os = "android"),
+    )
+}
+
+pub(crate) fn should_rebuild_endpoint_for_platform(
+    preferred_name: Option<&str>,
+    active: &ResolvedDeviceMeta,
+    active_stream_ok: bool,
+    observed: &ObservedTopologySide,
+    is_android: bool,
+) -> bool {
+    if is_android {
+        if !active_stream_ok {
+            return true;
+        }
+        let Some(target) = preferred_name else {
+            return active.using_fallback;
+        };
+        if target.starts_with("@id:") {
+            if active.using_fallback {
+                return false;
+            }
+            return active.resolved_name.as_deref() != Some(target);
+        }
+    }
+
     let Some(target) = preferred_name else {
         if !active_stream_ok {
             return observed.default_name.is_some();
@@ -158,6 +189,22 @@ pub(crate) fn observe_topology_side<F>(
 where
     F: Fn(&cpal::Device, bool) -> (u32, usize),
 {
+    #[cfg(target_os = "android")]
+    if preferred_name.is_none() || preferred_name.is_some_and(|p| p.starts_with("@id:")) {
+        let mut all_names = vec!["default".to_string()];
+        if let Some(target) = preferred_name {
+            all_names.push(target.to_string());
+        }
+        all_names.sort();
+        return ObservedTopologySide {
+            all_names,
+            default_name: Some("default".to_string()),
+            default_rate: crate::SAMPLE_RATE,
+            default_channels: if is_input { 1 } else { 2 },
+            preferred_rate: None,
+        };
+    }
+
     let mut all_names = Vec::new();
     let mut preferred_rate = None;
 
@@ -587,5 +634,66 @@ mod tests {
         assert!(guard.try_consume_rebuild());
         assert!(guard.try_consume_rebuild());
         assert!(!guard.try_consume_rebuild());
+    }
+
+    #[test]
+    fn test_android_id_route_and_default_stability() {
+        let obs_cpal_mismatch = observed(&["SM-G973U"], Some("default"), 44_100, 1, None);
+
+        // Healthy default AAudio output/input must not trigger 900ms rebuilds on cpal rate mismatch.
+        let default_active = meta(Some("default"), 48_000, 2, false);
+        assert!(!should_rebuild_endpoint_for_platform(
+            None,
+            &default_active,
+            true,
+            &obs_cpal_mismatch,
+            true
+        ));
+
+        // Healthy @id:17 AAudio stream must stay stable even though cpal lists product names, not "@id:17".
+        let id_active = meta(Some("@id:17"), 16_000, 1, false);
+        assert!(!should_rebuild_endpoint_for_platform(
+            Some("@id:17"),
+            &id_active,
+            true,
+            &obs_cpal_mismatch,
+            true
+        ));
+
+        // Error callback / stream failure must immediately trigger rebuild on Android.
+        assert!(should_rebuild_endpoint_for_platform(
+            Some("@id:17"),
+            &id_active,
+            false,
+            &obs_cpal_mismatch,
+            true
+        ));
+        assert!(should_rebuild_endpoint_for_platform(
+            None,
+            &default_active,
+            false,
+            &obs_cpal_mismatch,
+            true
+        ));
+
+        // Different active @id vs preferred @id triggers rebuild.
+        let stale_id = meta(Some("@id:5"), 48_000, 1, false);
+        assert!(should_rebuild_endpoint_for_platform(
+            Some("@id:17"),
+            &stale_id,
+            true,
+            &obs_cpal_mismatch,
+            true
+        ));
+
+        // Fallback @id stream stays stable while healthy so it does not thrash every 900ms.
+        let fallback_id = meta(Some("default"), 48_000, 1, true);
+        assert!(!should_rebuild_endpoint_for_platform(
+            Some("@id:17"),
+            &fallback_id,
+            true,
+            &obs_cpal_mismatch,
+            true
+        ));
     }
 }

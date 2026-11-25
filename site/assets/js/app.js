@@ -222,13 +222,25 @@
         installCmd: "sudo snap install squad-air",
         name: "Linux",
       },
+      android: {
+        label: "Download for Android (.apk)",
+        artifact: "SquadAir-android-arm64.apk · Signed arm64-v8a APK · Android 8.0+",
+        installLabel: "Sideload via ADB (Android arm64-v8a):",
+        installCmd: "adb install -r SquadAir-android-arm64.apk",
+        name: "Android",
+      },
     };
 
     function detectPlatform() {
-      const uaDataPlatform = navigator.userAgentData?.platform || "";
-      const platform = (uaDataPlatform || navigator.platform || navigator.userAgent || "").toLowerCase();
+      const uaDataPlatform = (navigator.userAgentData?.platform || "").toLowerCase();
+      const ua = (navigator.userAgent || "").toLowerCase();
+      const navPlatform = (navigator.platform || "").toLowerCase();
+      if (uaDataPlatform.includes("android") || ua.includes("android") || navPlatform.includes("android")) {
+        return "android";
+      }
+      const platform = uaDataPlatform || navPlatform || ua;
       if (platform.includes("mac") || platform.includes("darwin")) return "macos";
-      if (platform.includes("linux") && !platform.includes("android")) return "linux";
+      if (platform.includes("linux")) return "linux";
       return "windows";
     }
 

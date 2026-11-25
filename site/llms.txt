@@ -1,11 +1,11 @@
 # SquadAir
 
-> SquadAir (`https://squadair.app/`) is a free, open-source (GNU AGPLv3) pure-Rust peer-to-peer voice chat and 1080p60 screen sharing desktop client for Windows, macOS (Apple Silicon), and Linux. Built for competitive shooters with zero accounts, zero subscription tiers, and zero central media servers.
+> SquadAir (`https://squadair.app/`) is a free, open-source (GNU AGPLv3) peer-to-peer voice chat and 1080p60 screen sharing client for Windows, macOS (Apple Silicon), Linux, and Android (8.0+ `arm64-v8a`), powered by a pure-Rust audio/crypto/network core. Built for competitive shooters with zero accounts, zero subscription tiers, and zero central media servers.
 
 ## Key Benchmarks & Architecture
 
 - **Memory & CPU Footprint:** `~48 MB` RAM and `< 1.5%` CPU during an active voice call with `1080p 60fps` screen sharing (`~36–46 MB` voice-only), dropping to `~3.5–6 MB` working set (`< 0.2%` CPU) when minimized to the Windows system tray via `SetProcessWorkingSetSize`.
-- **Native Binary & Installer Sizes:** Pure Rust `iced` 0.13 desktop client (`~21 MB` typical footprint; `11.6 MB` macOS ARM64 `.pkg`, `34.7 MB` Windows `x86_64` `.exe` installer, `11.7–15.3 MB` Linux `.deb` / `.rpm` / Arch / `.tar.gz` packages); self-hostable `squad-rendezvous` coordinator binary is `1.7 MB` (`2,768 KB` live RSS).
+- **Native Binary & Installer Sizes:** Pure Rust `iced` 0.13 desktop client (`~21 MB` typical footprint; `11.6 MB` macOS ARM64 `.pkg`, `34.7 MB` Windows `x86_64` `.exe` installer, `11.7–15.3 MB` Linux `.deb` / `.rpm` / Arch / `.tar.gz` packages) and `~14 MB` Android `arm64-v8a` APK (`SquadAir-android-arm64.apk`, Android 8.0+); self-hostable `squad-rendezvous` coordinator binary is `1.7 MB` (`2,768 KB` live RSS).
 - **Real-Time Audio DSP (`squad-dsp`):** Lock-free `cpal` + `ringbuf` SPSC audio engine, `rubato` resampling, `10 ms` Opus frames (`24 / 40 / 64 / 96 kbps`), WebRTC `AEC3` acoustic echo cancellation, `RNNoise` and optional `DeepFilterNet3` noise suppression, and adaptive jitter buffer profiles.
 - **Free 1080p60 Screen Sharing (`squad-video`):** `720p / 1080p / Native` at `30 / 60 FPS` with zero subscription tiers — DXGI Desktop Duplication on Windows and CoreGraphics on macOS, hardware H.264/H.265 encoder detection (`VideoToolbox`, `NVENC`, `AMD AMF`, `Intel QSV`), 4-lane parallel stripe codec (`IDR_MODE_JPEG_STRIPED`), atomic `64x64` tiles, interleaved `XOR-FEC`, direct `wgpu::Texture` shader playback, and `0%` capture/encode load when unwatched.
 - **Zero-Knowledge Cryptography (`squad-proto`):** End-to-end `ChaCha20-Poly1305` AEAD sealing every voice frame, video fragment, chat message, inline clipboard screenshot (`Ctrl/Cmd+V`), and `1024 B` P2P swarm file chunk; room keys derived client-side via `BLAKE3` from a 256-bit secret; 128/2048-packet replay windows; `X25519` dual-DH `sqf_` friend invites; `SPAKE2` (`Ed25519Group`) for 6-digit voice codes (`482-910`) and password-locked LAN rooms.
@@ -21,9 +21,10 @@
 - [SquadAir Homebrew Tap (macOS Apple Silicon)](https://github.com/alivergg/homebrew-tap): Auto-updated Homebrew Cask (`brew install --cask alivergg/tap/squadair`).
 - [SquadAir Scoop Bucket (Windows)](https://github.com/alivergg/scoop-bucket): Auto-updated portable Windows bucket (`scoop bucket add squadair https://github.com/alivergg/scoop-bucket && scoop install squadair/squadair`).
 - [Winget Submission (`SquadAir.SquadAir`)](https://github.com/microsoft/winget-pkgs/pull/485946): Windows Package Manager manifest PR (`#485946`, validation passed, awaiting merge).
-- [Download Latest Release (Free)](https://github.com/alivergg/squad-air/releases/latest): Prebuilt installers and packages for Windows (`x86_64`), macOS (`arm64`), and Linux, plus `SHA256SUMS.txt`.
+- [Download Latest Release (Free)](https://github.com/alivergg/squad-air/releases/latest): Prebuilt installers and packages for Windows (`x86_64`), macOS (`arm64`), Linux, and Android (`arm64-v8a` `SquadAir-android-arm64.apk`, Android 8.0+), plus `SHA256SUMS.txt`.
+- [SquadAir Android APK (Android 8.0+ arm64-v8a)](https://github.com/alivergg/squad-air/releases/latest/download/SquadAir-android-arm64.apk): Direct signed APK release (`SquadAir-android-arm64.apk`, `~14 MB`) using Jetpack Compose, Rust UniFFI core, and in-app GitHub release update check.
 - [All Releases & Changelog](https://github.com/alivergg/squad-air/releases): Version history and release artifacts.
-- [Source Code (GitHub)](https://github.com/alivergg/squad-air): Full 5-crate Rust workspace source code, CI workflows, and packaging scripts.
+- [Source Code (GitHub)](https://github.com/alivergg/squad-air): Full 6-crate Rust workspace, Android Jetpack Compose client, CI workflows, and packaging scripts.
 - [Security & Cryptography Specification](https://squadair.app/security.html): Packet nonces, AAD layout, `X25519`/`SPAKE2` protocols, Tier 3 anti-amplification relay limits, and vulnerability disclosure.
 - [Privacy Policy & Zero-Knowledge Disclosure](https://squadair.app/privacy.html): Technical disclosure of ephemeral coordinator RAM state and local-only client configuration.
 - [Terms of Use & GNU AGPLv3 License](https://squadair.app/terms.html): Software license terms and permitted usage.

@@ -1,13 +1,19 @@
 use crate::net::RemoteStreamInfo;
-use crate::ui::theme::{
-    canvas_panel_style, m3_slider_style, pill_danger_button, pill_primary_button,
-    pill_tonal_button, M3_ERROR, M3_ON_PRIMARY, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT,
-    M3_OUTLINE_VARIANT,
+use crate::ui::{
+    components::with_tooltip,
+    icons::{icon, icon_colored, IconKind},
+    theme::{
+        canvas_panel_style, m3_slider_style, pill_danger_button, pill_primary_button,
+        pill_tonal_button, M3_ERROR, M3_ON_PRIMARY, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT,
+        M3_OUTLINE_VARIANT,
+    },
+    Message, SquadApp,
 };
-use crate::ui::{Message, SquadApp};
 use iced::{
     alignment::{Horizontal, Vertical},
-    widget::{button, column, container, horizontal_space, row, slider, stack, text},
+    widget::{
+        button, column, container, horizontal_space, row, slider, stack, text, tooltip::Position,
+    },
     Background, Border, Color, Element, Length, Theme,
 };
 use std::sync::Arc;
@@ -39,7 +45,11 @@ fn video_canvas_style(_theme: &Theme) -> container::Style {
 fn stream_volume_control<'a>(app: &SquadApp) -> Element<'a, Message> {
     let pct = (app.config.stream_volume * 100.0).round() as i32;
     row![
-        text("Stream Vol").size(11).color(M3_ON_SURFACE_VARIANT),
+        with_tooltip(
+            icon_colored(IconKind::VolumeUp, 14.0, M3_ON_SURFACE_VARIANT),
+            "Stream volume",
+            Position::Bottom,
+        ),
         slider(0.0..=200.0, app.config.stream_volume * 100.0, |v| {
             Message::StreamVolumeChanged(v / 100.0)
         })
@@ -102,10 +112,10 @@ pub fn view_stream_stage(app: &SquadApp) -> Element<'_, Message> {
         )
     };
 
-    let expand_label = if app.stream_expanded {
-        "Collapse"
+    let close_tip = if is_preview {
+        "Close preview"
     } else {
-        "Expand"
+        "Stop watching stream"
     };
 
     let mut top_bar = row![
@@ -127,24 +137,41 @@ pub fn view_stream_stage(app: &SquadApp) -> Element<'_, Message> {
     }
 
     top_bar = top_bar
-        .push(
-            button(text(expand_label).size(12))
-                .padding([7, 12])
-                .style(pill_tonal_button)
-                .on_press(Message::ToggleStreamExpanded),
-        )
-        .push(
-            button(text("Fullscreen").size(12))
-                .padding([7, 12])
+        .push(with_tooltip(
+            button(icon(
+                if app.stream_expanded {
+                    IconKind::Collapse
+                } else {
+                    IconKind::Expand
+                },
+                16.0,
+            ))
+            .padding([7, 10])
+            .style(pill_tonal_button)
+            .on_press(Message::ToggleStreamExpanded),
+            if app.stream_expanded {
+                "Collapse stream"
+            } else {
+                "Expand stream"
+            },
+            Position::Bottom,
+        ))
+        .push(with_tooltip(
+            button(icon(IconKind::Fullscreen, 16.0))
+                .padding([7, 10])
                 .style(pill_primary_button)
                 .on_press(Message::ToggleStreamFullscreen),
-        )
-        .push(
-            button(text("Close").size(12))
-                .padding([7, 12])
+            "Fullscreen",
+            Position::Bottom,
+        ))
+        .push(with_tooltip(
+            button(icon(IconKind::Close, 16.0))
+                .padding([7, 10])
                 .style(pill_danger_button)
                 .on_press(close_msg),
-        );
+            close_tip,
+            Position::Bottom,
+        ));
 
     let video_area: Element<'_, Message> = if let Some(ref frame) = app.active_stream_frame {
         container(crate::ui::video_shader::video_view(
@@ -253,19 +280,28 @@ pub fn view_stream_fullscreen(app: &SquadApp) -> Element<'_, Message> {
         controls_row = controls_row.push(stream_volume_control(app));
     }
 
+    let close_tip = if is_preview {
+        "Close preview"
+    } else {
+        "Stop watching stream"
+    };
     controls_row = controls_row
-        .push(
-            button(text("Exit Fullscreen").size(12))
-                .padding([7, 14])
+        .push(with_tooltip(
+            button(icon(IconKind::FullscreenExit, 16.0))
+                .padding([7, 10])
                 .style(pill_tonal_button)
                 .on_press(Message::ExitStreamFullscreen),
-        )
-        .push(
-            button(text("Close").size(12))
-                .padding([7, 12])
+            "Exit fullscreen",
+            Position::Bottom,
+        ))
+        .push(with_tooltip(
+            button(icon(IconKind::Close, 16.0))
+                .padding([7, 10])
                 .style(pill_danger_button)
                 .on_press(close_msg),
-        );
+            close_tip,
+            Position::Bottom,
+        ));
 
     let floating_controls =
         container(controls_row)

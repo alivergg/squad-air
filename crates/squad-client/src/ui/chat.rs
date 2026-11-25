@@ -1,10 +1,12 @@
 use crate::net::{BlobTransferState, ChatContentUi, ChatItemUi};
 use crate::ui::{
-    components::avatar_circle,
+    components::{avatar_circle, with_tooltip},
+    icons::{icon, icon_check_animated, IconKind},
     theme::{
-        attachment_card_style, canvas_panel_style, chat_bubble_style, m3_text_input_style,
-        pill_danger_button, pill_primary_button, pill_success_button, pill_tonal_button, M3_ERROR,
-        M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_SURFACE_HIGHEST,
+        attachment_card_style, canvas_panel_style, chat_bubble_style, copy_flash_button_style,
+        m3_text_input_style, pill_danger_button, pill_primary_button, pill_success_button,
+        pill_tonal_button, M3_ERROR, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+        M3_SURFACE_HIGHEST,
     },
     Message, SquadApp,
 };
@@ -13,10 +15,11 @@ use iced::{
     keyboard,
     widget::{
         button, column, container, horizontal_space, image, row, scrollable, text, text_editor,
-        text_input,
+        text_input, tooltip::Position,
     },
     Background, Border, Color, ContentFit, Element, Length, Theme,
 };
+use std::time::Instant;
 
 pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
     let header = row![
@@ -60,14 +63,22 @@ pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
     .anchor_bottom();
 
     let file_btn = if app.has_relayed_peer() {
-        button(text("Disabled on Relay — Voice & Chat only").size(11))
-            .padding([10, 12])
-            .style(pill_tonal_button)
+        with_tooltip(
+            button(icon(IconKind::AttachFile, 18.0))
+                .padding([10, 11])
+                .style(pill_tonal_button),
+            "File transfer disabled on Relay — Voice & Chat only",
+            Position::Top,
+        )
     } else {
-        button(text("+ File").size(12))
-            .padding([10, 12])
-            .style(pill_tonal_button)
-            .on_press(Message::PickFileToSend)
+        with_tooltip(
+            button(icon(IconKind::AttachFile, 18.0))
+                .padding([10, 11])
+                .style(pill_tonal_button)
+                .on_press(Message::PickFileToSend),
+            "Attach file",
+            Position::Top,
+        )
     };
 
     let composer = row![
@@ -78,10 +89,14 @@ pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
             .padding(10)
             .size(13)
             .style(m3_text_input_style),
-        button(text("Send").size(12))
-            .padding([10, 14])
-            .style(pill_primary_button)
-            .on_press(Message::SendChatText),
+        with_tooltip(
+            button(icon(IconKind::Send, 18.0))
+                .padding([10, 12])
+                .style(pill_primary_button)
+                .on_press(Message::SendChatText),
+            "Send message",
+            Position::Top,
+        ),
     ]
     .spacing(8)
     .align_y(Vertical::Center);
@@ -100,6 +115,7 @@ pub fn view_chat(app: &SquadApp) -> Element<'_, Message> {
 }
 
 fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, Message> {
+    let now = Instant::now();
     let author_label = if item.is_self {
         format!("{} (You)", item.sender_nickname)
     } else {
@@ -120,16 +136,22 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
     .align_y(Vertical::Center);
 
     if let ChatContentUi::Text(ref body_text) = item.content {
-        let is_copied = app.copied_msg_id.is_some_and(|(id, _)| id == item.msg_id);
-        let copy_label = if is_copied { "Copied ✓" } else { "Copy" };
-        let copy_btn = button(text(copy_label).size(10))
-            .padding([3, 7])
-            .style(if is_copied {
-                pill_success_button
-            } else {
-                pill_tonal_button
-            })
-            .on_press(Message::CopyChatText(item.msg_id, body_text.clone()));
+        let copy_progress = app.copy_flash.chat_msg_progress_at(item.msg_id, now);
+        let (copy_icon, copy_tip): (Element<'_, Message>, &'static str) = match copy_progress {
+            Some(p) => (
+                icon_check_animated(13.0, p.check_draw, p.pop_pulse),
+                "Copied!",
+            ),
+            None => (icon(IconKind::ContentCopy, 13.0), "Copy message"),
+        };
+        let copy_btn = with_tooltip(
+            button(copy_icon)
+                .padding([4, 6])
+                .style(copy_flash_button_style(pill_tonal_button, copy_progress))
+                .on_press(Message::CopyChatText(item.msg_id, body_text.clone())),
+            copy_tip,
+            Position::Top,
+        );
         meta_items = meta_items.push(copy_btn);
     }
 
@@ -185,13 +207,26 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
                 })
                 .on_press(Message::OpenImageLightbox(bid));
 
+                let image_progress = app.copy_flash.image_progress_at(bid, now);
+                let (img_copy_icon, img_copy_tip): (Element<'_, Message>, &'static str) =
+                    match image_progress {
+                        Some(p) => (
+                            icon_check_animated(14.0, p.check_draw, p.pop_pulse),
+                            "Copied!",
+                        ),
+                        None => (icon(IconKind::ContentCopy, 14.0), "Copy image"),
+                    };
                 let footer_row = row![
                     caption,
                     horizontal_space(),
-                    button(text("Copy Image").size(10))
-                        .padding([4, 8])
-                        .style(pill_tonal_button)
-                        .on_press(Message::CopyImageToClipboard(bid)),
+                    with_tooltip(
+                        button(img_copy_icon)
+                            .padding([5, 7])
+                            .style(copy_flash_button_style(pill_tonal_button, image_progress))
+                            .on_press(Message::CopyImageToClipboard(bid)),
+                        img_copy_tip,
+                        Position::Top,
+                    ),
                 ]
                 .spacing(8)
                 .align_y(Vertical::Center);
@@ -246,11 +281,14 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
             .width(Length::Fill);
 
             let action: Element<'a, Message> = match state {
-                BlobTransferState::Available => button(text("Download").size(12))
-                    .padding([7, 12])
-                    .style(pill_primary_button)
-                    .on_press(Message::DownloadBlob(bid))
-                    .into(),
+                BlobTransferState::Available => with_tooltip(
+                    button(icon(IconKind::Download, 16.0))
+                        .padding([7, 10])
+                        .style(pill_primary_button)
+                        .on_press(Message::DownloadBlob(bid)),
+                    "Download file",
+                    Position::Top,
+                ),
                 BlobTransferState::Downloading {
                     received_chunks,
                     total_chunks,
@@ -267,23 +305,30 @@ fn render_chat_item<'a>(app: &'a SquadApp, item: &'a ChatItemUi) -> Element<'a, 
                     .into()
                 }
                 BlobTransferState::Completed { saved_path } => {
-                    let label = if item.is_self {
-                        "Shared"
+                    let tip = if item.is_self {
+                        "Shared — open folder"
                     } else {
-                        "Open Folder"
+                        "Open downloads folder"
                     };
-                    button(text(label).size(12))
-                        .padding([7, 12])
-                        .style(pill_success_button)
-                        .on_press(Message::OpenDownloadsFolder(saved_path.clone()))
-                        .into()
+                    with_tooltip(
+                        button(icon(IconKind::FolderOpen, 16.0))
+                            .padding([7, 10])
+                            .style(pill_success_button)
+                            .on_press(Message::OpenDownloadsFolder(saved_path.clone())),
+                        tip,
+                        Position::Top,
+                    )
                 }
                 BlobTransferState::Failed(err) => row![
                     text(err).size(11).color(M3_ERROR),
-                    button(text("Retry").size(11))
-                        .padding([6, 10])
-                        .style(pill_danger_button)
-                        .on_press(Message::DownloadBlob(bid)),
+                    with_tooltip(
+                        button(icon(IconKind::Refresh, 15.0))
+                            .padding([6, 9])
+                            .style(pill_danger_button)
+                            .on_press(Message::DownloadBlob(bid)),
+                        "Retry download",
+                        Position::Top,
+                    ),
                 ]
                 .spacing(6)
                 .align_y(Vertical::Center)

@@ -490,9 +490,28 @@ impl AudioEngineHandle {
     }
 }
 
+#[cfg(not(target_os = "android"))]
+type PlatformInputStream = cpal::Stream;
+#[cfg(not(target_os = "android"))]
+type PlatformOutputStream = cpal::Stream;
+
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+enum PlatformInputStream {
+    AAudio(crate::android_audio::AAudioStreamHandle),
+    Cpal(cpal::Stream),
+}
+
+#[cfg(target_os = "android")]
+#[allow(dead_code)]
+enum PlatformOutputStream {
+    AAudio(crate::android_audio::AAudioStreamHandle),
+    Cpal(cpal::Stream),
+}
+
 struct AudioStreams {
-    _input_stream: Option<cpal::Stream>,
-    _output_stream: Option<cpal::Stream>,
+    _input_stream: Option<PlatformInputStream>,
+    _output_stream: Option<PlatformOutputStream>,
     cap_cons: <HeapRb<f32> as Split>::Cons,
     play_prod: <HeapRb<f32> as Split>::Prod,
     cap_resampler: CaptureResampler,
@@ -571,7 +590,7 @@ fn negotiate_device_format(dev: &cpal::Device, is_input: bool) -> (u32, usize) {
 }
 
 struct InputStreamHalf {
-    stream: Option<cpal::Stream>,
+    stream: Option<PlatformInputStream>,
     cap_cons: <HeapRb<f32> as Split>::Cons,
     cap_resampler: CaptureResampler,
     failed: Arc<AtomicBool>,
@@ -581,7 +600,7 @@ struct InputStreamHalf {
 }
 
 struct OutputStreamHalf {
-    stream: Option<cpal::Stream>,
+    stream: Option<PlatformOutputStream>,
     play_prod: <HeapRb<f32> as Split>::Prod,
     play_resampler: PlaybackResampler,
     failed: Arc<AtomicBool>,
@@ -591,6 +610,43 @@ struct OutputStreamHalf {
 }
 
 fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -> InputStreamHalf {
+    #[cfg(target_os = "android")]
+    {
+        use crate::android_audio::{
+            open_aaudio_input, parse_android_device_spec, AndroidDeviceSpec,
+        };
+
+        let spec = parse_android_device_spec(input_device_name);
+        if !matches!(spec, AndroidDeviceSpec::LegacyIdx) {
+            let req_id = match spec {
+                AndroidDeviceSpec::Id(id) => id,
+                AndroidDeviceSpec::Default | AndroidDeviceSpec::LegacyIdx => 0,
+            };
+            let failed = Arc::new(AtomicBool::new(false));
+            if let Some(built) = open_aaudio_input(req_id, Arc::clone(&failed)) {
+                let resolved_name = if req_id > 0 && !built.using_fallback {
+                    Some(format!("@id:{req_id}"))
+                } else {
+                    Some("default".to_string())
+                };
+                return InputStreamHalf {
+                    stream: Some(PlatformInputStream::AAudio(built.stream)),
+                    cap_cons: built.cap_cons,
+                    cap_resampler: CaptureResampler::new(built.sample_rate),
+                    failed,
+                    sample_rate: built.sample_rate,
+                    channels: built.channels,
+                    meta: ResolvedDeviceMeta {
+                        resolved_name,
+                        sample_rate: built.sample_rate,
+                        channels: built.channels,
+                        using_fallback: built.using_fallback,
+                    },
+                };
+            }
+        }
+    }
+
     let (in_device, resolved_name, using_fallback) =
         select_device_with_meta(host, input_device_name, true);
     let (raw_in_rate, raw_in_channels) = in_device
@@ -637,7 +693,11 @@ fn build_input_stream_half(host: &cpal::Host, input_device_name: Option<&str>) -
             failed.store(true, Ordering::Relaxed);
             None
         } else {
-            Some(s)
+            #[cfg(target_os = "android")]
+            let wrapped = PlatformInputStream::Cpal(s);
+            #[cfg(not(target_os = "android"))]
+            let wrapped = s;
+            Some(wrapped)
         }
     });
 
@@ -661,6 +721,43 @@ fn build_output_stream_half(
     host: &cpal::Host,
     output_device_name: Option<&str>,
 ) -> OutputStreamHalf {
+    #[cfg(target_os = "android")]
+    {
+        use crate::android_audio::{
+            open_aaudio_output, parse_android_device_spec, AndroidDeviceSpec,
+        };
+
+        let spec = parse_android_device_spec(output_device_name);
+        if !matches!(spec, AndroidDeviceSpec::LegacyIdx) {
+            let req_id = match spec {
+                AndroidDeviceSpec::Id(id) => id,
+                AndroidDeviceSpec::Default | AndroidDeviceSpec::LegacyIdx => 0,
+            };
+            let failed = Arc::new(AtomicBool::new(false));
+            if let Some(built) = open_aaudio_output(req_id, Arc::clone(&failed)) {
+                let resolved_name = if req_id > 0 && !built.using_fallback {
+                    Some(format!("@id:{req_id}"))
+                } else {
+                    Some("default".to_string())
+                };
+                return OutputStreamHalf {
+                    stream: Some(PlatformOutputStream::AAudio(built.stream)),
+                    play_prod: built.play_prod,
+                    play_resampler: PlaybackResampler::new(built.sample_rate),
+                    failed,
+                    sample_rate: built.sample_rate,
+                    channels: built.channels,
+                    meta: ResolvedDeviceMeta {
+                        resolved_name,
+                        sample_rate: built.sample_rate,
+                        channels: built.channels,
+                        using_fallback: built.using_fallback,
+                    },
+                };
+            }
+        }
+    }
+
     let (out_device, resolved_name, using_fallback) =
         select_device_with_meta(host, output_device_name, false);
     let (raw_out_rate, raw_out_channels) = out_device
@@ -724,7 +821,11 @@ fn build_output_stream_half(
             failed.store(true, Ordering::Relaxed);
             None
         } else {
-            Some(s)
+            #[cfg(target_os = "android")]
+            let wrapped = PlatformOutputStream::Cpal(s);
+            #[cfg(not(target_os = "android"))]
+            let wrapped = s;
+            Some(wrapped)
         }
     });
 
@@ -786,71 +887,287 @@ fn build_audio_streams(
     }
 }
 
+#[allow(dead_code)]
+enum LoopbackHandle {
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    Cpal(cpal::Stream),
+    #[cfg(target_os = "macos")]
+    MacOs(crate::macos_loopback::MacOsLoopbackCapture),
+    #[cfg(target_os = "windows")]
+    WinProcess(crate::win_loopback::WinProcessLoopback),
+}
+
 struct LoopbackStream {
-    _stream: cpal::Stream,
+    _handle: LoopbackHandle,
     cons: <HeapRb<f32> as Split>::Cons,
     resampler: CaptureResampler,
+    failed: Arc<AtomicBool>,
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn push_downmixed_f32(data: &[f32], channels: usize, prod: &mut <HeapRb<f32> as Split>::Prod) {
+    let ch = channels.max(1);
+    if ch == 1 {
+        let _ = prod.push_slice(data);
+    } else {
+        for frame in data.chunks_exact(ch) {
+            let sum: f32 = frame.iter().copied().sum();
+            let _ = prod.try_push(sum / (ch as f32));
+        }
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn push_downmixed_i16(data: &[i16], channels: usize, prod: &mut <HeapRb<f32> as Split>::Prod) {
+    let ch = channels.max(1);
+    let scale = 1.0 / (32768.0 * (ch as f32));
+    for frame in data.chunks_exact(ch) {
+        let sum: f32 = frame.iter().map(|&s| s as f32).sum();
+        let _ = prod.try_push(sum * scale);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn push_downmixed_u16(data: &[u16], channels: usize, prod: &mut <HeapRb<f32> as Split>::Prod) {
+    let ch = channels.max(1);
+    let scale = 1.0 / (32768.0 * (ch as f32));
+    for frame in data.chunks_exact(ch) {
+        let sum: f32 = frame.iter().map(|&s| (s as f32) - 32768.0).sum();
+        let _ = prod.try_push(sum * scale);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn push_downmixed_i32(data: &[i32], channels: usize, prod: &mut <HeapRb<f32> as Split>::Prod) {
+    let ch = channels.max(1);
+    let scale = 1.0 / (2_147_483_648.0 * (ch as f32));
+    for frame in data.chunks_exact(ch) {
+        let sum: f32 = frame.iter().map(|&s| s as f32).sum();
+        let _ = prod.try_push(sum * scale);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn push_downmixed_i8(data: &[i8], channels: usize, prod: &mut <HeapRb<f32> as Split>::Prod) {
+    let ch = channels.max(1);
+    let scale = 1.0 / (128.0 * (ch as f32));
+    for frame in data.chunks_exact(ch) {
+        let sum: f32 = frame.iter().map(|&s| s as f32).sum();
+        let _ = prod.try_push(sum * scale);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux", test))]
+fn push_downmixed_u8(data: &[u8], channels: usize, prod: &mut <HeapRb<f32> as Split>::Prod) {
+    let ch = channels.max(1);
+    let scale = 1.0 / (128.0 * (ch as f32));
+    for frame in data.chunks_exact(ch) {
+        let sum: f32 = frame.iter().map(|&s| (s as f32) - 128.0).sum();
+        let _ = prod.try_push(sum * scale);
+    }
+}
+
+#[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+fn build_cpal_loopback_from_device(
+    dev: &cpal::Device,
+    cfg: cpal::SupportedStreamConfig,
+    label: &str,
+) -> Option<LoopbackStream> {
+    let lb_rate = cfg.sample_rate().0.clamp(8_000, 192_000);
+    let lb_channels = (cfg.channels() as usize).max(1);
+    let sample_format = cfg.sample_format();
+    let stream_cfg: cpal::StreamConfig = cfg.into();
+
+    let rb = HeapRb::<f32>::new((lb_rate as usize) / 2);
+    let (mut prod, cons) = rb.split();
+    let failed = Arc::new(AtomicBool::new(false));
+    let failed_cb = Arc::clone(&failed);
+
+    let err_cb = move |_err| {
+        failed_cb.store(true, Ordering::Relaxed);
+    };
+
+    let build_res = match sample_format {
+        cpal::SampleFormat::F32 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                push_downmixed_f32(data, lb_channels, &mut prod);
+            },
+            err_cb,
+            None,
+        ),
+        cpal::SampleFormat::I16 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[i16], _: &cpal::InputCallbackInfo| {
+                push_downmixed_i16(data, lb_channels, &mut prod);
+            },
+            err_cb,
+            None,
+        ),
+        cpal::SampleFormat::U16 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[u16], _: &cpal::InputCallbackInfo| {
+                push_downmixed_u16(data, lb_channels, &mut prod);
+            },
+            err_cb,
+            None,
+        ),
+        cpal::SampleFormat::I32 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[i32], _: &cpal::InputCallbackInfo| {
+                push_downmixed_i32(data, lb_channels, &mut prod);
+            },
+            err_cb,
+            None,
+        ),
+        cpal::SampleFormat::I8 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[i8], _: &cpal::InputCallbackInfo| {
+                push_downmixed_i8(data, lb_channels, &mut prod);
+            },
+            err_cb,
+            None,
+        ),
+        cpal::SampleFormat::U8 => dev.build_input_stream(
+            &stream_cfg,
+            move |data: &[u8], _: &cpal::InputCallbackInfo| {
+                push_downmixed_u8(data, lb_channels, &mut prod);
+            },
+            err_cb,
+            None,
+        ),
+        other => {
+            warn!("{label} unsupported sample format: {other:?}");
+            return None;
+        }
+    };
+
+    let stream = match build_res {
+        Ok(s) => s,
+        Err(err) => {
+            warn!("{label} build_input_stream failed ({lb_rate} Hz/{lb_channels}ch/{sample_format:?}): {err}");
+            return None;
+        }
+    };
+    if let Err(err) = stream.play() {
+        warn!("{label} stream.play() failed: {err}");
+        return None;
+    }
+
+    info!("{label} active ({lb_rate} Hz/{lb_channels}ch/{sample_format:?})");
+    Some(LoopbackStream {
+        _handle: LoopbackHandle::Cpal(stream),
+        cons,
+        resampler: CaptureResampler::new(lb_rate),
+        failed,
+    })
 }
 
 fn build_loopback_stream(
     host: &cpal::Host,
-    _output_device_name: Option<&str>,
+    output_device_name: Option<&str>,
 ) -> Option<LoopbackStream> {
-    #[cfg(target_os = "windows")]
-    let target_dev = select_device_with_meta(host, _output_device_name, false).0;
+    #[cfg(target_os = "macos")]
+    {
+        let _ = output_device_name;
+        if let Some(native) = crate::macos_loopback::start_macos_native_loopback() {
+            return Some(LoopbackStream {
+                _handle: LoopbackHandle::MacOs(native.handle),
+                cons: native.cons,
+                resampler: native.resampler,
+                failed: native.failed,
+            });
+        }
+        let target_dev = host.input_devices().ok().and_then(|mut iter| {
+            iter.find(|d| {
+                d.name()
+                    .map(|n| {
+                        let low = n.to_ascii_lowercase();
+                        low.contains("blackhole")
+                            || low.contains("loopback")
+                            || low.contains("soundflower")
+                    })
+                    .unwrap_or(false)
+            })
+        });
+        let dev = target_dev?;
+        let cfg = match dev.default_input_config() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("macOS virtual loopback default_input_config failed: {err}");
+                return None;
+            }
+        };
+        build_cpal_loopback_from_device(&dev, cfg, "macOS virtual loopback")
+    }
 
-    #[cfg(not(target_os = "windows"))]
-    let target_dev = host.input_devices().ok().and_then(|mut iter| {
-        iter.find(|d| {
-            d.name()
-                .map(|n| {
-                    let low = n.to_ascii_lowercase();
-                    low.contains("blackhole")
-                        || low.contains("loopback")
-                        || low.contains("soundflower")
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(proc_lb) = crate::win_loopback::start_windows_process_loopback() {
+            return Some(LoopbackStream {
+                _handle: LoopbackHandle::WinProcess(proc_lb.handle),
+                cons: proc_lb.cons,
+                resampler: proc_lb.resampler,
+                failed: proc_lb.failed,
+            });
+        }
+        let dev = host
+            .default_output_device()
+            .or_else(|| select_device_with_meta(host, output_device_name, false).0)?;
+        let cfg = match dev.default_output_config() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("Windows WASAPI loopback default_output_config failed: {err}");
+                return None;
+            }
+        };
+        build_cpal_loopback_from_device(&dev, cfg, "Windows WASAPI loopback")
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let _ = output_device_name;
+        let devs: Vec<cpal::Device> = host
+            .input_devices()
+            .ok()
+            .map(|iter| iter.collect())
+            .unwrap_or_default();
+        let target_dev = devs
+            .iter()
+            .find(|d| {
+                d.name()
+                    .map(|n| {
+                        let low = n.to_ascii_lowercase();
+                        low.contains(".monitor") || low.starts_with("monitor of ")
+                    })
+                    .unwrap_or(false)
+            })
+            .or_else(|| {
+                devs.iter().find(|d| {
+                    d.name()
+                        .map(|n| {
+                            let low = n.to_ascii_lowercase();
+                            low.contains("loopback") || low.contains("monitor")
+                        })
+                        .unwrap_or(false)
                 })
-                .unwrap_or(false)
-        })
-    });
+            });
+        let dev = target_dev?;
+        let cfg = match dev.default_input_config() {
+            Ok(c) => c,
+            Err(err) => {
+                warn!("Linux monitor loopback default_input_config failed: {err}");
+                return None;
+            }
+        };
+        build_cpal_loopback_from_device(dev, cfg, "Linux monitor loopback")
+    }
 
-    let dev = target_dev?;
-    #[cfg(target_os = "windows")]
-    let (raw_lb_rate, raw_lb_channels) = negotiate_device_format(&dev, false);
-    #[cfg(not(target_os = "windows"))]
-    let (raw_lb_rate, raw_lb_channels) = negotiate_device_format(&dev, true);
-    let lb_rate = raw_lb_rate.clamp(8_000, 192_000);
-    let lb_channels = raw_lb_channels.max(1);
-
-    let rb = HeapRb::<f32>::new((lb_rate as usize) / 2);
-    let (mut prod, cons) = rb.split();
-    let stream_cfg = cpal::StreamConfig {
-        channels: lb_channels as u16,
-        sample_rate: cpal::SampleRate(lb_rate),
-        buffer_size: cpal::BufferSize::Default,
-    };
-    let stream = dev
-        .build_input_stream(
-            &stream_cfg,
-            move |data: &[f32], _: &cpal::InputCallbackInfo| {
-                if lb_channels == 1 {
-                    let _ = prod.push_slice(data);
-                } else {
-                    for frame in data.chunks(lb_channels) {
-                        let mono = frame.iter().copied().sum::<f32>() / (frame.len() as f32);
-                        let _ = prod.try_push(mono);
-                    }
-                }
-            },
-            |_err| {},
-            None,
-        )
-        .ok()?;
-    let _ = stream.play();
-    Some(LoopbackStream {
-        _stream: stream,
-        cons,
-        resampler: CaptureResampler::new(lb_rate),
-    })
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (host, output_device_name);
+        None
+    }
 }
 
 struct WorkerAudioCtx<'a> {
@@ -869,6 +1186,8 @@ struct WorkerAudioCtx<'a> {
     silent_out_frames: &'a mut u8,
     last_hotplug_attempt: &'a mut Instant,
     error_backoff: &'a mut Duration,
+    last_loopback_retry: &'a mut Instant,
+    loopback_backoff: &'a mut Duration,
     silence_guard: &'a mut SilenceRetryGuard,
     topology_snap: &'a Arc<Mutex<ActiveTopologySnapshot>>,
 }
@@ -985,8 +1304,14 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
             if enabled && ctx.streams.is_some() {
                 *ctx.stream_loopback =
                     build_loopback_stream(ctx.host, ctx.current_output_dev.as_deref());
+                *ctx.last_loopback_retry = Instant::now();
+                *ctx.loopback_backoff = Duration::from_secs(1);
+                if ctx.stream_loopback.is_none() {
+                    warn!("Screen-share audio loopback failed to start; auto-recovery scheduled");
+                }
             } else {
                 drop(ctx.stream_loopback.take());
+                *ctx.loopback_backoff = Duration::from_secs(1);
             }
         }
         EngineCmd::RemovePeer { peer_id } => {
@@ -1010,25 +1335,46 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
             input_device_name,
             output_device_name,
         } => {
+            let input_changed = *ctx.current_input_dev != input_device_name;
+            let output_changed = *ctx.current_output_dev != output_device_name;
             *ctx.current_input_dev = input_device_name.clone();
             *ctx.current_output_dev = output_device_name.clone();
-            *ctx.silent_capture_ticks = 0;
-            *ctx.silent_out_frames = 0;
-            *ctx.last_hotplug_attempt = Instant::now();
-            *ctx.error_backoff = Duration::from_secs(1);
-            ctx.silence_guard.on_topology_changed();
-            if ctx.streams.is_some() {
-                drop(ctx.stream_loopback.take());
-                drop(ctx.streams.take());
-                *ctx.streams = Some(build_audio_streams(
-                    ctx.host,
-                    input_device_name.as_deref(),
-                    output_device_name.as_deref(),
-                ));
-                if ctx.atomics.stream_audio_sharing.load(Ordering::Relaxed) {
-                    *ctx.stream_loopback =
-                        build_loopback_stream(ctx.host, ctx.current_output_dev.as_deref());
+            if let Some(active) = ctx.streams.as_mut() {
+                let need_in = input_changed
+                    || active._input_stream.is_none()
+                    || active.input_stream_failed.load(Ordering::Relaxed);
+                let need_out = output_changed
+                    || active._output_stream.is_none()
+                    || active.output_stream_failed.load(Ordering::Relaxed);
+                if need_in {
+                    rebuild_input_half(
+                        ctx.host,
+                        active,
+                        ctx.current_input_dev.as_deref(),
+                        ctx.silent_capture_ticks,
+                    );
                 }
+                if need_out {
+                    rebuild_output_half(
+                        ctx.host,
+                        active,
+                        ctx.current_output_dev.as_deref(),
+                        ctx.stream_loopback,
+                        ctx.atomics.stream_audio_sharing.load(Ordering::Relaxed),
+                        ctx.silent_out_frames,
+                    );
+                }
+                if need_in || need_out {
+                    *ctx.last_hotplug_attempt = Instant::now();
+                    *ctx.error_backoff = Duration::from_secs(1);
+                    ctx.silence_guard.on_topology_changed();
+                }
+            } else {
+                *ctx.silent_capture_ticks = 0;
+                *ctx.silent_out_frames = 0;
+                *ctx.last_hotplug_attempt = Instant::now();
+                *ctx.error_backoff = Duration::from_secs(1);
+                ctx.silence_guard.on_topology_changed();
             }
             sync_topology_snapshot(
                 ctx.topology_snap,
@@ -1094,6 +1440,7 @@ fn handle_engine_cmd(cmd: EngineCmd, ctx: &mut WorkerAudioCtx<'_>) -> bool {
     true
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_audio_worker(
     config: AudioEngineConfig,
     mut suppressor: NoiseSuppressor,
@@ -1112,9 +1459,11 @@ fn run_audio_worker(
     let mut silent_out_frames: u8 = 0;
     let mut last_hotplug_attempt = Instant::now();
     let mut error_backoff = Duration::from_secs(1);
+    let mut last_loopback_retry = Instant::now() - Duration::from_secs(10);
+    let mut loopback_backoff = Duration::from_secs(1);
     let mut silence_guard = SilenceRetryGuard::new(2);
     let mut stream_loopback: Option<LoopbackStream> = None;
-    let mut stream_encoder = OpusEncoder10ms::new(64_000).expect("Stream Opus encoder init");
+    let mut stream_encoder = OpusEncoder10ms::new_audio(96_000).expect("Stream Opus encoder init");
     let mut stream_seq_num: u64 = 1;
     let mut stream_frame_48k = [0.0f32; FRAME_SAMPLES];
 
@@ -1163,6 +1512,8 @@ fn run_audio_worker(
                         silent_out_frames: &mut silent_out_frames,
                         last_hotplug_attempt: &mut last_hotplug_attempt,
                         error_backoff: &mut error_backoff,
+                        last_loopback_retry: &mut last_loopback_retry,
+                        loopback_backoff: &mut loopback_backoff,
                         silence_guard: &mut silence_guard,
                         topology_snap: &topology_snap,
                     };
@@ -1191,6 +1542,8 @@ fn run_audio_worker(
                 silent_out_frames: &mut silent_out_frames,
                 last_hotplug_attempt: &mut last_hotplug_attempt,
                 error_backoff: &mut error_backoff,
+                last_loopback_retry: &mut last_loopback_retry,
+                loopback_backoff: &mut loopback_backoff,
                 silence_guard: &mut silence_guard,
                 topology_snap: &topology_snap,
             };
@@ -1243,6 +1596,8 @@ fn run_audio_worker(
             }
             if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
                 stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
+                last_loopback_retry = Instant::now();
+                loopback_backoff = Duration::from_secs(1);
             }
             next_tick = Instant::now();
         }
@@ -1472,6 +1827,23 @@ fn run_audio_worker(
         }
 
         if atomics.stream_audio_sharing.load(Ordering::Relaxed) {
+            let needs_lb = stream_loopback
+                .as_ref()
+                .is_none_or(|lb| lb.failed.load(Ordering::Relaxed));
+            if needs_lb && last_loopback_retry.elapsed() >= loopback_backoff {
+                drop(stream_loopback.take());
+                stream_loopback = build_loopback_stream(&host, current_output_dev.as_deref());
+                last_loopback_retry = Instant::now();
+                if stream_loopback.is_some() {
+                    loopback_backoff = Duration::from_secs(1);
+                } else {
+                    loopback_backoff = (loopback_backoff * 2).min(Duration::from_secs(8));
+                    warn!(
+                        "Screen-share audio loopback unavailable; retrying in {:?}",
+                        loopback_backoff
+                    );
+                }
+            }
             if let Some(ref mut lb) = stream_loopback {
                 while lb.cons.occupied_len() > 0 {
                     let n = lb.cons.pop_slice(&mut raw_in_buf);
@@ -1585,5 +1957,113 @@ mod tests {
         // 3. Проверяем DTX на абсолютной тишине (не должен генерировать пакеты)
         let silence_48k = [0.0f32; FRAME_SAMPLES];
         assert!(encoder.encode_frame(&silence_48k).unwrap().is_none());
+    }
+
+    #[test]
+    fn test_stream_audio_opus_encode_jitter_mix_roundtrip() {
+        let mut cap_resampler = CaptureResampler::new(44_100);
+        let mut stream_encoder = OpusEncoder10ms::new_audio(96_000).unwrap();
+        let cue_bank = SoundCueBank::load_optional();
+        let mut mixer = AudioMixer::new(cue_bank, JitterProfile::Balanced);
+
+        let total_in = 44_100 / 5;
+        let mut music_44k = Vec::with_capacity(total_in);
+        for i in 0..total_in {
+            let t = i as f32 / 44_100.0;
+            music_44k.push(
+                0.35 * (2.0 * std::f32::consts::PI * 440.0 * t).sin()
+                    + 0.20 * (2.0 * std::f32::consts::PI * 6_000.0 * t).sin(),
+            );
+        }
+        cap_resampler.push_samples(&music_44k);
+
+        let mut frame_48k = [0.0f32; FRAME_SAMPLES];
+        let mut seq = 1u64;
+        let mut encoded_count = 0usize;
+        while cap_resampler.pop_frame(&mut frame_48k) {
+            let pkt = stream_encoder.encode_speech_frame(&frame_48k).unwrap();
+            let frame_msg = OutboundAudioFrame::StreamOpus {
+                seq_num: seq,
+                opus_bytes: Bytes::from(pkt),
+            };
+            if let OutboundAudioFrame::StreamOpus {
+                seq_num,
+                opus_bytes,
+            } = frame_msg
+            {
+                mixer.push_stream_opus(1, seq_num, opus_bytes.to_vec());
+                encoded_count += 1;
+            }
+            seq += 1;
+        }
+        assert!(encoded_count >= 18);
+
+        let mut out = [0.0f32; FRAME_SAMPLES];
+        let mut audible_frames = 0usize;
+        for _ in 0..encoded_count {
+            if mixer.mix_frame(false, &mut out) {
+                let rms = (out.iter().map(|&x| x * x).sum::<f32>() / (FRAME_SAMPLES as f32)).sqrt();
+                if rms > 0.05 {
+                    audible_frames += 1;
+                }
+            }
+        }
+        assert!(
+            audible_frames >= 10,
+            "Expected audible mixed stream audio frames, got {audible_frames}"
+        );
+
+        // Deafened must mute stream audio even when stream packets exist.
+        let pkt_extra = stream_encoder.encode_speech_frame(&frame_48k).unwrap();
+        mixer.push_stream_opus(1, seq, pkt_extra);
+        assert!(!mixer.mix_frame(true, &mut out));
+        assert!(out.iter().all(|&s| s == 0.0));
+
+        // Zero stream gain silences stream audio.
+        mixer.set_stream_gain(0.0);
+        let pkt_extra2 = stream_encoder.encode_speech_frame(&frame_48k).unwrap();
+        mixer.push_stream_opus(1, seq + 1, pkt_extra2);
+        assert!(!mixer.mix_frame(false, &mut out));
+        assert!(out.iter().all(|&s| s == 0.0));
+    }
+
+    #[test]
+    fn test_loopback_sample_format_downmix_conversion() {
+        let rb = HeapRb::<f32>::new(64);
+        let (mut prod, mut cons) = rb.split();
+
+        push_downmixed_f32(&[0.5, -0.5, 0.25, 0.75], 2, &mut prod);
+        let mut out = [0.0f32; 2];
+        assert_eq!(cons.pop_slice(&mut out), 2);
+        assert!((out[0] - 0.0).abs() < 1e-6);
+        assert!((out[1] - 0.5).abs() < 1e-6);
+
+        push_downmixed_i16(&[16384, 16384, -32768, 0], 2, &mut prod);
+        assert_eq!(cons.pop_slice(&mut out), 2);
+        assert!((out[0] - 0.5).abs() < 1e-3);
+        assert!((out[1] - (-0.5)).abs() < 1e-3);
+
+        push_downmixed_u16(&[32768, 32768, 65535, 32768], 2, &mut prod);
+        assert_eq!(cons.pop_slice(&mut out), 2);
+        assert!((out[0] - 0.0).abs() < 1e-4);
+        assert!((out[1] - 0.5).abs() < 1e-3);
+
+        push_downmixed_i32(
+            &[1_073_741_824, 1_073_741_824, -1_073_741_824, 0],
+            2,
+            &mut prod,
+        );
+        assert_eq!(cons.pop_slice(&mut out), 2);
+        assert!((out[0] - 0.5).abs() < 1e-4);
+        assert!((out[1] - (-0.25)).abs() < 1e-4);
+
+        push_downmixed_i8(&[64, 64], 2, &mut prod);
+        let mut one = [0.0f32; 1];
+        assert_eq!(cons.pop_slice(&mut one), 1);
+        assert!((one[0] - 0.5).abs() < 1e-2);
+
+        push_downmixed_u8(&[128, 128], 2, &mut prod);
+        assert_eq!(cons.pop_slice(&mut one), 1);
+        assert!((one[0] - 0.0).abs() < 1e-2);
     }
 }

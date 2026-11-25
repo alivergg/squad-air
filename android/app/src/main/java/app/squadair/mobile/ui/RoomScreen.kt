@@ -25,7 +25,6 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.BluetoothAudio
 import androidx.compose.material.icons.filled.CallEnd
 import androidx.compose.material.icons.filled.Chat
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Headset
 import androidx.compose.material.icons.filled.HeadsetOff
 import androidx.compose.material.icons.filled.Key
@@ -63,8 +62,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -233,7 +230,6 @@ fun RoomScreen(
     }
 
     if (shortCodeDialogOpen && state.activeShortCode != null) {
-        val clipboard = LocalClipboardManager.current
         val formatted = state.activeShortCode.chunked(3).joinToString(" ")
         AlertDialog(
             onDismissRequest = { shortCodeDialogOpen = false },
@@ -260,9 +256,11 @@ fun RoomScreen(
                 }
             },
             confirmButton = {
-                Button(onClick = { clipboard.setText(AnnotatedString(state.activeShortCode)) }) {
-                    Text("Copy Code")
-                }
+                AnimatedCopyButton(
+                    textToCopy = state.activeShortCode,
+                    label = "Copy Code",
+                    tonal = false,
+                )
             },
             dismissButton = {
                 TextButton(onClick = { shortCodeDialogOpen = false }) {
@@ -287,7 +285,6 @@ private fun RoomTopBar(
     repository: SquadSessionRepository,
     onShowShortCode: () -> Unit,
 ) {
-    val clipboard = LocalClipboardManager.current
     var routeMenuOpen by remember { mutableStateOf(false) }
 
     Surface(color = SquadAirSurfaceCard, tonalElevation = 2.dp) {
@@ -322,9 +319,10 @@ private fun RoomTopBar(
             IconButton(onClick = onShowShortCode) {
                 Icon(Icons.Default.Key, contentDescription = "6-Digit Code", tint = SquadAirPrimary)
             }
-            IconButton(onClick = { clipboard.setText(AnnotatedString(state.activeInviteUri)) }) {
-                Icon(Icons.Default.ContentCopy, contentDescription = "Copy Invite Link", tint = SquadAirPrimary)
-            }
+            AnimatedCopyIconButton(
+                textToCopy = state.activeInviteUri,
+                contentDescription = "Copy Invite Link",
+            )
             Box {
                 val routeIcon = when (state.audioRoute) {
                     AudioRoute.BLUETOOTH -> Icons.Default.BluetoothAudio

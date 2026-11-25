@@ -1,6 +1,8 @@
 package app.squadair.mobile.ui
 
 import android.content.Intent
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -24,7 +26,6 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Call
-import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Group
@@ -41,6 +42,7 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.OutlinedTextField
@@ -60,7 +62,6 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
@@ -68,8 +69,10 @@ import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import app.squadair.mobile.core.AppUpdater
 import app.squadair.mobile.core.SquadSessionRepository
 import app.squadair.mobile.core.SquadUiState
+import app.squadair.mobile.core.UpdateState
 import app.squadair.mobile.ui.theme.RgbaAvatarImage
 import app.squadair.mobile.ui.theme.SquadAirBackground
 import app.squadair.mobile.ui.theme.SquadAirDangerRed
@@ -154,6 +157,13 @@ fun LobbyScreen(
                         }
                     }
                 }
+            }
+
+            if (!state.updateBannerDismissed) {
+                LobbyUpdateBanner(
+                    updateState = state.updateState,
+                    repository = repository,
+                )
             }
 
             when (selectedTab) {
@@ -500,7 +510,6 @@ private fun FriendsTab(
     repository: SquadSessionRepository,
 ) {
     val context = LocalContext.current
-    val clipboard = LocalClipboardManager.current
     var friendCodeInput by remember { mutableStateOf("") }
 
     LazyColumn(
@@ -531,16 +540,12 @@ private fun FriendsTab(
                     )
                     Spacer(modifier = Modifier.height(10.dp))
                     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        FilledTonalButton(
-                            onClick = {
-                                clipboard.setText(AnnotatedString(state.profile.myFriendCode))
-                            },
+                        AnimatedCopyButton(
+                            textToCopy = state.profile.myFriendCode,
+                            label = "Copy Code",
+                            tonal = true,
                             modifier = Modifier.weight(1f),
-                        ) {
-                            Icon(Icons.Default.ContentCopy, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(6.dp))
-                            Text("Copy Code")
-                        }
+                        )
                         FilledTonalButton(
                             onClick = {
                                 val sendIntent = Intent(Intent.ACTION_SEND).apply {
@@ -800,6 +805,179 @@ private fun LanRoomsTab(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun LobbyUpdateBanner(
+    updateState: UpdateState,
+    repository: SquadSessionRepository,
+) {
+    val context = LocalContext.current
+    val installPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) {
+        repository.onInstallPermissionResult()
+    }
+
+    when (updateState) {
+        is UpdateState.Available -> {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Text(
+                        text = "SquadAir ${updateState.release.tagName} available",
+                        color = SquadAirTextPrimary,
+                        fontSize = 14.sp,
+                        fontWeight = FontWeight.SemiBold,
+                    )
+                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = { repository.downloadAndInstallUpdate(updateState.release) },
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = SquadAirPrimary,
+                                contentColor = SquadAirOnPrimary,
+                            ),
+                        ) {
+                            Text("Download")
+                        }
+                        TextButton(onClick = { repository.dismissUpdateBanner() }) {
+                            Text("Later", color = SquadAirTextMuted)
+                        }
+                    }
+                }
+            }
+        }
+        is UpdateState.Downloading -> {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+            ) {
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    val pct = updateState.progress?.let { "${(it * 100).toInt()}%" } ?: "..."
+                    Text(
+                        text = "Downloading ${updateState.release.tagName} ($pct)",
+                        color = SquadAirTextPrimary,
+                        fontSize = 13.sp,
+                    )
+                    val progress = updateState.progress
+                    if (progress != null) {
+                        LinearProgressIndicator(
+                            progress = { progress },
+                            modifier = Modifier.fillMaxWidth(),
+                        )
+                    } else {
+                        LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                    }
+                }
+            }
+        }
+        is UpdateState.ReadyToInstall -> {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "${updateState.release.tagName} ready to install",
+                        color = SquadAirSpeakingGreen,
+                        fontSize = 13.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Button(onClick = { repository.installDownloadedUpdate() }) {
+                        Text("Install Update")
+                    }
+                }
+            }
+        }
+        is UpdateState.NeedsInstallPermission -> {
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(vertical = 6.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(
+                        text = "Allow app installs to finish updating to ${updateState.release.tagName}",
+                        color = SquadAirTextPrimary,
+                        fontSize = 12.sp,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Button(
+                        onClick = {
+                            installPermLauncher.launch(AppUpdater.createUnknownSourcesSettingsIntent(context))
+                        },
+                    ) {
+                        Text("Allow & Install")
+                    }
+                }
+            }
+        }
+        is UpdateState.Error -> {
+            val failedRelease = updateState.release
+            if (failedRelease != null) {
+                Card(
+                    colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(vertical = 6.dp),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        Text(
+                            text = "Update ${failedRelease.tagName} failed: ${updateState.message}",
+                            color = SquadAirDangerRed,
+                            fontSize = 13.sp,
+                        )
+                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                            Button(
+                                onClick = { repository.downloadAndInstallUpdate(failedRelease) },
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = SquadAirPrimary,
+                                    contentColor = SquadAirOnPrimary,
+                                ),
+                            ) {
+                                Text("Retry")
+                            }
+                            TextButton(onClick = { repository.dismissUpdateBanner() }) {
+                                Text("Dismiss", color = SquadAirTextMuted)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        else -> Unit
     }
 }
 

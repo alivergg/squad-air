@@ -1,13 +1,29 @@
 use crate::net::{PeerConnStatus, PeerRouteKind, PeerUiSnapshot};
 use crate::ui::theme::{
-    M3_ERROR, M3_ON_SURFACE_VARIANT, M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SUCCESS,
+    tooltip_box_style, M3_ERROR, M3_ON_SURFACE_VARIANT, M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SUCCESS,
     M3_SURFACE_HIGHEST, M3_WARNING,
 };
 use iced::{
     alignment::{Horizontal, Vertical},
-    widget::{container, horizontal_space, image as iced_image, row, stack, text},
+    widget::{
+        container, horizontal_space, image as iced_image, row, stack, text, tooltip,
+        tooltip::Position,
+    },
     Background, Border, ContentFit, Element, Length, Theme,
 };
+
+pub fn with_tooltip<'a, Message: 'a>(
+    content: impl Into<Element<'a, Message>>,
+    label: impl iced::widget::text::IntoFragment<'a>,
+    position: Position,
+) -> Element<'a, Message> {
+    tooltip(content, text(label).size(12), position)
+        .gap(6.0)
+        .padding(8.0)
+        .snap_within_viewport(true)
+        .style(tooltip_box_style)
+        .into()
+}
 
 pub fn avatar_circle<'a, Message: 'a>(
     handle: iced_image::Handle,

@@ -1,13 +1,14 @@
 use crate::net::PeerConnStatus;
 use crate::ui::{
     chat::view_chat,
-    components::{avatar_circle, mic_level_meter, telemetry_badge},
+    components::{avatar_circle, mic_level_meter, telemetry_badge, with_tooltip},
+    icons::{icon, icon_check_animated, IconKind},
     stream_view::{view_stream_fullscreen, view_stream_stage},
     theme::{
-        canvas_panel_style, floating_dock_style, m3_slider_style, m3_text_input_style,
-        peer_card_style, pill_chip_button, pill_danger_button, pill_primary_button,
-        pill_success_button, pill_tonal_button, surface_card_style, M3_ERROR, M3_ON_PRIMARY,
-        M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_WARNING,
+        canvas_panel_style, copy_flash_button_style, floating_dock_style, m3_slider_style,
+        m3_text_input_style, peer_card_style, pill_chip_button, pill_danger_button,
+        pill_primary_button, pill_success_button, pill_tonal_button, surface_card_style, M3_ERROR,
+        M3_ON_PRIMARY, M3_ON_SURFACE_VARIANT, M3_PRIMARY, M3_SUCCESS, M3_WARNING,
     },
     Message, SquadApp,
 };
@@ -15,10 +16,12 @@ use iced::{
     alignment::{Horizontal, Vertical},
     widget::{
         button, column, container, horizontal_space, row, scrollable, slider, text, text_input,
+        tooltip::Position,
     },
     Background, Border, Element, Length, Theme,
 };
 use squad_dsp::MicActivationMode;
+use std::time::Instant;
 
 pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     let has_stage = app.watched_peer_id.is_some() || app.local_stream_preview;
@@ -26,12 +29,9 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
         return view_stream_fullscreen(app);
     }
 
+    let now = Instant::now();
     let total_members = app.peers.len() + 1;
-    let copy_label = if app.invite_copied_flash {
-        "Copied!"
-    } else {
-        "Copy Link"
-    };
+    let invite_progress = app.copy_flash.invite_progress_at(now);
     let saved_channel = app
         .config
         .saved_channels
@@ -78,10 +78,21 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
                 && !app.is_friend_in_current_room(&f.pub_key)
         })
         .count();
-    let invite_btn_label = if online_friends_count > 0 {
-        format!("Invite ({online_friends_count})")
+    let invite_content: Element<'_, Message> = if online_friends_count > 0 {
+        row![
+            icon(IconKind::PersonAdd, 16.0),
+            text(format!("{online_friends_count}")).size(11),
+        ]
+        .spacing(5)
+        .align_y(Vertical::Center)
+        .into()
     } else {
-        "Invite Friends".to_string()
+        icon(IconKind::PersonAdd, 16.0)
+    };
+    let invite_tooltip = if online_friends_count > 0 {
+        format!("Invite friends ({online_friends_count} online)")
+    } else {
+        "Invite friends".to_string()
     };
 
     let mut header_row = row![
@@ -94,85 +105,140 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             .padding([7, 10])
             .size(12)
             .style(m3_text_input_style),
-        button(text(if already_saved { "Saved ✓" } else { "Save" }).size(12))
-            .padding([8, 11])
+        with_tooltip(
+            button(icon(
+                if already_saved {
+                    IconKind::BookmarkAdded
+                } else {
+                    IconKind::Bookmark
+                },
+                16.0,
+            ))
+            .padding([8, 10])
             .style(if already_saved {
                 pill_success_button
             } else {
                 pill_tonal_button
             })
             .on_press(Message::SaveActiveChannel),
+            if already_saved {
+                "Saved in sidebar"
+            } else {
+                "Save room to sidebar"
+            },
+            Position::Bottom,
+        ),
     ]
     .spacing(6)
     .align_y(Vertical::Center);
 
     if let Some((code, _expires_at)) = app.active_short_code {
         let formatted = crate::ui::format_short_code(code);
-        let code_label = if app.short_code_copied_flash {
-            format!("Copied {formatted}!")
+        let short_code_progress = app.copy_flash.short_code_progress_at(now);
+        let code_icon: Element<'_, Message> = match short_code_progress {
+            Some(p) => icon_check_animated(16.0, p.check_draw, p.pop_pulse),
+            None => icon(IconKind::Key, 16.0),
+        };
+        let code_tip = if short_code_progress.is_some() {
+            "Copied!"
         } else {
-            format!("Code: {formatted}")
+            "Copy 6-digit code"
         };
         header_row = header_row
-            .push(
-                button(text(code_label).size(12))
-                    .padding([8, 11])
-                    .style(pill_success_button)
-                    .on_press(Message::CopyShortCode),
-            )
-            .push(
-                button(text("↻").size(12))
+            .push(with_tooltip(
+                button(
+                    row![code_icon, text(formatted).size(12)]
+                        .spacing(6)
+                        .align_y(Vertical::Center),
+                )
+                .padding([8, 10])
+                .style(copy_flash_button_style(
+                    pill_tonal_button,
+                    short_code_progress,
+                ))
+                .on_press(Message::CopyShortCode),
+                code_tip,
+                Position::Bottom,
+            ))
+            .push(with_tooltip(
+                button(icon(IconKind::Refresh, 16.0))
                     .padding([8, 10])
                     .style(pill_tonal_button)
                     .on_press(Message::GenerateShortCode),
-            );
+                "Regenerate 6-digit code",
+                Position::Bottom,
+            ));
     } else {
-        header_row = header_row.push(
-            button(text("6-Digit Code").size(12))
-                .padding([8, 11])
+        header_row = header_row.push(with_tooltip(
+            button(icon(IconKind::Key, 16.0))
+                .padding([8, 10])
                 .style(pill_tonal_button)
                 .on_press(Message::GenerateShortCode),
-        );
+            "Generate 6-digit code",
+            Position::Bottom,
+        ));
     }
 
+    let (invite_copy_icon, invite_copy_tip): (Element<'_, Message>, &'static str) =
+        match invite_progress {
+            Some(p) => (
+                icon_check_animated(16.0, p.check_draw, p.pop_pulse),
+                "Copied!",
+            ),
+            None => (icon(IconKind::ContentCopy, 16.0), "Copy invite link"),
+        };
+
     header_row = header_row
-        .push(
-            button(text(invite_btn_label).size(12))
-                .padding([8, 11])
+        .push(with_tooltip(
+            button(invite_content)
+                .padding([8, 10])
                 .style(pill_tonal_button)
                 .on_press(Message::OpenInviteFriendsModal),
-        )
-        .push(
-            button(text(copy_label).size(12))
-                .padding([8, 11])
-                .style(pill_primary_button)
+            invite_tooltip,
+            Position::Bottom,
+        ))
+        .push(with_tooltip(
+            button(invite_copy_icon)
+                .padding([8, 10])
+                .style(copy_flash_button_style(
+                    pill_primary_button,
+                    invite_progress,
+                ))
                 .on_press(Message::CopyInviteUri),
-        );
+            invite_copy_tip,
+            Position::Bottom,
+        ));
 
     #[cfg(not(feature = "managed_updates"))]
     if let Some(ref info) = app.available_update {
-        header_row = header_row.push(
-            button(text(format!("Update {}", info.tag_name)).size(12))
-                .padding([8, 11])
+        header_row = header_row.push(with_tooltip(
+            button(icon(IconKind::Download, 16.0))
+                .padding([8, 10])
                 .style(pill_success_button)
                 .on_press(Message::OpenUpdateModal),
-        );
+            format!("Update available: {}", info.tag_name),
+            Position::Bottom,
+        ));
     }
 
     let header = container(
         header_row
-            .push(
-                button(text("Settings").size(12))
-                    .padding([8, 11])
+            .push(with_tooltip(
+                button(icon(IconKind::Settings, 16.0))
+                    .padding([8, 10])
                     .style(pill_tonal_button)
                     .on_press(Message::OpenSettings),
-            )
-            .push(
-                button(text("Leave").size(12))
-                    .padding([8, 11])
+                "Settings",
+                Position::Bottom,
+            ))
+            .push(with_tooltip(
+                button(icon(IconKind::CallEnd, 16.0))
+                    .padding([8, 10])
                     .style(pill_danger_button)
                     .on_press(Message::LeaveRoom),
-            ),
+                "Leave voice room",
+                Position::Bottom,
+            )),
     )
     .padding([12, 16])
     .width(Length::Fill)
@@ -208,17 +274,25 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     .align_y(Vertical::Center);
 
     if app.is_local_sharing {
-        let preview_label = if app.local_stream_preview {
-            "Hide Preview"
-        } else {
-            "Preview"
-        };
-        self_row = self_row.push(
-            button(text(preview_label).size(11))
-                .padding([6, 12])
-                .style(pill_chip_button(app.local_stream_preview))
-                .on_press(Message::ToggleLocalStreamPreview),
-        );
+        self_row = self_row.push(with_tooltip(
+            button(icon(
+                if app.local_stream_preview {
+                    IconKind::VisibilityOff
+                } else {
+                    IconKind::Visibility
+                },
+                15.0,
+            ))
+            .padding([6, 9])
+            .style(pill_chip_button(app.local_stream_preview))
+            .on_press(Message::ToggleLocalStreamPreview),
+            if app.local_stream_preview {
+                "Hide local preview"
+            } else {
+                "Show local preview"
+            },
+            Position::Top,
+        ));
     }
     self_row = self_row.push(mic_level_meter(
         app.audio.local_mic_level_db(),
@@ -289,19 +363,31 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
             if let Some(ref stream) = peer.stream_info {
                 let is_watching = app.watched_peer_id == Some(peer_id);
                 let watch_btn = if is_watching {
-                    button(text("Watching").size(11))
-                        .padding([5, 10])
-                        .style(pill_chip_button(true))
-                        .on_press(Message::StopWatchingStream)
+                    with_tooltip(
+                        button(icon(IconKind::Stop, 14.0))
+                            .padding([6, 9])
+                            .style(pill_chip_button(true))
+                            .on_press(Message::StopWatchingStream),
+                        "Stop watching stream",
+                        Position::Top,
+                    )
                 } else if peer.status == PeerConnStatus::Relayed {
-                    button(text("P2P/Mesh Only").size(11))
-                        .padding([5, 10])
-                        .style(pill_tonal_button)
+                    with_tooltip(
+                        button(icon(IconKind::PlayArrow, 14.0))
+                            .padding([6, 9])
+                            .style(pill_tonal_button),
+                        "Stream unavailable on Relay (P2P/Mesh only)",
+                        Position::Top,
+                    )
                 } else {
-                    button(text("Watch").size(11))
-                        .padding([5, 10])
-                        .style(pill_primary_button)
-                        .on_press(Message::WatchPeerStream(peer_id))
+                    with_tooltip(
+                        button(icon(IconKind::PlayArrow, 14.0))
+                            .padding([6, 9])
+                            .style(pill_primary_button)
+                            .on_press(Message::WatchPeerStream(peer_id)),
+                        "Watch stream",
+                        Position::Top,
+                    )
                 };
 
                 let stream_row = row![
@@ -385,45 +471,92 @@ pub fn view_room(app: &SquadApp) -> Element<'_, Message> {
     let act_mode = app.config.activation_mode;
 
     let share_btn = if app.is_local_sharing {
-        button(
-            text(format!(
-                "Stop Sharing • {} watching",
-                app.local_stream_subscribers
-            ))
-            .size(12),
+        let stop_content: Element<'_, Message> = if app.local_stream_subscribers > 0 {
+            row![
+                icon(IconKind::StopScreenShare, 20.0),
+                text(format!("{}", app.local_stream_subscribers)).size(12),
+            ]
+            .spacing(6)
+            .align_y(Vertical::Center)
+            .into()
+        } else {
+            icon(IconKind::StopScreenShare, 20.0)
+        };
+        with_tooltip(
+            button(stop_content)
+                .padding([10, 14])
+                .style(pill_danger_button)
+                .on_press(Message::StopScreenShare),
+            format!("Stop sharing ({} watching)", app.local_stream_subscribers),
+            Position::Top,
         )
-        .padding([9, 14])
-        .style(pill_danger_button)
-        .on_press(Message::StopScreenShare)
     } else if app.has_relayed_peer() {
-        button(text("Disabled on Relay — Voice & Chat only").size(11))
-            .padding([9, 14])
-            .style(pill_tonal_button)
+        with_tooltip(
+            button(icon(IconKind::ScreenShare, 20.0))
+                .padding([10, 14])
+                .style(pill_tonal_button),
+            "Screen share disabled on Relay — Voice & Chat only",
+            Position::Top,
+        )
     } else {
-        button(text("Share Screen").size(12))
-            .padding([9, 14])
-            .style(pill_tonal_button)
-            .on_press(Message::OpenShareModal)
+        with_tooltip(
+            button(icon(IconKind::ScreenShare, 20.0))
+                .padding([10, 14])
+                .style(pill_tonal_button)
+                .on_press(Message::OpenShareModal),
+            "Share screen",
+            Position::Top,
+        )
     };
 
     let bottom_dock = container(
         row![
-            button(text(if is_muted { "Unmute Mic" } else { "Mute Mic" }).size(12))
-                .padding([9, 16])
+            with_tooltip(
+                button(icon(
+                    if is_muted {
+                        IconKind::MicOff
+                    } else {
+                        IconKind::Mic
+                    },
+                    20.0,
+                ))
+                .padding([10, 14])
                 .style(if is_muted {
                     pill_danger_button
                 } else {
                     pill_tonal_button
                 })
                 .on_press(Message::ToggleMicMute),
-            button(text(if is_deafened { "Undeafen" } else { "Deafen" }).size(12))
-                .padding([9, 16])
+                if is_muted {
+                    "Unmute microphone"
+                } else {
+                    "Mute microphone"
+                },
+                Position::Top,
+            ),
+            with_tooltip(
+                button(icon(
+                    if is_deafened {
+                        IconKind::HeadsetOff
+                    } else {
+                        IconKind::Headset
+                    },
+                    20.0,
+                ))
+                .padding([10, 14])
                 .style(if is_deafened {
                     pill_danger_button
                 } else {
                     pill_tonal_button
                 })
                 .on_press(Message::ToggleDeafen),
+                if is_deafened {
+                    "Undeafen audio"
+                } else {
+                    "Deafen audio"
+                },
+                Position::Top,
+            ),
             share_btn,
             text("Input Mode:").size(12).color(M3_ON_SURFACE_VARIANT),
             button(text("Push-to-Mute").size(12))

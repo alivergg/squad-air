@@ -1,6 +1,8 @@
 pub mod avatar;
 pub mod chat;
 pub mod components;
+pub mod copy_flash;
+pub mod icons;
 pub mod incoming_call;
 pub mod lobby;
 pub mod overlay;
@@ -30,13 +32,19 @@ use crate::ui::avatar::{
     hash_to_hex, hex_to_hash, load_cached_avatar_jpeg, process_custom_avatar_image,
     save_cached_avatar_jpeg, AvatarCache,
 };
+use crate::ui::components::with_tooltip;
+use crate::ui::copy_flash::{
+    CopyFlashProgress, CopyFlashState, COPY_FLASH_DURATION, COPY_FLASH_FADE_START,
+};
+use crate::ui::icons::{icon, icon_check_animated, IconKind};
 use crate::ui::share_modal::ShareSourceTab;
 use crate::ui::shortcut_normalizer::{matches_layout_agnostic_key, shortcut_normalizer};
 #[cfg_attr(feature = "managed_updates", allow(unused_imports))]
 use crate::ui::theme::{
-    material_dark_theme, pill_danger_button, pill_primary_button, pill_success_button,
-    pill_tonal_button, root_container_style, M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_OUTLINE,
-    M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SURFACE_CONTAINER, M3_SURFACE_HIGH,
+    copy_flash_button_style, material_dark_theme, pill_danger_button, pill_primary_button,
+    pill_success_button, pill_tonal_button, root_container_style, M3_ON_SURFACE,
+    M3_ON_SURFACE_VARIANT, M3_OUTLINE, M3_OUTLINE_VARIANT, M3_PRIMARY, M3_SURFACE_CONTAINER,
+    M3_SURFACE_HIGH,
 };
 #[cfg_attr(feature = "managed_updates", allow(unused_imports))]
 use iced::{
@@ -47,7 +55,7 @@ use iced::{
     keyboard, mouse, stream,
     widget::{
         button, column, container, horizontal_space, image as iced_image, row, scrollable, stack,
-        text, text_editor,
+        text, text_editor, tooltip::Position,
     },
     Background, Border, Color, ContentFit, Element, Length, Point, Size, Subscription, Task, Theme,
 };
@@ -104,6 +112,7 @@ pub enum Message {
     VideoFrameReady,
     AudioStateChanged,
     ClearCopiedFlash,
+    CopyFlashTick,
     ReleaseMemory,
     CreateRoom,
     LanRoomNameChanged(String),
@@ -158,6 +167,10 @@ pub enum Message {
     ChatEditorAction((ClientUuid, u64), text_editor::Action),
     CopySelectedChatText,
     CopyImageToClipboard([u8; 16]),
+    ImageCopiedToClipboard {
+        blob_id: [u8; 16],
+        result: Result<(), String>,
+    },
     OpenImageLightbox([u8; 16]),
     CloseImageLightbox,
     SaveImageAs([u8; 16]),
@@ -364,11 +377,10 @@ pub struct SquadApp {
     pub active_chat_selection: Option<String>,
     pub image_handles: HashMap<[u8; 16], iced_image::Handle>,
     pub inline_image_bytes: HashMap<[u8; 16], (String, Vec<u8>)>,
-    pub copied_msg_id: Option<(u64, std::time::Instant)>,
+    pub copy_flash: CopyFlashState,
     pub lightbox_blob_id: Option<[u8; 16]>,
     pub chat_input: String,
     pub status_banner: Option<String>,
-    pub invite_copied_flash: bool,
     pub input_devices: Vec<String>,
     pub output_devices: Vec<String>,
     pub video_frame_slot: Arc<Mutex<Option<DecodedVideoFrame>>>,
@@ -414,7 +426,6 @@ pub struct SquadApp {
     update_manual_check: bool,
     pub friends: Vec<FriendContact>,
     pub friend_presences: HashMap<[u8; 32], FriendPresenceUi>,
-    pub friend_id_copied_flash: bool,
     pub add_friend_modal_open: bool,
     pub add_friend_code_input: String,
     pub add_friend_nick_input: String,
@@ -425,7 +436,6 @@ pub struct SquadApp {
     pub short_code_input: String,
     pub short_code_joining: bool,
     pub active_short_code: Option<(u32, std::time::Instant)>,
-    pub short_code_copied_flash: bool,
     pub rendezvous_custom_mode: bool,
     ui_sync: Arc<UiSyncState>,
 }
@@ -545,11 +555,10 @@ impl SquadApp {
             active_chat_selection: None,
             image_handles: HashMap::new(),
             inline_image_bytes: HashMap::new(),
-            copied_msg_id: None,
+            copy_flash: CopyFlashState::default(),
             lightbox_blob_id: None,
             chat_input: String::new(),
             status_banner: None,
-            invite_copied_flash: false,
             input_devices: list_input_devices(),
             output_devices: list_output_devices(),
             video_frame_slot,
@@ -595,7 +604,6 @@ impl SquadApp {
             update_manual_check: false,
             friends,
             friend_presences: HashMap::new(),
-            friend_id_copied_flash: false,
             add_friend_modal_open: false,
             add_friend_code_input: String::new(),
             add_friend_nick_input: String::new(),
@@ -606,7 +614,6 @@ impl SquadApp {
             short_code_input: String::new(),
             short_code_joining: false,
             active_short_code: None,
-            short_code_copied_flash: false,
             rendezvous_custom_mode,
             ui_sync,
         };
@@ -634,7 +641,7 @@ impl SquadApp {
 
     pub fn title(&self, window_id: iced::window::Id) -> String {
         if Some(window_id) == self.overlay_window_id {
-            return "SquadAir Overlay".to_string();
+            return overlay_window_title_for_platform(cfg!(target_os = "windows")).to_string();
         }
         match self.screen {
             Screen::Lobby => "SquadAir".to_string(),
@@ -665,7 +672,16 @@ impl SquadApp {
         } else {
             event::listen_with(listen_normal_event)
         };
-        Subscription::batch([worker, keys, close_reqs])
+        if self
+            .copy_flash
+            .needs_animation_tick_at(std::time::Instant::now())
+        {
+            let flash_tick =
+                iced::time::every(Duration::from_millis(16)).map(|_| Message::CopyFlashTick);
+            Subscription::batch([worker, keys, close_reqs, flash_tick])
+        } else {
+            Subscription::batch([worker, keys, close_reqs])
+        }
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -677,12 +693,8 @@ impl SquadApp {
                 }
                 Task::none()
             }
-            Message::ClearCopiedFlash => {
-                if let Some((_, ts)) = self.copied_msg_id {
-                    if ts.elapsed() >= Duration::from_secs(2) {
-                        self.copied_msg_id = None;
-                    }
-                }
+            Message::ClearCopiedFlash | Message::CopyFlashTick => {
+                self.copy_flash.clear_expired_at(std::time::Instant::now());
                 Task::none()
             }
             Message::ReleaseMemory => {
@@ -748,7 +760,7 @@ impl SquadApp {
                             self.short_code_joining = false;
                             self.short_code_input.clear();
                             self.active_short_code = None;
-                            self.short_code_copied_flash = false;
+                            self.copy_flash.clear_short_code();
                             self.invite_friends_modal_open = false;
                             self.invited_friends_session.clear();
                             self.incoming_call = None;
@@ -783,13 +795,12 @@ impl SquadApp {
                             self.active_chat_selection = None;
                             self.image_handles.clear();
                             self.inline_image_bytes.clear();
-                            self.copied_msg_id = None;
+                            self.copy_flash.clear_room_flashes();
                             self.lightbox_blob_id = None;
                             self.chat_input.clear();
                             self.local_peer_id = 0;
                             self.share_modal_open = false;
                             self.active_short_code = None;
-                            self.short_code_copied_flash = false;
                             self.invite_friends_modal_open = false;
                             self.invited_friends_session.clear();
                             self.short_code_joining = false;
@@ -1027,12 +1038,12 @@ impl SquadApp {
                                 std::time::Instant::now()
                                     + Duration::from_secs(expires_in_secs as u64),
                             ));
-                            self.short_code_copied_flash = false;
+                            self.copy_flash.clear_short_code();
                             self.status_banner = None;
                         }
                         MeshEvent::ShortCodeCleared => {
                             self.active_short_code = None;
-                            self.short_code_copied_flash = false;
+                            self.copy_flash.clear_short_code();
                         }
                         MeshEvent::FriendInviteSent { target_pub_key } => {
                             self.invited_friends_session.insert(target_pub_key);
@@ -1056,14 +1067,18 @@ impl SquadApp {
                 let invite = InviteLink::generate();
                 let uri = invite.to_uri();
                 self.active_invite_uri = uri.clone();
-                self.invite_copied_flash = true;
                 let join_task = self.join_with_invite(
                     invite,
                     self.config.rendezvous_server.clone(),
                     false,
                     None,
                 );
-                Task::batch([join_task, clipboard::write(uri)])
+                self.copy_flash.mark_invite_at(std::time::Instant::now());
+                Task::batch([
+                    join_task,
+                    clipboard::write(uri),
+                    schedule_copy_flash_tasks(),
+                ])
             }
             Message::LanRoomNameChanged(val) => {
                 self.lan_room_name_input = val;
@@ -1103,7 +1118,7 @@ impl SquadApp {
                         secret,
                     };
                     self.active_invite_uri = invite.to_uri();
-                    self.invite_copied_flash = false;
+                    self.copy_flash.clear_invite();
                     self.active_lan_locked = false;
                     self.join_with_invite(
                         invite,
@@ -1155,12 +1170,11 @@ impl SquadApp {
                 self.active_chat_selection = None;
                 self.image_handles.clear();
                 self.inline_image_bytes.clear();
-                self.copied_msg_id = None;
+                self.copy_flash.clear_room_flashes();
                 self.lightbox_blob_id = None;
                 self.chat_input.clear();
                 self.share_modal_open = false;
                 self.active_short_code = None;
-                self.short_code_copied_flash = false;
                 self.invite_friends_modal_open = false;
                 self.invited_friends_session.clear();
                 self.short_code_joining = false;
@@ -1196,8 +1210,11 @@ impl SquadApp {
                 }
             }
             Message::CopyInviteUri => {
-                self.invite_copied_flash = true;
-                clipboard::write(self.active_invite_uri.clone())
+                self.copy_flash.mark_invite_at(std::time::Instant::now());
+                Task::batch([
+                    clipboard::write(self.active_invite_uri.clone()),
+                    schedule_copy_flash_tasks(),
+                ])
             }
             Message::OpenSettings => {
                 if self.screen != Screen::Settings {
@@ -1548,16 +1565,9 @@ impl SquadApp {
             }
             Message::ClipboardProcessed(None) => Task::none(),
             Message::CopyChatText(msg_id, text) => {
-                self.copied_msg_id = Some((msg_id, std::time::Instant::now()));
-                Task::batch([
-                    clipboard::write(text),
-                    Task::perform(
-                        async {
-                            tokio::time::sleep(Duration::from_secs(2)).await;
-                        },
-                        |_| Message::ClearCopiedFlash,
-                    ),
-                ])
+                self.copy_flash
+                    .mark_chat_msg_at(msg_id, std::time::Instant::now());
+                Task::batch([clipboard::write(text), schedule_copy_flash_tasks()])
             }
             Message::ChatEditorAction(key, action) => {
                 if !action.is_edit() {
@@ -1588,11 +1598,22 @@ impl SquadApp {
                             .await
                             .map_err(|e| format!("Clipboard task failed: {e}"))?
                         },
-                        Message::ClipboardActionDone,
+                        move |result| Message::ImageCopiedToClipboard { blob_id, result },
                     );
                 }
                 Task::none()
             }
+            Message::ImageCopiedToClipboard { blob_id, result } => match result {
+                Ok(()) => {
+                    self.copy_flash
+                        .mark_image_at(blob_id, std::time::Instant::now());
+                    schedule_copy_flash_tasks()
+                }
+                Err(err) => {
+                    self.status_banner = Some(err);
+                    Task::none()
+                }
+            },
             Message::OpenImageLightbox(blob_id) => {
                 if self.image_handles.contains_key(&blob_id) {
                     self.lightbox_blob_id = Some(blob_id);
@@ -2130,15 +2151,15 @@ impl SquadApp {
                 Task::none()
             }
             Message::CopyMyFriendId => {
-                self.friend_id_copied_flash = true;
+                self.copy_flash.mark_friend_id_at(std::time::Instant::now());
                 let code =
                     format_friend_code(&self.config.identity_pub_key(), &self.config.nickname);
-                clipboard::write(code)
+                Task::batch([clipboard::write(code), schedule_copy_flash_tasks()])
             }
             Message::OpenAddFriendModal => {
                 self.add_friend_modal_open = true;
                 self.add_friend_error = None;
-                self.friend_id_copied_flash = false;
+                self.copy_flash.clear_friend_id();
                 Task::none()
             }
             Message::CloseAddFriendModal => {
@@ -2275,7 +2296,7 @@ impl SquadApp {
                     }
                     let invite = call.invite;
                     self.active_invite_uri = invite.to_uri();
-                    self.invite_copied_flash = false;
+                    self.copy_flash.clear_invite();
                     return self.join_with_invite(
                         invite,
                         self.config.rendezvous_server.clone(),
@@ -2315,14 +2336,18 @@ impl SquadApp {
                 Task::none()
             }
             Message::GenerateShortCode => {
-                self.short_code_copied_flash = false;
+                self.copy_flash.clear_short_code();
                 let _ = self.mesh_tx.try_send(MeshCommand::GenerateShortCode);
                 Task::none()
             }
             Message::CopyShortCode => {
                 if let Some((code, _)) = self.active_short_code {
-                    self.short_code_copied_flash = true;
-                    return clipboard::write(format_short_code(code));
+                    self.copy_flash
+                        .mark_short_code_at(std::time::Instant::now());
+                    return Task::batch([
+                        clipboard::write(format_short_code(code)),
+                        schedule_copy_flash_tasks(),
+                    ]);
                 }
                 Task::none()
             }
@@ -2406,7 +2431,14 @@ impl SquadApp {
                     .get(&blob_id)
                     .map(|(name, _)| name.as_str())
                     .unwrap_or("Image Preview");
-                stack![base, view_image_lightbox(blob_id, title, handle.clone())].into()
+                let copy_progress = self
+                    .copy_flash
+                    .image_progress_at(blob_id, std::time::Instant::now());
+                stack![
+                    base,
+                    view_image_lightbox(blob_id, title, handle.clone(), copy_progress)
+                ]
+                .into()
             } else {
                 base.into()
             }
@@ -2486,7 +2518,7 @@ impl SquadApp {
         match InviteLink::parse(uri) {
             Ok(invite) => {
                 self.active_invite_uri = invite.to_uri();
-                self.invite_copied_flash = false;
+                self.copy_flash.clear_invite();
                 self.join_with_invite(invite, self.config.rendezvous_server.clone(), false, None)
             }
             Err(e) => {
@@ -2513,11 +2545,10 @@ impl SquadApp {
         self.active_chat_selection = None;
         self.image_handles.clear();
         self.inline_image_bytes.clear();
-        self.copied_msg_id = None;
+        self.copy_flash.clear_room_flashes();
         self.lightbox_blob_id = None;
         self.chat_input.clear();
         self.active_short_code = None;
-        self.short_code_copied_flash = false;
         self.invite_friends_modal_open = false;
         self.invited_friends_session.clear();
         self.short_code_joining = false;
@@ -2626,24 +2657,7 @@ impl SquadApp {
                 self.ui_sync.has_overlay.store(true, Ordering::Release);
                 return Task::none();
             }
-            #[allow(unused_mut)]
-            let mut settings = iced::window::Settings {
-                size: Size::new(200.0, 420.0),
-                position: iced::window::Position::SpecificWith(overlay_left_center_position),
-                visible: true,
-                resizable: false,
-                decorations: false,
-                transparent: true,
-                level: iced::window::Level::AlwaysOnTop,
-                exit_on_close_request: false,
-                ..Default::default()
-            };
-            #[cfg(target_os = "windows")]
-            {
-                settings.platform_specific.skip_taskbar = true;
-                settings.platform_specific.undecorated_shadow = false;
-                settings.platform_specific.drag_and_drop = false;
-            }
+            let settings = overlay_window_settings_for_platform(cfg!(target_os = "windows"));
             let (ov_id, open_task) = iced::window::open(settings);
             self.overlay_window_id = Some(ov_id);
             self.ui_sync.has_overlay.store(true, Ordering::Release);
@@ -2658,6 +2672,53 @@ impl SquadApp {
             Task::none()
         }
     }
+}
+
+fn overlay_window_title_for_platform(is_windows: bool) -> &'static str {
+    if is_windows {
+        ""
+    } else {
+        "SquadAir Overlay"
+    }
+}
+
+fn overlay_window_settings_for_platform(is_windows: bool) -> iced::window::Settings {
+    #[allow(unused_mut)]
+    let mut settings = iced::window::Settings {
+        size: Size::new(200.0, 420.0),
+        position: iced::window::Position::SpecificWith(overlay_left_center_position),
+        visible: !is_windows,
+        resizable: false,
+        decorations: false,
+        transparent: true,
+        level: iced::window::Level::AlwaysOnTop,
+        exit_on_close_request: false,
+        ..Default::default()
+    };
+    #[cfg(target_os = "windows")]
+    {
+        settings.platform_specific.skip_taskbar = true;
+        settings.platform_specific.undecorated_shadow = false;
+        settings.platform_specific.drag_and_drop = false;
+    }
+    settings
+}
+
+fn schedule_copy_flash_tasks() -> Task<Message> {
+    Task::batch([
+        Task::perform(
+            async {
+                tokio::time::sleep(COPY_FLASH_FADE_START).await;
+            },
+            |_| Message::CopyFlashTick,
+        ),
+        Task::perform(
+            async {
+                tokio::time::sleep(COPY_FLASH_DURATION).await;
+            },
+            |_| Message::ClearCopiedFlash,
+        ),
+    ])
 }
 
 fn overlay_left_center_position(win: Size, screen: Size) -> Point {
@@ -2685,22 +2746,42 @@ fn view_image_lightbox<'a>(
     blob_id: [u8; 16],
     filename: &'a str,
     handle: iced_image::Handle,
+    copy_progress: Option<CopyFlashProgress>,
 ) -> Element<'a, Message> {
+    let (copy_icon, copy_tip): (Element<'a, Message>, &'static str) = match copy_progress {
+        Some(p) => (
+            icon_check_animated(16.0, p.check_draw, p.pop_pulse),
+            "Copied!",
+        ),
+        None => (icon(IconKind::ContentCopy, 16.0), "Copy image"),
+    };
     let header = row![
         text(filename).size(14).color(M3_ON_SURFACE),
         horizontal_space(),
-        button(text("Copy Image").size(12))
-            .padding([8, 14])
-            .style(pill_primary_button)
-            .on_press(Message::CopyImageToClipboard(blob_id)),
-        button(text("Save As...").size(12))
-            .padding([8, 14])
-            .style(pill_tonal_button)
-            .on_press(Message::SaveImageAs(blob_id)),
-        button(text("Close").size(12))
-            .padding([8, 14])
-            .style(pill_danger_button)
-            .on_press(Message::CloseImageLightbox),
+        with_tooltip(
+            button(copy_icon)
+                .padding([8, 10])
+                .style(copy_flash_button_style(pill_primary_button, copy_progress))
+                .on_press(Message::CopyImageToClipboard(blob_id)),
+            copy_tip,
+            Position::Bottom,
+        ),
+        with_tooltip(
+            button(icon(IconKind::Download, 16.0))
+                .padding([8, 10])
+                .style(pill_tonal_button)
+                .on_press(Message::SaveImageAs(blob_id)),
+            "Save image as...",
+            Position::Bottom,
+        ),
+        with_tooltip(
+            button(icon(IconKind::Close, 16.0))
+                .padding([8, 10])
+                .style(pill_danger_button)
+                .on_press(Message::CloseImageLightbox),
+            "Close preview",
+            Position::Bottom,
+        ),
     ]
     .spacing(10)
     .align_y(Vertical::Center);
@@ -3222,7 +3303,10 @@ fn iced_key_to_hotkey_name(
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_invite_clipboard_text;
+    use super::{
+        overlay_window_settings_for_platform, overlay_window_title_for_platform,
+        sanitize_invite_clipboard_text,
+    };
 
     #[test]
     fn sanitize_invite_clipboard_trims_and_rejects_empty() {
@@ -3235,5 +3319,36 @@ mod tests {
             sanitize_invite_clipboard_text("\n  squad://room-key  \n"),
             Some("squad://room-key".to_string())
         );
+    }
+
+    #[test]
+    fn overlay_title_is_empty_on_windows_and_named_elsewhere() {
+        assert_eq!(overlay_window_title_for_platform(true), "");
+        assert_eq!(overlay_window_title_for_platform(false), "SquadAir Overlay");
+    }
+
+    #[test]
+    fn overlay_window_settings_invariants() {
+        let win = overlay_window_settings_for_platform(true);
+        assert!(!win.visible);
+        assert!(!win.decorations);
+        assert!(win.transparent);
+        assert!(!win.resizable);
+        assert_eq!(win.level, iced::window::Level::AlwaysOnTop);
+        assert!(!win.exit_on_close_request);
+        #[cfg(target_os = "windows")]
+        {
+            assert!(win.platform_specific.skip_taskbar);
+            assert!(!win.platform_specific.undecorated_shadow);
+            assert!(!win.platform_specific.drag_and_drop);
+        }
+
+        let other = overlay_window_settings_for_platform(false);
+        assert!(other.visible);
+        assert!(!other.decorations);
+        assert!(other.transparent);
+        assert!(!other.resizable);
+        assert_eq!(other.level, iced::window::Level::AlwaysOnTop);
+        assert!(!other.exit_on_close_request);
     }
 }

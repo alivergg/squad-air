@@ -1208,11 +1208,9 @@ mod windows_impl {
 
                 match target {
                     CaptureTarget::Monitor { id, .. } => {
-                        if self.dxgi.as_ref().is_some_and(|d| d.monitor_id != *id) {
-                            self.dxgi = DxgiDuplicator::new(*id);
-                            self.last_dxgi_retry = Instant::now();
-                        } else if self.dxgi.is_none()
-                            && self.last_dxgi_retry.elapsed() >= Duration::from_secs(2)
+                        if self.dxgi.as_ref().is_some_and(|d| d.monitor_id != *id)
+                            || (self.dxgi.is_none()
+                                && self.last_dxgi_retry.elapsed() >= Duration::from_secs(2))
                         {
                             self.dxgi = DxgiDuplicator::new(*id);
                             self.last_dxgi_retry = Instant::now();

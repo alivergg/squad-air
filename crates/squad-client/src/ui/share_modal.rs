@@ -1,12 +1,18 @@
-use crate::ui::theme::{
-    pill_chip_button, pill_primary_button, pill_tonal_button, M3_ON_PRIMARY_CONTAINER,
-    M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_OUTLINE, M3_OUTLINE_VARIANT, M3_PRIMARY,
-    M3_PRIMARY_CONTAINER, M3_SURFACE_CONTAINER, M3_SURFACE_HIGH, M3_SURFACE_HIGHEST,
+use crate::ui::{
+    components::with_tooltip,
+    icons::{icon, IconKind},
+    theme::{
+        pill_chip_button, pill_primary_button, pill_tonal_button, M3_ON_PRIMARY_CONTAINER,
+        M3_ON_SURFACE, M3_ON_SURFACE_VARIANT, M3_OUTLINE, M3_OUTLINE_VARIANT, M3_PRIMARY,
+        M3_PRIMARY_CONTAINER, M3_SURFACE_CONTAINER, M3_SURFACE_HIGH, M3_SURFACE_HIGHEST,
+    },
+    Message, SquadApp,
 };
-use crate::ui::{Message, SquadApp};
 use iced::{
     alignment::Vertical,
-    widget::{button, column, container, horizontal_space, row, scrollable, text},
+    widget::{
+        button, column, container, horizontal_space, row, scrollable, text, tooltip::Position,
+    },
     Background, Border, Color, Element, Length, Shadow, Theme, Vector,
 };
 use squad_video::{CaptureTarget, StreamFps, StreamResolution, VideoCodec};
@@ -89,10 +95,14 @@ pub fn view_share_modal(app: &SquadApp) -> Element<'_, Message> {
             .style(pill_chip_button(app.share_tab == ShareSourceTab::Windows))
             .on_press(Message::SelectShareTab(ShareSourceTab::Windows)),
         horizontal_space(),
-        button(text("Refresh").size(12))
-            .padding([8, 12])
-            .style(pill_tonal_button)
-            .on_press(Message::RefreshCaptureTargets),
+        with_tooltip(
+            button(icon(IconKind::Refresh, 16.0))
+                .padding([8, 10])
+                .style(pill_tonal_button)
+                .on_press(Message::RefreshCaptureTargets),
+            "Refresh capture sources",
+            Position::Left,
+        ),
     ]
     .spacing(8)
     .align_y(Vertical::Center);

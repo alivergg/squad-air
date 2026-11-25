@@ -1115,7 +1115,6 @@ fn dispatch_mesh_event(
                 }
             };
             if should_deliver {
-                audio_engine.play_cue(SoundCue::IncomingCall);
                 listener.on_incoming_friend_call(MobileIncomingCall {
                     sender_pub_key_hex: bytes_to_hex(&call.sender_pub_key),
                     sender_nickname: call.sender_nickname,

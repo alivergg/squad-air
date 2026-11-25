@@ -41,8 +41,8 @@
   <meta name="twitter:description" content="Pure Rust P2P voice and free 1080p60 screen sharing under 50 MB RAM. Zero accounts, zero central media servers.">
   <meta name="twitter:image" content="https://squadair.app/assets/img/og-cover.png">
 
-  <link rel="stylesheet" href="assets/css/main.css?v=20261121">
-  <script defer src="assets/js/app.js?v=20261121"></script>
+  <link rel="stylesheet" href="assets/css/main.css?v=20261124">
+  <script defer src="assets/js/app.js?v=20261124"></script>
 
   <script type="application/ld+json">
   {
@@ -72,7 +72,7 @@
         "name": "SquadAir",
         "alternateName": "squadair",
         "applicationCategory": "CommunicationApplication",
-        "operatingSystem": "Windows 10, Windows 11, macOS 13+, Linux",
+        "operatingSystem": "Windows 10, Windows 11, macOS 13+, Linux, Android 8.0+",
         "softwareVersion": "1.8",
         "image": "https://squadair.app/assets/img/thumb-square.png",
         "screenshot": [
@@ -261,6 +261,7 @@
                 <button type="button" class="os-btn caption-4" data-os-switch="windows" aria-pressed="true">Windows</button>
                 <button type="button" class="os-btn caption-4" data-os-switch="macos" aria-pressed="false">macOS</button>
                 <button type="button" class="os-btn caption-4" data-os-switch="linux" aria-pressed="false">Linux</button>
+                <button type="button" class="os-btn caption-4" data-os-switch="android" aria-pressed="false">Android</button>
               </div>
               <a href="https://github.com/alivergg/squad-air/releases" class="caption-2 text-secondary">All releases</a>
             </div>
@@ -292,7 +293,7 @@
             </div>
 
             <p class="hero-proof caption-1">
-              Open Source (GNU AGPLv3) · Zero Accounts · Windows, macOS &amp; Linux
+              Open Source (GNU AGPLv3) · Zero Accounts · Windows, macOS, Linux &amp; Android
             </p>
           </div>
         </div>
@@ -954,7 +955,7 @@
         </div>
         <h2 id="install-heading" class="heading-2">Install via your platform’s native store</h2>
         <p class="body-3 text-secondary">
-          Every tagged release on <span class="mono-num">main</span> automatically builds and publishes updated installers and packages for Scoop, Homebrew Cask, Snap Store, and Linux distros.
+          Every tagged release on <span class="mono-num">main</span> automatically builds and publishes updated installers and packages for Scoop, Homebrew Cask, Snap Store, Linux distros, and Android APK.
         </p>
       </div>
 
@@ -1206,6 +1207,60 @@ scoop install squadair/squadair</code>
             Portable <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">.tar.gz</span></a>, <span class="mono-num">PKGBUILD</span>, and validated Flatpak/AUR manifests are included in the repo.
           </p>
         </article>
+
+        <article class="install-card" data-reveal>
+          <div class="tier-header">
+            <h3 class="heading-4">Android</h3>
+            <span class="tier-badge caption-4 mono-num">
+              <span class="status-led" aria-hidden="true"></span>
+              arm64-v8a · Android 8.0+
+            </span>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">Direct APK (Free)</span>
+              <span class="install-pill install-pill--live caption-4">Live · Signed APK</span>
+            </div>
+            <p class="body-6 text-secondary">
+              Signed <span class="mono-num">arm64-v8a</span> Android package (<span class="mono-num">minSdk 26</span>) with built-in GitHub release update check and installer.
+            </p>
+            <div class="install-cta-row">
+              <a href="https://github.com/alivergg/squad-air/releases/latest/download/SquadAir-android-arm64.apk" class="btn btn--primary button-sm" rel="noopener">
+                Download SquadAir-android-arm64.apk
+              </a>
+            </div>
+          </div>
+
+          <div class="install-method">
+            <div class="install-method-head">
+              <span class="body-5">ADB Sideload</span>
+              <span class="install-pill caption-4">SHA-256 Verified</span>
+            </div>
+            <div class="install-cmd-box">
+              <code id="cmd-android-adb" class="install-code mono-num">adb install -r SquadAir-android-arm64.apk</code>
+              <span class="copy-wrap">
+                <button type="button" class="copy-btn" command="--copy" commandfor="cmd-android-adb" aria-label="Copy Android ADB install command">
+                  <svg class="icon-copy" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <rect x="9" y="9" width="13" height="13" rx="2"/>
+                    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+                  </svg>
+                  <svg class="icon-check" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                    <path d="M20 6 9 17l-5-5"/>
+                  </svg>
+                </button>
+                <span class="copy-tip caption-5" role="status"></span>
+              </span>
+            </div>
+            <p class="caption-2 text-muted">
+              Or tap the downloaded <span class="mono-num">.apk</span> on Android and allow installs from your browser or file manager.
+            </p>
+          </div>
+
+          <p class="install-foot caption-2 text-muted">
+            Verify <span class="mono-num">SquadAir-android-arm64.apk</span> against <a href="https://github.com/alivergg/squad-air/releases/latest" rel="noopener"><span class="mono-num">SHA256SUMS.txt</span></a> on GitHub Releases.
+          </p>
+        </article>
       </div>
     </section>
 
@@ -1349,7 +1404,7 @@ scoop install squadair/squadair</code>
         <div style="display: grid; gap: var(--space-100);">
           <h2 class="heading-3">Ready for your next squad session</h2>
           <p class="body-3 text-secondary">
-            Download the native Windows, macOS, or Linux release with SHA-256 verification or self-host <span class="mono-num">squad-rendezvous</span> on one UDP port.
+            Download the native Windows, macOS, Linux, or Android release with SHA-256 verification or self-host <span class="mono-num">squad-rendezvous</span> on one UDP port.
           </p>
           <p class="caption-2 text-muted mono-num" data-download-artifact>
             SquadAir-Setup-windows-x86_64.exe · 34.7 MB standalone installer · Windows 10 &amp; 11
@@ -1397,6 +1452,7 @@ scoop install squadair/squadair</code>
             <li><a href="https://snapcraft.io/squad-air" rel="noopener">Snap Store (Linux)</a></li>
             <li><a href="https://github.com/alivergg/homebrew-tap" rel="noopener">Homebrew Tap (macOS)</a></li>
             <li><a href="https://github.com/alivergg/scoop-bucket" rel="noopener">Scoop Bucket (Windows)</a></li>
+            <li><a href="https://github.com/alivergg/squad-air/releases/latest/download/SquadAir-android-arm64.apk" rel="noopener">Android APK (arm64-v8a)</a></li>
             <li><a href="https://github.com/alivergg/squad-air/releases/latest">Latest Download (Free)</a></li>
             <li><a href="https://github.com/alivergg/squad-air/releases">GitHub Releases</a></li>
             <li><a href="https://github.com/alivergg/squad-air">Source Code</a></li>

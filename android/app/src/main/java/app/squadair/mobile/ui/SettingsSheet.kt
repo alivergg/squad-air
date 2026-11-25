@@ -15,11 +15,15 @@ import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalButton
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Slider
@@ -29,6 +33,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -41,11 +46,23 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import app.squadair.mobile.BuildConfig
+import app.squadair.mobile.core.AppUpdater
+import app.squadair.mobile.core.BatterySurvivalHelper
 import app.squadair.mobile.core.SquadSessionRepository
+import app.squadair.mobile.core.UpdateState
 import app.squadair.mobile.ui.theme.RgbaAvatarImage
+import app.squadair.mobile.ui.theme.SquadAirDangerRed
 import app.squadair.mobile.ui.theme.SquadAirOnPrimary
 import app.squadair.mobile.ui.theme.SquadAirPrimary
+import app.squadair.mobile.ui.theme.SquadAirRelayYellow
+import app.squadair.mobile.ui.theme.SquadAirSpeakingGreen
 import app.squadair.mobile.ui.theme.SquadAirSurfaceCard
+import app.squadair.mobile.ui.theme.SquadAirSurfaceElevated
 import app.squadair.mobile.ui.theme.SquadAirTextMuted
 import app.squadair.mobile.ui.theme.SquadAirTextPrimary
 import kotlinx.coroutines.Dispatchers
@@ -62,12 +79,36 @@ fun SettingsSheet(
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
+    val lifecycleOwner = LocalLifecycleOwner.current
     val scope = rememberCoroutineScope()
+    val uiState by repository.uiState.collectAsStateWithLifecycle()
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var nickname by remember(profile.nickname) { mutableStateOf(profile.nickname) }
     var server by remember(profile.rendezvousServer) { mutableStateOf(profile.rendezvousServer) }
     var inputGain by remember(profile.inputGain) { mutableFloatStateOf(profile.inputGain) }
     var vadDb by remember(profile.vadThresholdDb) { mutableFloatStateOf(profile.vadThresholdDb) }
+    var showBatteryDialog by remember { mutableStateOf(false) }
+    var isIgnoringBatteryOpt by remember {
+        mutableStateOf(BatterySurvivalHelper.isIgnoringBatteryOptimizations(context))
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                isIgnoringBatteryOpt = BatterySurvivalHelper.isIgnoringBatteryOptimizations(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose {
+            lifecycleOwner.lifecycle.removeObserver(observer)
+        }
+    }
+
+    val installPermLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult(),
+    ) {
+        repository.onInstallPermissionResult()
+    }
 
     val avatarPicker = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.PickVisualMedia(),
@@ -164,6 +205,13 @@ fun SettingsSheet(
                 Column(modifier = Modifier.weight(1f)) {
                     Text("Echo Cancellation (AEC3)", color = SquadAirTextPrimary, fontSize = 14.sp)
                     Text("Reduces speaker feedback during loudspeaker calls", color = SquadAirTextMuted, fontSize = 11.sp)
+                    if (uiState.isSpeakerAecOverride) {
+                        Text(
+                            text = "Auto-enabled for Speaker (restores previous setting on switch)",
+                            color = SquadAirPrimary,
+                            fontSize = 11.sp,
+                        )
+                    }
                 }
                 Switch(
                     checked = profile.aecEnabled,
@@ -226,6 +274,151 @@ fun SettingsSheet(
                 )
             }
 
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Background & Battery Survival",
+                            color = SquadAirTextPrimary,
+                            fontSize = 14.sp,
+                            fontWeight = FontWeight.Medium,
+                        )
+                        Text(
+                            text = if (isIgnoringBatteryOpt) "Unrestricted" else "Restricted (may sleep in background)",
+                            color = if (isIgnoringBatteryOpt) SquadAirSpeakingGreen else SquadAirRelayYellow,
+                            fontSize = 11.sp,
+                        )
+                    }
+                    FilledTonalButton(onClick = { showBatteryDialog = true }) {
+                        Text("Configure")
+                    }
+                }
+            }
+
+            Card(
+                colors = CardDefaults.cardColors(containerColor = SquadAirSurfaceElevated),
+                shape = RoundedCornerShape(12.dp),
+            ) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                    ) {
+                        Column(modifier = Modifier.weight(1f)) {
+                            Text(
+                                text = "App Updates",
+                                color = SquadAirTextPrimary,
+                                fontSize = 14.sp,
+                                fontWeight = FontWeight.Medium,
+                            )
+                            Text(
+                                text = "Version ${BuildConfig.VERSION_NAME}",
+                                color = SquadAirTextMuted,
+                                fontSize = 11.sp,
+                            )
+                        }
+                        FilledTonalButton(
+                            onClick = { repository.checkForUpdates(silent = false) },
+                            enabled = uiState.updateState !is UpdateState.Checking &&
+                                uiState.updateState !is UpdateState.Downloading,
+                        ) {
+                            Text("Check for Updates")
+                        }
+                    }
+
+                    when (val upd = uiState.updateState) {
+                        UpdateState.Idle -> Unit
+                        UpdateState.Checking -> {
+                            Text("Checking GitHub releases...", color = SquadAirTextMuted, fontSize = 12.sp)
+                        }
+                        is UpdateState.UpToDate -> {
+                            Text(
+                                text = "Up to date (${upd.currentVersion})",
+                                color = SquadAirSpeakingGreen,
+                                fontSize = 12.sp,
+                            )
+                        }
+                        is UpdateState.Available -> {
+                            Text(
+                                text = "Update ${upd.release.tagName} available",
+                                color = SquadAirPrimary,
+                                fontSize = 12.sp,
+                            )
+                            Button(
+                                onClick = { repository.downloadAndInstallUpdate(upd.release) },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Download & Install")
+                            }
+                        }
+                        is UpdateState.Downloading -> {
+                            val pct = upd.progress?.let { "${(it * 100).toInt()}%" } ?: "..."
+                            Text(
+                                text = "Downloading ${upd.release.tagName} ($pct)",
+                                color = SquadAirTextPrimary,
+                                fontSize = 12.sp,
+                            )
+                            val prog = upd.progress
+                            if (prog != null) {
+                                LinearProgressIndicator(
+                                    progress = { prog },
+                                    modifier = Modifier.fillMaxWidth(),
+                                )
+                            } else {
+                                LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+                            }
+                        }
+                        is UpdateState.ReadyToInstall -> {
+                            Button(
+                                onClick = { repository.installDownloadedUpdate() },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Install Update")
+                            }
+                        }
+                        is UpdateState.NeedsInstallPermission -> {
+                            Text(
+                                text = "Grant install permission for SquadAir to apply ${upd.release.tagName}",
+                                color = SquadAirRelayYellow,
+                                fontSize = 12.sp,
+                            )
+                            Button(
+                                onClick = {
+                                    installPermLauncher.launch(
+                                        AppUpdater.createUnknownSourcesSettingsIntent(context),
+                                    )
+                                },
+                                modifier = Modifier.fillMaxWidth(),
+                            ) {
+                                Text("Allow & Install")
+                            }
+                        }
+                        is UpdateState.Error -> {
+                            Text(
+                                text = upd.message,
+                                color = SquadAirDangerRed,
+                                fontSize = 12.sp,
+                            )
+                        }
+                    }
+                }
+            }
+
             Button(
                 onClick = {
                     if (nickname.isNotBlank() && nickname != profile.nickname) {
@@ -247,5 +440,14 @@ fun SettingsSheet(
 
             Spacer(modifier = Modifier.height(12.dp))
         }
+    }
+
+    if (showBatteryDialog) {
+        BatteryOptimizationDialog(
+            onDismiss = {
+                isIgnoringBatteryOpt = BatterySurvivalHelper.isIgnoringBatteryOptimizations(context)
+                showBatteryDialog = false
+            },
+        )
     }
 }
