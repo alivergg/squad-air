@@ -116,7 +116,8 @@ cp -f "$LIBCXX_SRC" "$ARM64_DIR/libc++_shared.so"
 
 SO_PATH="$ROOT_DIR/target/aarch64-linux-android/release/libsquad_core.so"
 echo "==> Generating Kotlin UniFFI bindings..."
-cargo run --locked -p squad-core --no-default-features --features android-ffi --bin uniffi-bindgen -- \
+env -u CMAKE_TOOLCHAIN_FILE -u ANDROID_ABI -u ANDROID_PLATFORM -u OPUS_STATIC -u CMAKE_GENERATOR \
+    cargo run --locked -p squad-core --no-default-features --features android-ffi --bin uniffi-bindgen -- \
     generate --library "$SO_PATH" --language kotlin --out-dir "$ROOT_DIR/android/app/src/main/java"
 
 LLVM_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG/bin/llvm-strip"

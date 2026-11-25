@@ -404,6 +404,8 @@ where
     thread::Builder::new()
         .name("squad-audio-hotplug".into())
         .spawn(move || {
+            #[cfg(target_os = "windows")]
+            let _win_com_guard = crate::win_loopback::enter_windows_com_mta();
             #[cfg(target_os = "macos")]
             let _ca_guard = macos_ca::CoreAudioListenerGuard::register(thread::current());
 

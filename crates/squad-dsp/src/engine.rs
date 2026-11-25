@@ -1455,6 +1455,8 @@ fn run_audio_worker(
     topology_snap: Arc<Mutex<ActiveTopologySnapshot>>,
     hotplug_thread: Arc<Mutex<Option<thread::Thread>>>,
 ) {
+    #[cfg(target_os = "windows")]
+    let _win_com_guard = crate::win_loopback::enter_windows_com_mta();
     let host = cpal::default_host();
     let mut streams: Option<AudioStreams> = None;
     let mut current_input_dev = config.input_device_name.clone();

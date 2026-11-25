@@ -1,4 +1,5 @@
 use crate::resampler::CaptureResampler;
+use cpal::traits::HostTrait;
 use ringbuf::{
     traits::{Producer, Split},
     HeapRb,
@@ -134,6 +135,47 @@ extern "system" {
 extern "system" {
     fn CoInitializeEx(pv_reserved: *const c_void, dw_co_init: u32) -> i32;
     fn CoUninitialize();
+}
+
+pub(crate) struct WinComMtaGuard(bool);
+
+impl Drop for WinComMtaGuard {
+    fn drop(&mut self) {
+        if self.0 {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
+pub(crate) fn enter_windows_com_mta() -> WinComMtaGuard {
+    ensure_windows_com_mta_ready();
+    let ok = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED) >= 0 };
+    WinComMtaGuard(ok)
+}
+
+pub(crate) fn ensure_windows_com_mta_ready() {
+    static INIT: OnceLock<()> = OnceLock::new();
+    INIT.get_or_init(|| {
+        let (tx, rx) = mpsc::sync_channel::<()>(1);
+        if thread::Builder::new()
+            .name("squad-win-com-mta".into())
+            .spawn(move || {
+                let _ = unsafe { CoInitializeEx(std::ptr::null(), COINIT_MULTITHREADED) };
+                // Initialize cpal's process-global WASAPI IMMDeviceEnumerator inside a permanent MTA
+                // thread so shutting down short-lived worker threads cannot tear down its COM apartment.
+                let host = cpal::default_host();
+                let _ = host.default_output_device();
+                let _ = host.default_input_device();
+                let _ = tx.send(());
+                loop {
+                    thread::park();
+                }
+            })
+            .is_ok()
+        {
+            let _ = rx.recv();
+        }
+    });
 }
 
 type ActivateAudioInterfaceAsyncFn = unsafe extern "system" fn(
